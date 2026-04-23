@@ -94,6 +94,15 @@ class ClaudeCodeAdapter(BaseAdapter):
         ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
         :class:`AgentskillsAdaptor` writes to both.
         """
+        # KI-001 fix: warn immediately if CLAUDE_CODE_OAUTH_TOKEN is absent so
+        # operators see the problem at startup instead of a silent
+        # AuthenticationError on the first LLM call.
+        if not os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"):
+            logger.warning(
+                "CLAUDE_CODE_OAUTH_TOKEN is not set — the adapter will fail on the "
+                "first LLM call with an AuthenticationError. Set the env var or "
+                "configure an API key in your platform workspace settings."
+            )
         from molecule_runtime.plugins import load_plugins
         workspace_plugins_dir = os.path.join(config.config_path, "plugins")
         plugins = load_plugins(
