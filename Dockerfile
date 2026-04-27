@@ -28,6 +28,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy adapter code
 COPY adapter.py .
 COPY __init__.py .
+# Adapter-specific executor — owned by THIS template (universal-runtime
+# refactor, molecule-core task #87). Lives alongside adapter.py so
+# Python's import system picks the local /app/claude_sdk_executor.py
+# before the same-named module that older molecule-runtime versions
+# also shipped under site-packages. Once molecule-core drops the file
+# from its workspace/ package and bumps the runtime PyPI version, the
+# template will be the sole source of truth.
+COPY claude_sdk_executor.py .
 
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter
