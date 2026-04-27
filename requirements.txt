@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — shared infrastructure
-molecule-ai-workspace-runtime>=0.1.0
+molecule-ai-workspace-runtime>=0.1.16
 
 # Claude Code adapter specific deps
 # Claude Agent SDK — programmatic API to Claude Code engine.
