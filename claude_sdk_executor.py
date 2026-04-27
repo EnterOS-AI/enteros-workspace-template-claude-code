@@ -41,7 +41,7 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.helpers import new_agent_text_message
 
-from executor_helpers import (
+from molecule_runtime.executor_helpers import (
     CONFIG_MOUNT,
     MEMORY_CONTENT_MAX_CHARS,
     WORKSPACE_MOUNT,
@@ -62,7 +62,7 @@ from executor_helpers import (
 )
 
 if TYPE_CHECKING:
-    from heartbeat import HeartbeatLoop
+    from molecule_runtime.heartbeat import HeartbeatLoop
 
 logger = logging.getLogger(__name__)
 
@@ -210,8 +210,8 @@ async def _report_tool_use(block: Any) -> None:
         # executor must still run when the workspace's network/auth
         # plumbing isn't fully set up (e.g. unit tests).
         import httpx
-        from a2a_client import PLATFORM_URL, WORKSPACE_ID
-        from platform_auth import auth_headers
+        from molecule_runtime.a2a_client import PLATFORM_URL, WORKSPACE_ID
+        from molecule_runtime.platform_auth import auth_headers
     except Exception:
         return
     try:

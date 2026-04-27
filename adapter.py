@@ -94,7 +94,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
         :class:`AgentskillsAdaptor` writes to both.
         """
-        from plugins import load_plugins
+        from molecule_runtime.plugins import load_plugins
         workspace_plugins_dir = os.path.join(config.config_path, "plugins")
         plugins = load_plugins(
             workspace_plugins_dir=workspace_plugins_dir,
