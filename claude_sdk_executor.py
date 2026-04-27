@@ -39,7 +39,7 @@ import claude_agent_sdk as sdk
 
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.helpers import new_agent_text_message
+from a2a.helpers import new_text_message
 
 from molecule_runtime.executor_helpers import (
     CONFIG_MOUNT,
@@ -576,7 +576,7 @@ class ClaudeSDKExecutor(AgentExecutor):
             )
             user_input = (user_input + manifest) if user_input else manifest.lstrip()
         if not user_input:
-            await event_queue.enqueue_event(new_agent_text_message(_NO_TEXT_MSG))
+            await event_queue.enqueue_event(new_text_message(_NO_TEXT_MSG))
             return
 
         async with self._run_lock:
@@ -604,7 +604,7 @@ class ClaudeSDKExecutor(AgentExecutor):
                 parts=parts,
             ))
         else:
-            await event_queue.enqueue_event(new_agent_text_message(response_text))
+            await event_queue.enqueue_event(new_text_message(response_text))
 
     @staticmethod
     def _is_retryable(exc: BaseException) -> bool:
