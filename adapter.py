@@ -212,3 +212,6 @@ class ClaudeCodeAdapter(BaseAdapter):
         result_base["cursor"] = since + len(lines)
         result_base["more"] = more
         return result_base
+
+
+Adapter = ClaudeCodeAdapter
