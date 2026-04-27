@@ -16,6 +16,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      runtime_version:
+        description: "Optional explicit runtime version to bake in (forwarded as RUNTIME_VERSION build-arg)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,3 +30,11 @@ jobs:
   publish:
     uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
     secrets: inherit
+    with:
+      # When the cascade fires, client_payload.runtime_version is the
+      # exact version PyPI just published. Forwarded to the reusable
+      # workflow as a docker --build-arg so the cache key changes
+      # per-version and pip install resolves freshly.
+      # On other events (push/PR/manual without input), this is empty
+      # and the Dockerfile's default (requirements.txt pin) applies.
+      runtime_version: ${{ github.event.client_payload.runtime_version || inputs.runtime_version || '' }}
