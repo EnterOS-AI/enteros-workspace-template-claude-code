@@ -586,21 +586,27 @@ class ClaudeSDKExecutor(AgentExecutor):
         # preparing its prompt while this turn's response ships. Event
         # ordering is preserved per-queue by the A2A server, so no races.
         # If the response mentions /workspace/... files, stage each and
-        # emit FileParts alongside the text so the canvas can download.
+        # emit file parts alongside the text so the canvas can download.
+        #
+        # a2a-sdk v1 uses protobuf, NOT the v0 Pydantic discriminated-union
+        # types. There is no FilePart / TextPart / FileWithUri class — Part
+        # is one struct with optional `text`, `url`, `raw`, `data`,
+        # `filename`, `media_type` fields (plus `metadata`). Set the field
+        # that matches the part's nature; leave the rest unset.
         outbound = collect_outbound_files(response_text)
         if outbound:
-            from a2a.types import FilePart, FileWithUri, Message, Part, Role, TextPart
+            from a2a.types import Message, Part, Role
             import uuid as _uuid
-            parts: list = [Part(root=TextPart(text=response_text))] if response_text else []
+            parts: list = [Part(text=response_text)] if response_text else []
             for f in outbound:
-                parts.append(Part(root=FilePart(file=FileWithUri(
-                    uri="workspace:" + f["path"],
-                    name=f["name"],
-                    mimeType=f["mime_type"],
-                ))))
+                parts.append(Part(
+                    url="workspace:" + f["path"],
+                    filename=f["name"],
+                    media_type=f["mime_type"],
+                ))
             await event_queue.enqueue_event(Message(
-                messageId=_uuid.uuid4().hex,
-                role=Role.agent,
+                message_id=_uuid.uuid4().hex,
+                role=Role.ROLE_AGENT,
                 parts=parts,
             ))
         else:
