@@ -81,4 +81,27 @@ elif [ -n "${GH_TOKEN:-}" ]; then
     echo "${GH_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
 fi
 
+# Third-party Anthropic-API-compatible provider routing.
+# The `claude` CLI honors ANTHROPIC_BASE_URL natively; we rewrite it
+# based on MODEL so a Xiaomi MiMo selection lands on Xiaomi's endpoint
+# without code changes inside the SDK. ANTHROPIC_API_KEY in this case
+# is the third-party provider key, not an Anthropic Console key.
+#
+# Refuses to clobber an operator-set ANTHROPIC_BASE_URL — if the user
+# provided one explicitly via secrets, that wins. The mapping below is
+# only the fallback for known model prefixes.
+#
+# Long-term this should move to a data-driven `runtime_env` field in
+# config.yaml read by the platform provisioner; tracked separately.
+case "${MODEL:-}" in
+    mimo-*)
+        if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+            export ANTHROPIC_BASE_URL="https://api.xiaomimimo.com/anthropic"
+            echo "[entrypoint] MODEL=${MODEL} → ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}" >&2
+        else
+            echo "[entrypoint] MODEL=${MODEL} but ANTHROPIC_BASE_URL already set; not overriding" >&2
+        fi
+        ;;
+esac
+
 exec molecule-runtime "$@"

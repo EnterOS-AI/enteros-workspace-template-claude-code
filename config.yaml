@@ -1,11 +1,13 @@
 name: Claude Code Agent
 description: >-
-  General-purpose Claude Code workspace. Supports two auth paths:
+  General-purpose Claude Code workspace. Supports three auth paths:
   (1) Claude Code subscription via OAuth token (CLAUDE_CODE_OAUTH_TOKEN,
-  obtained from `claude login`), or (2) Anthropic API key
-  (ANTHROPIC_API_KEY, pay-as-you-go via console.anthropic.com). The
-  `claude` CLI picks whichever is set; OAuth takes precedence when both
-  are present.
+  obtained from `claude login`), (2) Anthropic API key
+  (ANTHROPIC_API_KEY, pay-as-you-go via console.anthropic.com), or
+  (3) third-party Anthropic-API-compatible providers (e.g. Xiaomi MiMo)
+  via ANTHROPIC_API_KEY + provider-specific ANTHROPIC_BASE_URL routing.
+  The `claude` CLI picks whichever is set; OAuth takes precedence when
+  multiple are present.
 version: 1.0.0
 tier: 2
 
@@ -41,6 +43,26 @@ runtime_config:
       required_env: [ANTHROPIC_API_KEY]
     - id: claude-haiku-4-5
       name: Claude Haiku 4.5 (API key / Anthropic Console)
+      required_env: [ANTHROPIC_API_KEY]
+
+    # --- Xiaomi MiMo (third-party, Anthropic-API-compatible) — set ANTHROPIC_API_KEY ---
+    # Routed through https://api.xiaomimimo.com/anthropic via ANTHROPIC_BASE_URL
+    # (the claude CLI honors the env var natively). Mapping lives in
+    # entrypoint.sh — when MODEL matches mimo-*, base URL is rewritten before
+    # the runtime starts. The user's ANTHROPIC_API_KEY here is a Xiaomi key,
+    # not an Anthropic Console key. Long-term, this should move to a
+    # data-driven `runtime_env` schema field; tracked separately.
+    - id: mimo-v2-flash
+      name: Xiaomi MiMo V2 Flash (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_API_KEY]
+    - id: mimo-v2-pro
+      name: Xiaomi MiMo V2 Pro (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_API_KEY]
+    - id: mimo-v2-omni
+      name: Xiaomi MiMo V2 Omni (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_API_KEY]
+    - id: mimo-v2.5-pro
+      name: Xiaomi MiMo V2.5 Pro (third-party, Anthropic-API-compatible)
       required_env: [ANTHROPIC_API_KEY]
 
   # Default required_env — per-model entries above override this once a
