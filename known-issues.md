@@ -8,40 +8,11 @@ workaround, and (where applicable) a link to the upstream or internal tracker.
 
 ## 1. `CLAUDE_CODE_OAUTH_TOKEN` Missing Causes Silent Auth Failures
 
-**Severity:** High
-**Affects:** All template versions.
+**Status:** ✅ **RESOLVED** (2026-04-23)
 
-**Symptom:**
-The agent starts but immediately fails to call the LLM with:
-
-```
-anthropic.AuthenticationError: Incorrect API key provided
-```
-
-or, in platform-managed environments:
-
-```
-401 Unauthorized — Bearer token invalid or expired
-```
-
-**Root cause:**
-`config.yaml` requires `CLAUDE_CODE_OAUTH_TOKEN` but the adapter has no API-key
-fallback. If the environment variable is unset, empty, or expired, the LLM client
-uses an empty/bogus credential and the first turn fails.
-
-**Workaround:**
-Set the token before starting the adapter:
-
-```bash
-export CLAUDE_CODE_OAUTH_TOKEN="your-oauth-token-here"
-python adapter.py
-```
-
-For platform-managed workspaces, ensure the token is injected via the workspace
-environment configuration in the Molecule platform dashboard.
-
-**Fix:** The adapter should emit a startup warning if `CLAUDE_CODE_OAUTH_TOKEN` is
-empty or absent. Tracked in internal ticket MOL-XXXX.
+`adapter.py:setup()` now emits a `logger.warning()` if `CLAUDE_CODE_OAUTH_TOKEN` is absent,
+so operators see the problem immediately at startup rather than a silent `AuthenticationError`
+on the first LLM call. Fix shipped in PR #1753 (`fix/oauth-token-startup-warning`).
 
 ---
 
