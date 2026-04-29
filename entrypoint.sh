@@ -34,8 +34,51 @@ if [ "$(id -u)" = "0" ]; then
         chown -R agent:agent /root/.claude /home/agent/.claude 2>/dev/null
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
+
+    # GitHub credential helper setup (fix #1933 / #1866 / #547).
+    # Runs as root so the global gitconfig is written before we drop to agent.
+    # The helper fetches fresh GitHub App installation tokens from the
+    # platform API on every git push/clone, with caching + env-var fallback.
+    if [ -x /app/scripts/molecule-git-token-helper.sh ]; then
+        git config --global "credential.https://github.com.helper" \
+            "!/app/scripts/molecule-git-token-helper.sh"
+        git config --global "credential.https://github.com.useHttpPath" true
+        if [ -f /root/.gitconfig ]; then
+            cp /root/.gitconfig /home/agent/.gitconfig
+            chown agent:agent /home/agent/.gitconfig
+        fi
+    fi
+    mkdir -p /home/agent/.molecule-token-cache
+    chown agent:agent /home/agent/.molecule-token-cache
+    chmod 700 /home/agent/.molecule-token-cache
+
     exec gosu agent "$0" "$@"
 fi
 
 # Now running as agent (uid 1000)
+
+# Background token refresh daemon — keeps `gh` CLI auth + credential helper
+# cache warm across the ~60 min GitHub App installation token TTL. Wrapped
+# in a respawn loop so a daemon crash doesn't silently leave the workspace
+# stuck on an expired token (which is exactly how #1933 was discovered).
+if [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
+    nohup bash -c '
+        while true; do
+            /app/scripts/molecule-gh-token-refresh.sh
+            rc=$?
+            echo "[molecule-gh-token-refresh] daemon exited rc=$rc — respawning in 30s" >&2
+            sleep 30
+        done
+    ' > /home/agent/.gh-token-refresh.log 2>&1 &
+fi
+
+# Initial gh auth — primes the CLI with whatever GH_TOKEN/GITHUB_TOKEN was
+# injected at provision time, so commands work in the ~60s window before the
+# background daemon's first refresh fires.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "${GITHUB_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
+elif [ -n "${GH_TOKEN:-}" ]; then
+    echo "${GH_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
+fi
+
 exec molecule-runtime "$@"
