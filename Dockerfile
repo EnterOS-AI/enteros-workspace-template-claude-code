@@ -21,13 +21,36 @@ RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
 RUN useradd -u 1000 -m -s /bin/bash agent
 WORKDIR /app
 
-# Install Python deps
+# RUNTIME_VERSION is forwarded from the reusable publish workflow as
+# a docker build-arg. When set (cascade-triggered builds), it's the
+# exact runtime version PyPI just published. Including it as an ARG
+# changes the cache key for the pip install layer below — without
+# this, identical Dockerfile + identical requirements.txt content
+# would let docker reuse the cached layer with the previous version
+# baked in (the cache trap that bit us 5x on 2026-04-27).
+# Empty default = falls back to whatever requirements.txt resolves to.
+ARG RUNTIME_VERSION=
+
+# Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
+# the RUN command itself but its presence as a declared ARG above
+# means buildx hashes it into the cache key.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    if [ -n "${RUNTIME_VERSION}" ]; then \
+      pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+    fi
 
 # Copy adapter code
 COPY adapter.py .
 COPY __init__.py .
+# Adapter-specific executor — owned by THIS template (universal-runtime
+# refactor, molecule-core task #87). Lives alongside adapter.py so
+# Python's import system picks the local /app/claude_sdk_executor.py
+# before the same-named module that older molecule-runtime versions
+# also shipped under site-packages. Once molecule-core drops the file
+# from its workspace/ package and bumps the runtime PyPI version, the
+# template will be the sole source of truth.
+COPY claude_sdk_executor.py .
 
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter

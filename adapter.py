@@ -5,7 +5,7 @@ import os
 import logging
 from pathlib import Path
 
-from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig
+from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig, RuntimeCapabilities
 from a2a.server.agent_execution import AgentExecutor
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,53 @@ class ClaudeCodeAdapter(BaseAdapter):
             "timeout": {"type": "integer", "description": "Timeout in seconds (0 = no timeout)", "default": 0},
         }
 
+    def capabilities(self) -> RuntimeCapabilities:
+        """Claude-code SDK owns session lifecycle natively — see project
+        memory `project_runtime_native_pluggable.md`.
+
+        provides_native_session=True
+            The claude-agent-sdk maintains a long-lived streaming session
+            with its own ClaudeSDKClient state. The platform's a2a_queue
+            would double-buffer the same in-flight state — declaring
+            native_session lets the platform skip enqueueing and dispatch
+            directly. Validates capability primitive #5 once that
+            consumer lands.
+
+        Other capabilities stay False (platform fallback owns them):
+        - provides_native_heartbeat: the SDK's session events don't map
+          cleanly to our 30s heartbeat cadence; heartbeat.py keeps
+          emitting WORKSPACE_HEARTBEAT so the canvas idle indicator and
+          a2a_proxy idle-timer reset behavior keep working.
+        - provides_native_scheduler: claude-code has no built-in cron;
+          platform scheduler keeps owning it.
+        - provides_native_status_mgmt: claude-code wedge detection IS
+          adapter-driven (claude_sdk_executor sets is_wedged + heartbeat
+          forwards as runtime_state="wedged"), but the rest of the
+          status state machine (online/degraded recovery via error_rate)
+          stays platform-owned. Reconsider once the SDK exposes its own
+          ready-signal hook.
+        - provides_native_retry / activity_decoration / channel_dispatch:
+          not implemented in the SDK surface — platform fallback applies.
+        """
+        return RuntimeCapabilities(
+            provides_native_session=True,
+        )
+
+    def idle_timeout_override(self) -> int:
+        """Claude-code synthesis on Opus + multi-step tool use legitimately
+        runs 8-10 min between broadcaster events. The pre-capability
+        bug PR #2128 patched at the env-var layer hit this exact issue:
+        `context canceled` mid-flight when the platform's 5min idle
+        timer fired during a long packaging step. Override to 15 min
+        to cover the long tail without leaving genuinely-wedged runs
+        hanging too long.
+
+        Capability primitive #2 — see workspace/adapter_base.py:
+        idle_timeout_override and PR #2139 for the platform-side
+        consumer in a2a_proxy.dispatchA2A.
+        """
+        return 900  # 15 minutes
+
     async def setup(self, config: AdapterConfig) -> None:
         """Install plugins via the per-runtime adaptor registry.
 
@@ -47,7 +94,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
         :class:`AgentskillsAdaptor` writes to both.
         """
-        from plugins import load_plugins
+        from molecule_runtime.plugins import load_plugins
         workspace_plugins_dir = os.path.join(config.config_path, "plugins")
         plugins = load_plugins(
             workspace_plugins_dir=workspace_plugins_dir,
@@ -165,3 +212,6 @@ class ClaudeCodeAdapter(BaseAdapter):
         result_base["cursor"] = since + len(lines)
         result_base["more"] = more
         return result_base
+
+
+Adapter = ClaudeCodeAdapter
