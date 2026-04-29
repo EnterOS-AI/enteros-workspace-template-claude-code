@@ -14,8 +14,18 @@ on:
     types: [runtime-published]
   push:
     branches: [main]
-  pull_request:
+  # NOTE: do NOT add `pull_request:` here. The reusable
+  # publish-template-image workflow has no PR-skip guard, so a PR
+  # trigger pushes per-PR :latest clobbers and sha-<7> tags for
+  # unmerged code to GHCR. PRs already get a Dockerfile build smoke
+  # test from the validate-workspace-template workflow (no push) —
+  # that's the right place for PR-time verification.
   workflow_dispatch:
+    inputs:
+      runtime_version:
+        description: "Optional explicit runtime version to bake in (forwarded as RUNTIME_VERSION build-arg)"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -25,3 +35,11 @@ jobs:
   publish:
     uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
     secrets: inherit
+    with:
+      # When the cascade fires, client_payload.runtime_version is the
+      # exact version PyPI just published. Forwarded to the reusable
+      # workflow as a docker --build-arg so the cache key changes
+      # per-version and pip install resolves freshly.
+      # On other events (push to main / manual without input), this is
+      # empty and the Dockerfile's default (requirements.txt pin) applies.
+      runtime_version: ${{ github.event.client_payload.runtime_version || inputs.runtime_version || '' }}
