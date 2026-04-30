@@ -88,8 +88,16 @@ fi
 # is the third-party provider key, not an Anthropic Console key.
 #
 # Refuses to clobber an operator-set ANTHROPIC_BASE_URL — if the user
-# provided one explicitly via secrets, that wins. The mapping below is
-# only the fallback for known model prefixes.
+# provided one explicitly via secrets (e.g. a Xiaomi MiMo Token Plan
+# endpoint such as https://token-plan-sgp.xiaomimimo.com/anthropic),
+# that wins. The mapping below is only the fallback for known model
+# prefixes.
+#
+# Supported Xiaomi MiMo endpoints:
+#   - Pay-as-you-go: https://api.xiaomimimo.com/anthropic
+#   - Token Plan SG:  https://token-plan-sgp.xiaomimimo.com/anthropic
+#   - Token Plan HK:   https://token-plan-hk.xiaomimimo.com/anthropic
+# (Set ANTHROPIC_BASE_URL explicitly to use a specific endpoint.)
 #
 # Long-term this should move to a data-driven `runtime_env` field in
 # config.yaml read by the platform provisioner; tracked separately.
