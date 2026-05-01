@@ -165,11 +165,21 @@ def _resolve_provider(model: str, providers: tuple) -> dict:
 
     Match is case-insensitive: prefix wins over alias when both could
     apply. Unknown ids fall back to the first provider in the registry
-    (by convention, the OAuth/safest default).
+    (by convention, the OAuth/safest default — anthropic-oauth in both
+    _BUILTIN_PROVIDERS and the shipped config.yaml).
+
+    Pre-condition: ``providers`` is non-empty. _load_providers always
+    returns at least one entry (built-ins when YAML is missing or every
+    parsed entry was rejected).
     """
-    fallback = providers[0] if providers else _normalize_provider({})
+    if not providers:
+        raise ValueError(
+            "_resolve_provider called with empty providers tuple; "
+            "_load_providers must always return at least one entry "
+            "(falling back to _BUILTIN_PROVIDERS when needed)"
+        )
     if not model:
-        return fallback
+        return providers[0]
     m = model.lower()
     for provider in providers:
         for prefix in provider["model_prefixes"]:
@@ -178,7 +188,7 @@ def _resolve_provider(model: str, providers: tuple) -> dict:
     for provider in providers:
         if m in provider["model_aliases"]:
             return provider
-    return fallback
+    return providers[0]
 
 
 class ClaudeCodeAdapter(BaseAdapter):
