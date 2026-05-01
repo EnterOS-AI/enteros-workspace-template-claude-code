@@ -57,9 +57,15 @@ def _install_stubs():
         mr.adapters.base.BaseAdapter = _StubBaseAdapter
         mr.adapters.base.AdapterConfig = _StubAdapterConfig
         mr.adapters.base.RuntimeCapabilities = _StubRuntimeCapabilities
+        # adapter.setup() lazy-imports molecule_runtime.plugins.load_plugins.
+        # Stub it as a no-op returning [] so setup() pass-paths run cleanly
+        # without needing the real runtime installed in the test env.
+        mr.plugins = types.ModuleType("molecule_runtime.plugins")
+        mr.plugins.load_plugins = lambda **_kwargs: []
         sys.modules["molecule_runtime"] = mr
         sys.modules["molecule_runtime.adapters"] = mr.adapters
         sys.modules["molecule_runtime.adapters.base"] = mr.adapters.base
+        sys.modules["molecule_runtime.plugins"] = mr.plugins
     if "a2a" not in sys.modules:
         a2a = types.ModuleType("a2a")
         a2a.server = types.ModuleType("a2a.server")
@@ -222,3 +228,83 @@ async def test_create_executor_passes_when_unparseable_url(adapter, monkeypatch)
     # fallback. The SDK will fail; that's not the adapter's job.
     executor = await adapter.create_executor(cfg)
     assert executor is not None
+
+
+# ---- setup() pre-validation tests ----
+#
+# Symmetric to create_executor's pre-validate: setup() raises on the
+# inverse misconfig (third-party MODEL picked but ANTHROPIC_BASE_URL
+# unset). Both produce "boots but every LLM call fails" if not caught;
+# raising at boot keeps the workspace from entering "online" status with
+# structurally-broken auth.
+
+
+@pytest.mark.asyncio
+async def test_setup_raises_when_third_party_model_and_no_base_url(
+    adapter, monkeypatch
+):
+    """mimo-* model picked but no ANTHROPIC_BASE_URL → raise.
+
+    Without the URL, every LLM request lands on api.anthropic.com with
+    a non-Anthropic key and 401s. The adapter should fail at boot
+    rather than ship a workspace that 401s on every prompt.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "mimo-v2-flash"}, config_path="/tmp/configs"
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        await adapter.setup(cfg)
+
+    msg = str(exc_info.value)
+    assert "mimo-v2-flash" in msg
+    assert "ANTHROPIC_BASE_URL" in msg
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_when_third_party_model_with_base_url(
+    adapter, monkeypatch
+):
+    """The fix path: third-party model + base URL set → setup() runs
+    cleanly through to plugin install (which is a no-op stub here).
+    """
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL", "https://api.xiaomimimo.com/anthropic"
+    )
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "mimo-v2-flash"}, config_path="/tmp/configs"
+    )
+
+    # Should complete without raising. Plugin install is stubbed.
+    await adapter.setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_when_oauth_model_no_base_url(adapter, monkeypatch):
+    """OAuth-aliased models (sonnet/opus/haiku) are Anthropic-native; no
+    base URL is required. setup() must not raise on the OAuth path even
+    though base_url is unset — that's the historical happy path.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path="/tmp/configs"
+    )
+
+    await adapter.setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_when_anthropic_api_model_no_base_url(
+    adapter, monkeypatch
+):
+    """claude-* versioned ids are Anthropic API-key path; base URL
+    optional (defaults to api.anthropic.com). setup() must not raise.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "claude-sonnet-4-6"},
+        config_path="/tmp/configs",
+    )
+
+    await adapter.setup(cfg)
