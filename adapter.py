@@ -311,7 +311,14 @@ class ClaudeCodeAdapter(BaseAdapter):
             picked_model = rc.get("model") or "sonnet"
         else:
             picked_model = getattr(rc, "model", None) or "sonnet"
-        picked_model = _strip_provider_prefix(picked_model)
+        # NOTE: do NOT strip the provider prefix here. The pre-fix routing
+        # behavior — `anthropic:claude-opus-4-7` falls through to
+        # providers[0] (anthropic-oauth) when no model_prefixes match — is
+        # actually correct for OAuth users (the realistic case for the
+        # wheel default). Stripping in setup() routes OAuth users into
+        # `anthropic-api` provider and the CLI then hangs at `initialize`
+        # because ANTHROPIC_API_KEY isn't set. The strip belongs only at
+        # the CLI invocation site (create_executor below).
         provider = _resolve_provider(picked_model, providers)
         auth_env_options = provider["auth_env"]
 
