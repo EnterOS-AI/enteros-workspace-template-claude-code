@@ -774,3 +774,134 @@ def test_resolve_provider_falls_back_to_first_when_unknown():
 
     result = adapter_module._resolve_provider("some-unknown-model", providers)
     assert result["name"] == "anthropic-oauth"
+
+
+# ---- _strip_provider_prefix tests (2026-05-01 exit-1 root cause) ----
+#
+# Wheel's molecule_runtime/config.py defaults model to
+# "anthropic:claude-opus-4-7" so langchain/crewai consumers get a uniform
+# LangChain-style provider:model string. The claude CLI rejects prefixed
+# strings and exits 1 silently. Adapter must strip known-Claude prefixes
+# before either provider routing (setup) or CLI invocation (executor)
+# touches the value.
+
+
+def _adapter_module():
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module  # noqa: WPS433
+    return adapter_module
+
+
+def test_strip_provider_prefix_strips_anthropic():
+    """The exact wheel default must reach downstream as the bare id."""
+    mod = _adapter_module()
+    assert mod._strip_provider_prefix("anthropic:claude-opus-4-7") == "claude-opus-4-7"
+
+
+def test_strip_provider_prefix_strips_claude():
+    """Operators sometimes write `claude:opus-4-7`; treat as the same prefix."""
+    mod = _adapter_module()
+    assert mod._strip_provider_prefix("claude:opus-4-7") == "opus-4-7"
+
+
+def test_strip_provider_prefix_keeps_unprefixed():
+    """Bare ids and aliases pass through unchanged."""
+    mod = _adapter_module()
+    assert mod._strip_provider_prefix("sonnet") == "sonnet"
+    assert mod._strip_provider_prefix("claude-opus-4-7") == "claude-opus-4-7"
+    assert mod._strip_provider_prefix("MiniMax-M2") == "MiniMax-M2"
+
+
+def test_strip_provider_prefix_keeps_unknown_prefix():
+    """Unknown prefixes (e.g. openai:) pass through so the CLI fails loudly
+    instead of being silently mangled into a half-recognized name."""
+    mod = _adapter_module()
+    assert mod._strip_provider_prefix("openai:gpt-4") == "openai:gpt-4"
+    assert mod._strip_provider_prefix("bedrock:claude-3") == "bedrock:claude-3"
+
+
+def test_strip_provider_prefix_handles_empty():
+    """Empty string returns empty — used by create_executor before the
+    'or sonnet' fallback so the strip path can't crash on the missing-model
+    code path."""
+    mod = _adapter_module()
+    assert mod._strip_provider_prefix("") == ""
+
+
+@pytest.mark.asyncio
+async def test_create_executor_strips_anthropic_prefix(adapter, monkeypatch):
+    """End-to-end: the wheel default ("anthropic:claude-opus-4-7") reaches
+    ClaudeSDKExecutor as the bare id. Without this strip the claude CLI
+    silently exits 1 mid-A2A.
+    """
+    import claude_sdk_executor
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    claude_sdk_executor.ClaudeSDKExecutor.reset_mock()
+
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "anthropic:claude-opus-4-7"}
+    )
+    await adapter.create_executor(cfg)
+
+    kwargs = claude_sdk_executor.ClaudeSDKExecutor.call_args.kwargs
+    assert kwargs["model"] == "claude-opus-4-7"
+
+
+@pytest.mark.asyncio
+async def test_create_executor_strips_anthropic_prefix_dataclass(
+    adapter, monkeypatch
+):
+    """Symmetric coverage of dataclass-shaped runtime_config — the same
+    wheel default arrives via that shape in production via main.py's
+    load_config path.
+    """
+    import claude_sdk_executor
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    claude_sdk_executor.ClaudeSDKExecutor.reset_mock()
+
+    @dataclass
+    class _RC:
+        model: str = "anthropic:claude-opus-4-7"
+
+    cfg = _StubAdapterConfig(runtime_config=_RC())
+    await adapter.create_executor(cfg)
+
+    kwargs = claude_sdk_executor.ClaudeSDKExecutor.call_args.kwargs
+    assert kwargs["model"] == "claude-opus-4-7"
+
+
+@pytest.mark.asyncio
+async def test_setup_strip_routes_prefixed_anthropic_to_anthropic_api(
+    adapter, monkeypatch, configs_dir, caplog
+):
+    """With the prefix intact, `anthropic:claude-opus-4-7` doesn't match
+    anthropic-api's model_prefixes=("claude-",) and falls back to
+    anthropic-oauth — wrong for users on ANTHROPIC_API_KEY. The strip in
+    setup() must run BEFORE _resolve_provider so routing sees the bare id.
+    """
+    import logging
+
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "anthropic:claude-opus-4-7"},
+        config_path=configs_dir,
+    )
+
+    with caplog.at_level(logging.INFO, logger="adapter"):
+        await adapter.setup(cfg)
+
+    banner = next(
+        (r.getMessage() for r in caplog.records
+         if "Claude Code adapter starting" in r.getMessage()),
+        "",
+    )
+    assert "provider=anthropic-api" in banner, (
+        f"Expected provider=anthropic-api after stripping prefix; banner={banner!r}"
+    )

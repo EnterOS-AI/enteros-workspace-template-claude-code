@@ -160,6 +160,34 @@ def _load_providers(config_path: str) -> tuple:
     return tuple(parsed)
 
 
+def _strip_provider_prefix(model: str) -> str:
+    """Strip LangChain-style "<provider>:<model>" prefix from a model id.
+
+    The molecule-runtime wheel's config.py defaults model to
+    "anthropic:claude-opus-4-7" so langchain/crewai consumers get a uniform
+    LangChain-style provider:model string out of the box. The claude CLI's
+    --model arg expects the bare model id and silently exits 1 (no stderr)
+    on prefixed strings — root cause of the 2026-05-01 claude-code adapter
+    "Agent error (Exception)" bug.
+
+    The strip also feeds _resolve_provider correctly: with the prefix
+    intact, "anthropic:claude-opus-4-7" doesn't match the anthropic-api
+    provider's model_prefixes=("claude-",) and falls back to the OAuth
+    default — wrong for users on ANTHROPIC_API_KEY. Stripping makes both
+    routing and CLI invocation see the same id.
+
+    Only known-Claude prefixes are stripped. Unknown prefixes (e.g.
+    "openai:gpt-4") pass through so the CLI fails loudly instead of being
+    silently mangled into a model name it half-recognizes.
+    """
+    if not model:
+        return model
+    for prefix in ("anthropic:", "claude:"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
 def _resolve_provider(model: str, providers: tuple) -> dict:
     """Return the provider entry matching this model id.
 
@@ -283,6 +311,7 @@ class ClaudeCodeAdapter(BaseAdapter):
             picked_model = rc.get("model") or "sonnet"
         else:
             picked_model = getattr(rc, "model", None) or "sonnet"
+        picked_model = _strip_provider_prefix(picked_model)
         provider = _resolve_provider(picked_model, providers)
         auth_env_options = provider["auth_env"]
 
@@ -378,6 +407,7 @@ class ClaudeCodeAdapter(BaseAdapter):
             explicit_model = rc.get("model") or ""
         else:
             explicit_model = getattr(rc, "model", None) or ""
+        explicit_model = _strip_provider_prefix(explicit_model)
 
         # Pre-validation: detect the misconfiguration combo that drove the
         # 2026-04-30 staging incident — ANTHROPIC_BASE_URL pointed at a
