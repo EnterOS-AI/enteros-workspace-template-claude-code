@@ -237,7 +237,6 @@ class ClaudeCodeAdapter(BaseAdapter):
         # "sonnet" fallback — that's correct behavior, no error.
         base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
         if base_url and not explicit_model:
-            from urllib.parse import urlparse
             host = urlparse(base_url).hostname or ""
             if host and host != "api.anthropic.com":
                 raise ValueError(
@@ -257,12 +256,10 @@ class ClaudeCodeAdapter(BaseAdapter):
         # adapter sent X to Y" without having to dig into the SDK
         # subprocess. Cheap diagnostic, no runtime cost.
         if base_url:
-            from urllib.parse import urlparse
             logger.info(
-                "claude-code: model=%s base_url_host=%s%s",
+                "claude-code: model=%s base_url_host=%s (custom upstream)",
                 model,
                 urlparse(base_url).hostname or "<unparseable>",
-                " (custom upstream)" if base_url else "",
             )
         else:
             logger.info("claude-code: model=%s base_url=anthropic-default", model)
