@@ -178,16 +178,21 @@ class ClaudeCodeAdapter(BaseAdapter):
             )
 
         # Third-party paths additionally need ANTHROPIC_BASE_URL; entrypoint.sh
-        # sets it for known mimo-* prefixes. Surface the missing-base-URL
-        # case explicitly — the symptom otherwise is the CLI silently hitting
-        # api.anthropic.com with a third-party key, which 401s.
+        # sets it for known mimo-* prefixes. Fail fast on the missing-base-URL
+        # combo — the symptom otherwise is the CLI silently hitting
+        # api.anthropic.com with a non-Anthropic key, every LLM call 401s, and
+        # the workspace looks "online" while being structurally broken.
+        # Symmetric with create_executor's pre-validate raise on the inverse
+        # combo (URL set, no model picked) — both unrecoverable misconfigs
+        # that would put the workspace into a "boots but never works" state.
         if auth_mode == _AUTH_MODE_THIRD_PARTY and not base_url:
-            logger.warning(
-                "model=%s is a third-party Anthropic-compat model but "
-                "ANTHROPIC_BASE_URL is unset — requests will land on the real "
-                "api.anthropic.com and fail with 401. Check entrypoint.sh's "
-                "model→base-URL mapping or set ANTHROPIC_BASE_URL via secrets.",
-                picked_model,
+            raise ValueError(
+                f"claude-code adapter: model={picked_model} is a third-party "
+                "Anthropic-compat model but ANTHROPIC_BASE_URL is unset. "
+                "Without it, requests land on api.anthropic.com with a "
+                "non-Anthropic key and 401 every call. Fix: check "
+                "entrypoint.sh's model→base-URL mapping for this model "
+                "prefix, or set ANTHROPIC_BASE_URL as a workspace secret."
             )
 
         from molecule_runtime.plugins import load_plugins
