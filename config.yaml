@@ -154,6 +154,9 @@ runtime_config:
     - id: MiniMax-M2.7
       name: MiniMax M2.7 (third-party, Anthropic-API-compatible)
       required_env: [ANTHROPIC_AUTH_TOKEN]
+    - id: MiniMax-M2.7-highspeed
+      name: MiniMax M2.7 High-Speed (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
 
     # --- Z.ai GLM family (third-party, Anthropic-API-compatible) ---
     # Routed via the `zai` provider entry. docs.z.ai for the full
