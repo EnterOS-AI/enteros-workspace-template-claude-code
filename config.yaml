@@ -4,12 +4,90 @@ description: >-
   (1) Claude Code subscription via OAuth token (CLAUDE_CODE_OAUTH_TOKEN,
   obtained from `claude login`), (2) Anthropic API key
   (ANTHROPIC_API_KEY, pay-as-you-go via console.anthropic.com), or
-  (3) third-party Anthropic-API-compatible providers (e.g. Xiaomi MiMo)
-  via ANTHROPIC_API_KEY + provider-specific ANTHROPIC_BASE_URL routing.
-  The `claude` CLI picks whichever is set; OAuth takes precedence when
-  multiple are present.
+  (3) third-party Anthropic-API-compatible providers (e.g. Xiaomi MiMo,
+  MiniMax) via ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY + provider-specific
+  ANTHROPIC_BASE_URL routing. The `claude` CLI picks whichever is set;
+  OAuth takes precedence when multiple are present.
 version: 1.0.0
 tier: 2
+
+# Provider registry — single source of truth for model→endpoint→auth
+# routing. The adapter reads this list at boot to resolve the picked
+# model to a provider, auto-set ANTHROPIC_BASE_URL, and validate the
+# right auth env var. The canvas Config tab reads the same list to
+# render its Provider dropdown — UI and adapter never disagree on
+# what's available.
+#
+# Adding a new provider = one entry below. No adapter or entrypoint.sh
+# code changes needed. Operator override always wins: setting
+# ANTHROPIC_BASE_URL as a workspace secret bypasses the auto-routing
+# (useful for regional endpoints like Xiaomi's token-plan-sgp.* or
+# MiniMax's api.minimaxi.com China endpoint).
+#
+# Schema per entry:
+#   name           : human-readable label (boot banner + UI dropdown)
+#   auth_mode      : "oauth" | "anthropic_api" | "third_party_anthropic_compat"
+#   model_prefixes : lowercase model-id prefixes (e.g. ["mimo-", "minimax-"])
+#   model_aliases  : exact lowercase ids (e.g. ["sonnet", "opus"])
+#   base_url       : ANTHROPIC_BASE_URL to set; null = CLI default (anthropic-native)
+#   auth_env       : env vars accepted; any one being set satisfies auth
+providers:
+  - name: anthropic-oauth
+    auth_mode: oauth
+    model_prefixes: []
+    model_aliases: [sonnet, opus, haiku]
+    base_url: null
+    auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+
+  - name: anthropic-api
+    auth_mode: anthropic_api
+    model_prefixes: [claude-]
+    model_aliases: []
+    base_url: null
+    auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
+
+  - name: xiaomi-mimo
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [mimo-]
+    model_aliases: []
+    base_url: https://api.xiaomimimo.com/anthropic
+    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+  - name: minimax
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [minimax-]
+    model_aliases: []
+    base_url: https://api.minimax.io/anthropic
+    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+  # Z.ai — GLM family. docs.z.ai/scenario-example/develop-tools/claude.
+  # Model ids are uppercase (GLM-4.6) but the registry lowercases for
+  # matching, so the `glm-` prefix catches both `GLM-4.6` and `glm-4.6`.
+  - name: zai
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [glm-]
+    model_aliases: []
+    base_url: https://api.z.ai/api/anthropic
+    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+  # Moonshot AI — Kimi family. platform.kimi.ai/docs/guide/agent-support.
+  - name: moonshot
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [kimi-]
+    model_aliases: []
+    base_url: https://api.moonshot.ai/anthropic
+    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+  # DeepSeek — api-docs.deepseek.com/guides/anthropic_api. Note: their
+  # endpoint silently maps unknown model ids to deepseek-v4-flash, so a
+  # typo lands on a working-but-wrong-tier model rather than 400ing.
+  # Worth flagging in operator-facing docs.
+  - name: deepseek
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [deepseek-]
+    model_aliases: []
+    base_url: https://api.deepseek.com/anthropic
+    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
 runtime: claude-code
 runtime_config:
@@ -45,13 +123,11 @@ runtime_config:
       name: Claude Haiku 4.5 (API key / Anthropic Console)
       required_env: [ANTHROPIC_API_KEY]
 
-    # --- Xiaomi MiMo (third-party, Anthropic-API-compatible) — set ANTHROPIC_API_KEY ---
-    # Routed through https://api.xiaomimimo.com/anthropic via ANTHROPIC_BASE_URL
-    # (the claude CLI honors the env var natively). Mapping lives in
-    # entrypoint.sh — when MODEL matches mimo-*, base URL is rewritten before
-    # the runtime starts. The user's ANTHROPIC_API_KEY here is a Xiaomi key,
-    # not an Anthropic Console key. Long-term, this should move to a
-    # data-driven `runtime_env` schema field; tracked separately.
+    # --- Xiaomi MiMo (third-party, Anthropic-API-compatible) ---
+    # Routed via the `xiaomi-mimo` provider entry above (base_url and
+    # auth_env are resolved from the registry — the adapter sets
+    # ANTHROPIC_BASE_URL automatically based on the model prefix). Either
+    # ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY satisfies auth — both work.
     - id: mimo-v2-flash
       name: Xiaomi MiMo V2 Flash (third-party, Anthropic-API-compatible)
       required_env: [ANTHROPIC_API_KEY]
@@ -61,9 +137,55 @@ runtime_config:
     - id: mimo-v2-omni
       name: Xiaomi MiMo V2 Omni (third-party, Anthropic-API-compatible)
       required_env: [ANTHROPIC_API_KEY]
+    - id: mimo-v2.5
+      name: Xiaomi MiMo V2.5 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_API_KEY]
     - id: mimo-v2.5-pro
       name: Xiaomi MiMo V2.5 Pro (third-party, Anthropic-API-compatible)
       required_env: [ANTHROPIC_API_KEY]
+
+    # --- MiniMax (third-party, Anthropic-API-compatible) ---
+    # Routed via the `minimax` provider entry above. MiniMax docs prefer
+    # ANTHROPIC_AUTH_TOKEN (Bearer-style) — see platform.minimax.io/docs/token-plan/claude-code.
+    # ANTHROPIC_API_KEY also works (the claude CLI accepts both).
+    - id: MiniMax-M2
+      name: MiniMax M2 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+    - id: MiniMax-M2.7
+      name: MiniMax M2.7 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+
+    # --- Z.ai GLM family (third-party, Anthropic-API-compatible) ---
+    # Routed via the `zai` provider entry. docs.z.ai for the full
+    # Anthropic-compat docs. GLM-4.6 is the current-gen flagship; 4.5
+    # remains for users on legacy quotas.
+    - id: GLM-4.6
+      name: Z.ai GLM-4.6 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+    - id: GLM-4.5
+      name: Z.ai GLM-4.5 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+
+    # --- Moonshot AI Kimi family (third-party, Anthropic-API-compatible) ---
+    # Routed via the `moonshot` provider entry. platform.kimi.ai for docs.
+    # K2.5 is the latest agentic-coding tier; K2 stays as a cheaper option.
+    - id: kimi-k2.5
+      name: Moonshot Kimi K2.5 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+    - id: kimi-k2
+      name: Moonshot Kimi K2 (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+
+    # --- DeepSeek (third-party, Anthropic-API-compatible) ---
+    # Routed via the `deepseek` provider entry. api-docs.deepseek.com.
+    # Note: unknown deepseek-* ids silently fall back to v4-flash on
+    # DeepSeek's side — pick the exact tier you mean.
+    - id: deepseek-v4-pro
+      name: DeepSeek V4 Pro (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
+    - id: deepseek-v4-flash
+      name: DeepSeek V4 Flash (third-party, Anthropic-API-compatible)
+      required_env: [ANTHROPIC_AUTH_TOKEN]
 
   # Default required_env — per-model entries above override this once a
   # model is picked. Keep CLAUDE_CODE_OAUTH_TOKEN as the default so

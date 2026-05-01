@@ -15,46 +15,104 @@ logger = logging.getLogger(__name__)
 # the workspace by polling /transcript?limit=999999.
 _TRANSCRIPT_MAX_LIMIT = 1000
 
-# Auth-mode classification for a selected model id. The Claude Code CLI
-# accepts three auth paths and the right env var differs per path; warning
-# at boot about the wrong var (the pre-multi-provider behavior) misled
-# operators who picked an API-key or third-party model. New third-party
-# providers add a prefix → mode entry below + a model-prefix → base-URL
-# mapping in entrypoint.sh until the data-driven `runtime_env` schema
-# field lands platform-side.
+# Auth-mode constants — provider entries use one of these strings.
+# Drives validation behavior in setup() (third-party requires base_url
+# resolution; oauth/anthropic-api leave base_url=None for CLI defaults).
 _AUTH_MODE_OAUTH = "oauth"
 _AUTH_MODE_ANTHROPIC_API = "anthropic_api"
 _AUTH_MODE_THIRD_PARTY = "third_party_anthropic_compat"
 
-_THIRD_PARTY_PREFIXES = ("mimo-",)
-_OAUTH_ALIASES = frozenset({"sonnet", "opus", "haiku"})
+# Built-in provider registry — used as a fallback when /configs/config.yaml
+# doesn't define `providers:`. The canonical registry is the YAML file: it
+# becomes the single source of truth read by both this adapter (for boot-time
+# routing) and the canvas Config tab (Provider dropdown). Adding a new
+# provider should be a one-line YAML edit, not a code change. This builtin
+# exists so a workspace with a malformed/missing config.yaml still boots
+# with sensible defaults instead of failing.
+_BUILTIN_PROVIDERS = (
+    {
+        "name": "anthropic-oauth",
+        "auth_mode": _AUTH_MODE_OAUTH,
+        "model_prefixes": (),
+        "model_aliases": ("sonnet", "opus", "haiku"),
+        "base_url": None,
+        "auth_env": ("CLAUDE_CODE_OAUTH_TOKEN",),
+    },
+    {
+        "name": "anthropic-api",
+        "auth_mode": _AUTH_MODE_ANTHROPIC_API,
+        "model_prefixes": ("claude-",),
+        "model_aliases": (),
+        "base_url": None,
+        "auth_env": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    },
+)
 
 
-def _detect_auth_mode(model: str) -> str:
-    """Classify the picked model into one of three auth paths.
+def _normalize_provider(entry: dict) -> dict:
+    """Coerce a YAML-loaded provider dict into the shape adapter logic expects.
 
-    Used by setup() to validate the right env var is set so operators see
-    the misconfiguration at boot instead of on the first LLM call.
-    Unknown ids default to OAuth — the historical default and the safest
-    fallback for the warning path.
+    YAML gives us lists (not tuples) and may omit optional keys. Normalize
+    to the union of all fields so downstream lookups work without scattered
+    .get(...) calls.
     """
+    return {
+        "name": entry.get("name") or "<unnamed>",
+        "auth_mode": entry.get("auth_mode") or _AUTH_MODE_OAUTH,
+        "model_prefixes": tuple(p.lower() for p in entry.get("model_prefixes") or ()),
+        "model_aliases": tuple(a.lower() for a in entry.get("model_aliases") or ()),
+        "base_url": entry.get("base_url") or None,
+        "auth_env": tuple(entry.get("auth_env") or ()),
+    }
+
+
+def _load_providers(config_path: str) -> tuple:
+    """Load the provider registry from /configs/config.yaml.
+
+    The YAML's top-level ``providers:`` list is the canonical source —
+    canvas Config tab reads the same list to populate its Provider
+    dropdown so the UI and the adapter never disagree on what's
+    available. Falls back to ``_BUILTIN_PROVIDERS`` (oauth + anthropic-api)
+    if the file is missing, malformed, or has no providers section, so a
+    bare-bones workspace still boots with the historical defaults.
+
+    Mode mismatches (e.g. a provider entry without a name) are logged
+    but don't fail the load — better-something-than-nothing for boot.
+    """
+    yaml_path = os.path.join(config_path, "config.yaml")
+    try:
+        import yaml  # transitive dep via molecule-ai-workspace-runtime
+        with open(yaml_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        raw = data.get("providers")
+        if isinstance(raw, list) and raw:
+            return tuple(_normalize_provider(p) for p in raw if isinstance(p, dict))
+    except FileNotFoundError:
+        logger.info("providers: %s not found, using builtin defaults", yaml_path)
+    except Exception as exc:  # noqa: BLE001 — defensive: never block boot on YAML
+        logger.warning("providers: failed to load from %s (%s); using builtins", yaml_path, exc)
+    return _BUILTIN_PROVIDERS
+
+
+def _resolve_provider(model: str, providers: tuple) -> dict:
+    """Return the provider entry matching this model id.
+
+    Match is case-insensitive: prefix wins over alias when both could
+    apply. Unknown ids fall back to the first provider in the registry
+    (by convention, the OAuth/safest default).
+    """
+    fallback = providers[0] if providers else _normalize_provider({})
     if not model:
-        return _AUTH_MODE_OAUTH
+        return fallback
     m = model.lower()
-    if any(m.startswith(p) for p in _THIRD_PARTY_PREFIXES):
-        return _AUTH_MODE_THIRD_PARTY
-    if m.startswith("claude-"):
-        return _AUTH_MODE_ANTHROPIC_API
-    if m in _OAUTH_ALIASES:
-        return _AUTH_MODE_OAUTH
-    return _AUTH_MODE_OAUTH
-
-
-def _required_env_for_mode(mode: str) -> str:
-    """The env var the claude CLI needs to authenticate for a given mode."""
-    if mode == _AUTH_MODE_OAUTH:
-        return "CLAUDE_CODE_OAUTH_TOKEN"
-    return "ANTHROPIC_API_KEY"
+    for provider in providers:
+        for prefix in provider["model_prefixes"]:
+            if prefix and m.startswith(prefix):
+                return provider
+    for provider in providers:
+        if m in provider["model_aliases"]:
+            return provider
+    return fallback
 
 
 class ClaudeCodeAdapter(BaseAdapter):
@@ -136,63 +194,86 @@ class ClaudeCodeAdapter(BaseAdapter):
         ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
         :class:`AgentskillsAdaptor` writes to both.
         """
-        # KI-001 fix, generalized for the three auth paths the CLI supports:
-        # OAuth (CLAUDE_CODE_OAUTH_TOKEN), Anthropic API (ANTHROPIC_API_KEY),
-        # and third-party Anthropic-API-compat (ANTHROPIC_API_KEY + provider
-        # ANTHROPIC_BASE_URL). Detect the path from the picked model so the
-        # warning targets the *right* env var — the pre-multi-provider code
-        # always warned about CLAUDE_CODE_OAUTH_TOKEN even when the user had
-        # legitimately picked an API-key model and set ANTHROPIC_API_KEY.
+        # Load provider registry from /configs/config.yaml — canvas reads
+        # the same YAML for its Config-tab Provider dropdown so adapter +
+        # UI never disagree on what's available. Adding a new provider is
+        # a one-line YAML edit (no code change in this file or entrypoint.sh).
+        providers = _load_providers(config.config_path)
+
+        # Resolve the picked model to a provider entry, then drive auth-env
+        # validation + ANTHROPIC_BASE_URL routing from that single decision.
         rc = config.runtime_config
         if isinstance(rc, dict):
             picked_model = rc.get("model") or "sonnet"
         else:
             picked_model = getattr(rc, "model", None) or "sonnet"
-        auth_mode = _detect_auth_mode(picked_model)
-        required_var = _required_env_for_mode(auth_mode)
+        provider = _resolve_provider(picked_model, providers)
+        auth_env_options = provider["auth_env"]
 
-        # Single-line startup banner — operators reading boot logs can see
-        # which provider path was selected and whether ANTHROPIC_BASE_URL
-        # (set by entrypoint.sh for third-party mimo-*) took effect. URL is
-        # logged as host-only; defensive against credential-shaped query
-        # strings even though base_url shouldn't carry one.
-        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        # Endpoint precedence: operator-set ANTHROPIC_BASE_URL wins (escape
+        # hatch for custom regional endpoints — e.g. token-plan-sgp.* for
+        # Xiaomi MiMo, api.minimaxi.com for MiniMax China). Otherwise the
+        # provider's default base_url is auto-applied so the operator
+        # picking a provider in the platform UI doesn't *also* have to
+        # paste a URL. Anthropic-native paths (oauth, anthropic_api) leave
+        # base_url=None and let the CLI's built-in default take effect.
+        explicit_base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        if explicit_base_url:
+            effective_base_url = explicit_base_url
+            base_url_source = "operator-override"
+        elif provider["base_url"]:
+            os.environ["ANTHROPIC_BASE_URL"] = provider["base_url"]
+            effective_base_url = provider["base_url"]
+            base_url_source = f"provider={provider['name']}"
+        else:
+            effective_base_url = None
+            base_url_source = "anthropic-default"
+
+        # Boot banner — operators reading workspace logs see which provider
+        # was selected, where the URL came from, and which auth env var
+        # the adapter expects. Cheap diagnostic; cuts root-cause-finding
+        # time when an LLM call fails downstream.
         base_url_host = ""
-        if base_url:
+        if effective_base_url:
             try:
-                base_url_host = urlparse(base_url).netloc or "<unparseable>"
+                base_url_host = urlparse(effective_base_url).netloc or "<unparseable>"
             except Exception:
                 base_url_host = "<unparseable>"
         logger.info(
-            "Claude Code adapter starting: model=%s auth_mode=%s required_env=%s%s",
-            picked_model, auth_mode, required_var,
-            f" base_url_host={base_url_host}" if base_url_host else "",
+            "Claude Code adapter starting: model=%s provider=%s auth_mode=%s "
+            "base_url=%s (%s) auth_env=%s",
+            picked_model, provider["name"], provider["auth_mode"],
+            base_url_host or "anthropic-default", base_url_source,
+            "/".join(auth_env_options),
         )
 
-        if not os.environ.get(required_var):
+        # Auth check — any of the provider's accepted env vars satisfies.
+        # Warning (not raise) so a workspace can still boot for non-LLM
+        # work (terminal, file editing) while the operator sets the key.
+        if not any(os.environ.get(v) for v in auth_env_options):
             logger.warning(
-                "%s is not set for model=%s (auth_mode=%s) — the adapter will fail "
-                "on the first LLM call with an AuthenticationError. Set the env "
-                "var or configure the key in your platform workspace settings.",
-                required_var, picked_model, auth_mode,
+                "None of %s set for model=%s (provider=%s) — the adapter "
+                "will fail on the first LLM call with AuthenticationError. "
+                "Set one of these env vars in workspace secrets.",
+                "/".join(auth_env_options), picked_model, provider["name"],
             )
 
-        # Third-party paths additionally need ANTHROPIC_BASE_URL; entrypoint.sh
-        # sets it for known mimo-* prefixes. Fail fast on the missing-base-URL
-        # combo — the symptom otherwise is the CLI silently hitting
-        # api.anthropic.com with a non-Anthropic key, every LLM call 401s, and
-        # the workspace looks "online" while being structurally broken.
-        # Symmetric with create_executor's pre-validate raise on the inverse
-        # combo (URL set, no model picked) — both unrecoverable misconfigs
-        # that would put the workspace into a "boots but never works" state.
-        if auth_mode == _AUTH_MODE_THIRD_PARTY and not base_url:
+        # Third-party providers must end up with a base_url one way or
+        # another (provider default OR operator override). If neither, the
+        # CLI silently hits api.anthropic.com with a non-Anthropic key and
+        # every call 401s — workspace looks "online" but is structurally
+        # broken. Symmetric with create_executor's pre-validate raise on
+        # the inverse misconfig. The provider registry guarantees a default
+        # for every third-party we ship, so this fires only if a future
+        # provider entry forgets to set base_url.
+        if (provider["auth_mode"] == _AUTH_MODE_THIRD_PARTY
+                and not effective_base_url):
             raise ValueError(
-                f"claude-code adapter: model={picked_model} is a third-party "
-                "Anthropic-compat model but ANTHROPIC_BASE_URL is unset. "
-                "Without it, requests land on api.anthropic.com with a "
-                "non-Anthropic key and 401 every call. Fix: check "
-                "entrypoint.sh's model→base-URL mapping for this model "
-                "prefix, or set ANTHROPIC_BASE_URL as a workspace secret."
+                f"claude-code adapter: model={picked_model} resolved to "
+                f"third-party provider={provider['name']} but no "
+                "ANTHROPIC_BASE_URL is configured (provider has no default "
+                "and operator didn't set one). Add base_url to the provider "
+                "entry in adapter.py or set ANTHROPIC_BASE_URL via secrets."
             )
 
         from molecule_runtime.plugins import load_plugins

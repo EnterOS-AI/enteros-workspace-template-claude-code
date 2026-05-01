@@ -1,19 +1,23 @@
-"""Unit tests for ClaudeCodeAdapter.create_executor pre-validation.
+"""Unit tests for ClaudeCodeAdapter.setup + create_executor.
 
-Pin the failure-mode-caught-on-2026-04-30 (workspaces with
-ANTHROPIC_BASE_URL pointing at a MiniMax/OpenAI shim and no explicit
-model hung on the SDK --print probe for 30s, eventually triggering
-the platform's phantom-busy sweep).
+Two surfaces under test:
+  1. setup() — provider-registry loading + auth-env validation +
+     base_url resolution. Pins the post-2026-04-30 architecture where
+     the model→provider mapping lives in /configs/config.yaml's
+     `providers:` list (canonical) with `_BUILTIN_PROVIDERS` as the
+     malformed-YAML fallback.
+  2. create_executor() — the 2026-04-30 hang fix (custom upstream + no
+     model = raise instead of silently passing 'sonnet' to the SDK).
 
-These tests exercise the pre-validation branch in create_executor
-without booting the actual ClaudeSDKExecutor — we mock the import
-so we can drive the validation logic in isolation.
+These tests stub the import dependencies (molecule_runtime, a2a,
+claude_sdk_executor) so they can run without the real packages installed.
 """
 
 import os
 import sys
+import textwrap
 import types
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,7 +30,7 @@ import pytest
 #   - a2a.server.agent_execution (AgentExecutor)
 # create_executor lazily imports claude_sdk_executor.ClaudeSDKExecutor.
 # We stub all four so the test file can run in CI without those packages
-# installed. The pre-validation branch we care about runs BEFORE the
+# installed. The pre-validation branches we care about run BEFORE the
 # executor instantiates, so the stub doesn't affect what we're testing.
 
 
@@ -80,6 +84,67 @@ def _install_stubs():
         sys.modules["claude_sdk_executor"] = mod
 
 
+# ---- Fixtures ----
+
+
+# Canonical provider registry used by most setup() tests. Mirrors the
+# real config.yaml's `providers:` list — kept inline here so a config.yaml
+# rename/edit doesn't silently change test semantics. If the prod
+# registry ever drifts from this fixture, the divergence is intentional
+# and visible in the diff.
+_FIXTURE_PROVIDERS_YAML = textwrap.dedent("""
+    providers:
+      - name: anthropic-oauth
+        auth_mode: oauth
+        model_prefixes: []
+        model_aliases: [sonnet, opus, haiku]
+        base_url: null
+        auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+
+      - name: anthropic-api
+        auth_mode: anthropic_api
+        model_prefixes: [claude-]
+        model_aliases: []
+        base_url: null
+        auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
+
+      - name: xiaomi-mimo
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [mimo-]
+        model_aliases: []
+        base_url: https://api.xiaomimimo.com/anthropic
+        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+      - name: minimax
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [minimax-]
+        model_aliases: []
+        base_url: https://api.minimax.io/anthropic
+        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+      - name: zai
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [glm-]
+        model_aliases: []
+        base_url: https://api.z.ai/api/anthropic
+        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+      - name: moonshot
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [kimi-]
+        model_aliases: []
+        base_url: https://api.moonshot.ai/anthropic
+        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+
+      - name: deepseek
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [deepseek-]
+        model_aliases: []
+        base_url: https://api.deepseek.com/anthropic
+        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+""")
+
+
 @pytest.fixture
 def adapter(monkeypatch):
     """Fresh ClaudeCodeAdapter with all imports stubbed."""
@@ -98,7 +163,32 @@ def adapter(monkeypatch):
     return adapter_module.ClaudeCodeAdapter()
 
 
-# ---- Pre-validation tests ----
+@pytest.fixture
+def configs_dir(tmp_path):
+    """Per-test /configs dir with the canonical provider registry written to
+    config.yaml. Tests pass the path as ``config_path`` on _StubAdapterConfig
+    so adapter.setup() reads our fixture rather than the host's real
+    /configs/config.yaml (which doesn't exist in CI).
+    """
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(_FIXTURE_PROVIDERS_YAML)
+    return str(tmp_path)
+
+
+@pytest.fixture
+def empty_configs_dir(tmp_path):
+    """A /configs dir with no config.yaml — exercises the FileNotFoundError
+    fallback path in _load_providers (must yield _BUILTIN_PROVIDERS).
+    """
+    return str(tmp_path)
+
+
+# ---- create_executor pre-validation tests ----
+#
+# These exercise the 2026-04-30 hang-fix branch: ANTHROPIC_BASE_URL
+# pointed at a non-Anthropic shim with no model picked silently passes
+# 'sonnet' to the SDK, which hangs for 30s on the --print probe. The
+# adapter raises early instead.
 
 
 @pytest.mark.asyncio
@@ -230,65 +320,107 @@ async def test_create_executor_passes_when_unparseable_url(adapter, monkeypatch)
     assert executor is not None
 
 
-# ---- setup() pre-validation tests ----
+# ---- setup() provider-registry tests ----
 #
 # Symmetric to create_executor's pre-validate: setup() raises on the
 # inverse misconfig (third-party MODEL picked but ANTHROPIC_BASE_URL
-# unset). Both produce "boots but every LLM call fails" if not caught;
-# raising at boot keeps the workspace from entering "online" status with
+# unset and the resolved provider has no default base_url). Both
+# produce "boots but every LLM call fails" if not caught; raising at
+# boot keeps the workspace from entering "online" status with
 # structurally-broken auth.
 
 
 @pytest.mark.asyncio
-async def test_setup_raises_when_third_party_model_and_no_base_url(
-    adapter, monkeypatch
+async def test_setup_passes_when_third_party_model_with_registered_base_url(
+    adapter, monkeypatch, configs_dir
 ):
-    """mimo-* model picked but no ANTHROPIC_BASE_URL → raise.
-
-    Without the URL, every LLM request lands on api.anthropic.com with
-    a non-Anthropic key and 401s. The adapter should fail at boot
-    rather than ship a workspace that 401s on every prompt.
+    """Third-party model + provider has default base_url in YAML →
+    setup() auto-applies it (no operator URL needed) and runs cleanly
+    through to plugin install. The Option B v2 happy path: pick mimo-
+    or minimax- model in canvas, the registry handles routing.
     """
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     cfg = _StubAdapterConfig(
-        runtime_config={"model": "mimo-v2-flash"}, config_path="/tmp/configs"
+        runtime_config={"model": "mimo-v2-flash"}, config_path=configs_dir
     )
 
-    with pytest.raises(ValueError) as exc_info:
-        await adapter.setup(cfg)
-
-    msg = str(exc_info.value)
-    assert "mimo-v2-flash" in msg
-    assert "ANTHROPIC_BASE_URL" in msg
-
-
-@pytest.mark.asyncio
-async def test_setup_passes_when_third_party_model_with_base_url(
-    adapter, monkeypatch
-):
-    """The fix path: third-party model + base URL set → setup() runs
-    cleanly through to plugin install (which is a no-op stub here).
-    """
-    monkeypatch.setenv(
-        "ANTHROPIC_BASE_URL", "https://api.xiaomimimo.com/anthropic"
-    )
-    cfg = _StubAdapterConfig(
-        runtime_config={"model": "mimo-v2-flash"}, config_path="/tmp/configs"
-    )
-
-    # Should complete without raising. Plugin install is stubbed.
     await adapter.setup(cfg)
 
+    # Registry-default base_url should now be in env for the SDK to pick up.
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://api.xiaomimimo.com/anthropic"
+
 
 @pytest.mark.asyncio
-async def test_setup_passes_when_oauth_model_no_base_url(adapter, monkeypatch):
+async def test_setup_passes_for_minimax_model(adapter, monkeypatch, configs_dir):
+    """MiniMax-M2 resolves to the minimax provider, auto-sets the MiniMax
+    Anthropic-compat endpoint. Verifies registry adds new providers
+    without code changes — the original motivation for the YAML registry.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2"}, config_path=configs_dir
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
+
+
+@pytest.mark.asyncio
+async def test_setup_minimax_case_insensitive_match(
+    adapter, monkeypatch, configs_dir
+):
+    """MiniMax docs use mixed-case ids (MiniMax-M2.7); some operators may
+    type minimax-m2.7. Both must resolve to the same provider — registry
+    matches lowercased prefixes.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "minimax-m2.7"}, config_path=configs_dir
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://api.minimax.io/anthropic"
+
+
+@pytest.mark.asyncio
+async def test_setup_operator_base_url_overrides_registry_default(
+    adapter, monkeypatch, configs_dir
+):
+    """Operator-set ANTHROPIC_BASE_URL wins over the provider's default —
+    escape hatch for regional endpoints (Xiaomi token-plan-sgp.*,
+    MiniMax api.minimaxi.com China endpoint). Pinning this so a future
+    refactor can't quietly clobber the override.
+    """
+    monkeypatch.setenv(
+        "ANTHROPIC_BASE_URL",
+        "https://token-plan-sgp.xiaomimimo.com/anthropic",
+    )
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "mimo-v2-flash"}, config_path=configs_dir
+    )
+
+    await adapter.setup(cfg)
+
+    # Operator value untouched — adapter must not overwrite.
+    assert (
+        os.environ.get("ANTHROPIC_BASE_URL")
+        == "https://token-plan-sgp.xiaomimimo.com/anthropic"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_passes_when_oauth_model_no_base_url(
+    adapter, monkeypatch, configs_dir
+):
     """OAuth-aliased models (sonnet/opus/haiku) are Anthropic-native; no
     base URL is required. setup() must not raise on the OAuth path even
     though base_url is unset — that's the historical happy path.
     """
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     cfg = _StubAdapterConfig(
-        runtime_config={"model": "sonnet"}, config_path="/tmp/configs"
+        runtime_config={"model": "sonnet"}, config_path=configs_dir
     )
 
     await adapter.setup(cfg)
@@ -296,7 +428,7 @@ async def test_setup_passes_when_oauth_model_no_base_url(adapter, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_setup_passes_when_anthropic_api_model_no_base_url(
-    adapter, monkeypatch
+    adapter, monkeypatch, configs_dir
 ):
     """claude-* versioned ids are Anthropic API-key path; base URL
     optional (defaults to api.anthropic.com). setup() must not raise.
@@ -304,7 +436,210 @@ async def test_setup_passes_when_anthropic_api_model_no_base_url(
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     cfg = _StubAdapterConfig(
         runtime_config={"model": "claude-sonnet-4-6"},
-        config_path="/tmp/configs",
+        config_path=configs_dir,
     )
 
     await adapter.setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_falls_back_to_builtin_when_yaml_missing(
+    adapter, monkeypatch, empty_configs_dir
+):
+    """No config.yaml in the configs dir → _load_providers falls back to
+    _BUILTIN_PROVIDERS (oauth + anthropic-api only). OAuth-aliased models
+    must still resolve cleanly so a bare-bones workspace boots even if
+    config.yaml is missing or malformed.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path=empty_configs_dir
+    )
+
+    await adapter.setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_raises_when_yaml_missing_and_third_party_model(
+    adapter, monkeypatch, empty_configs_dir
+):
+    """No config.yaml + third-party model picked → builtin registry has no
+    matching prefix → resolves to the OAuth fallback (provider[0]). The
+    user picked a model the builtin can't route, so OAuth's auth_env
+    won't have the right key, but it won't raise here — auth check is
+    a warning, not an error. setup() should complete (no third-party
+    misconfig fires because the fallback isn't third-party).
+
+    Documented behavior: when YAML is missing, third-party models are
+    silently downgraded to OAuth fallback. Operators must fix their
+    config.yaml to get correct routing. This test pins that the failure
+    mode is "warning + boots" rather than "raises" (helps debug-vs-recover
+    triage when CI loses the YAML somehow).
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "mimo-v2-flash"}, config_path=empty_configs_dir
+    )
+
+    # No raise — falls back to OAuth provider, third-party gate doesn't fire.
+    await adapter.setup(cfg)
+
+
+@pytest.mark.asyncio
+async def test_setup_auth_token_alone_satisfies_third_party_check(
+    adapter, monkeypatch, configs_dir, caplog
+):
+    """MiniMax docs prefer ANTHROPIC_AUTH_TOKEN over ANTHROPIC_API_KEY.
+    The provider entry lists both as accepted; setting only AUTH_TOKEN
+    must NOT trigger the "no auth env set" warning.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "test-minimax-token")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2"}, config_path=configs_dir
+    )
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        await adapter.setup(cfg)
+
+    auth_warnings = [r for r in caplog.records if "AuthenticationError" in r.getMessage()]
+    assert auth_warnings == [], (
+        "ANTHROPIC_AUTH_TOKEN alone should satisfy minimax provider auth "
+        "but adapter logged a missing-auth warning anyway"
+    )
+
+
+# ---- _load_providers / _resolve_provider unit tests ----
+
+
+def test_load_providers_returns_builtin_when_yaml_missing(tmp_path):
+    """FileNotFoundError path returns the in-code defaults verbatim."""
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    result = adapter_module._load_providers(str(tmp_path))
+    assert result == adapter_module._BUILTIN_PROVIDERS
+
+
+def test_load_providers_parses_yaml_and_normalizes(tmp_path):
+    """YAML present + parses → normalized tuple of provider dicts."""
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    (tmp_path / "config.yaml").write_text(_FIXTURE_PROVIDERS_YAML)
+    result = adapter_module._load_providers(str(tmp_path))
+
+    assert len(result) == 7
+    names = [p["name"] for p in result]
+    assert names == [
+        "anthropic-oauth", "anthropic-api", "xiaomi-mimo", "minimax",
+        "zai", "moonshot", "deepseek",
+    ]
+    # YAML lists must be normalized to tuples for downstream lookup ergonomics.
+    assert isinstance(result[0]["model_aliases"], tuple)
+    assert isinstance(result[2]["model_prefixes"], tuple)
+
+
+@pytest.mark.parametrize("model,expected_provider,expected_url", [
+    ("GLM-4.6", "zai", "https://api.z.ai/api/anthropic"),
+    ("glm-4.5", "zai", "https://api.z.ai/api/anthropic"),
+    ("kimi-k2.5", "moonshot", "https://api.moonshot.ai/anthropic"),
+    ("deepseek-v4-pro", "deepseek", "https://api.deepseek.com/anthropic"),
+])
+@pytest.mark.asyncio
+async def test_setup_routes_extra_providers(
+    adapter, monkeypatch, configs_dir, model, expected_provider, expected_url
+):
+    """The Z.ai / Moonshot / DeepSeek providers added in this PR must
+    route correctly: model id → provider entry → ANTHROPIC_BASE_URL.
+    Parametrized to keep the matrix coverage tight without 3 near-identical
+    test bodies. Locks in the per-vendor base_url so a future YAML edit
+    that mistypes z.ai's `/api/anthropic` suffix gets caught.
+    """
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": model}, config_path=configs_dir
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == expected_url
+
+
+def test_load_providers_falls_back_on_malformed_yaml(tmp_path, caplog):
+    """Malformed YAML → log warning + fallback (don't kill boot)."""
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    (tmp_path / "config.yaml").write_text("providers: [not valid yaml: {{{")
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        result = adapter_module._load_providers(str(tmp_path))
+
+    assert result == adapter_module._BUILTIN_PROVIDERS
+
+
+def test_resolve_provider_minimax_prefix_matches_minimax_provider():
+    """The headline routing test: MiniMax-M2 lands on the minimax entry."""
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    providers = tuple(
+        adapter_module._normalize_provider(p) for p in [
+            {"name": "anthropic-oauth", "auth_mode": "oauth",
+             "model_aliases": ["sonnet"], "auth_env": ["CLAUDE_CODE_OAUTH_TOKEN"]},
+            {"name": "minimax", "auth_mode": "third_party_anthropic_compat",
+             "model_prefixes": ["minimax-"],
+             "base_url": "https://api.minimax.io/anthropic",
+             "auth_env": ["ANTHROPIC_AUTH_TOKEN"]},
+        ]
+    )
+
+    result = adapter_module._resolve_provider("MiniMax-M2", providers)
+    assert result["name"] == "minimax"
+
+    # Case insensitivity also exercised.
+    result2 = adapter_module._resolve_provider("minimax-m2.7", providers)
+    assert result2["name"] == "minimax"
+
+
+def test_resolve_provider_falls_back_to_first_when_unknown():
+    """Unknown model id → fallback to first provider (OAuth by convention)."""
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    providers = tuple(
+        adapter_module._normalize_provider(p) for p in [
+            {"name": "anthropic-oauth", "auth_mode": "oauth",
+             "auth_env": ["CLAUDE_CODE_OAUTH_TOKEN"]},
+            {"name": "minimax", "auth_mode": "third_party_anthropic_compat",
+             "model_prefixes": ["minimax-"],
+             "auth_env": ["ANTHROPIC_AUTH_TOKEN"]},
+        ]
+    )
+
+    result = adapter_module._resolve_provider("some-unknown-model", providers)
+    assert result["name"] == "anthropic-oauth"
