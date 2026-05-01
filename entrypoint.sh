@@ -81,35 +81,12 @@ elif [ -n "${GH_TOKEN:-}" ]; then
     echo "${GH_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
 fi
 
-# Third-party Anthropic-API-compatible provider routing.
-# The `claude` CLI honors ANTHROPIC_BASE_URL natively; we rewrite it
-# based on MODEL so a Xiaomi MiMo selection lands on Xiaomi's endpoint
-# without code changes inside the SDK. ANTHROPIC_API_KEY in this case
-# is the third-party provider key, not an Anthropic Console key.
-#
-# Refuses to clobber an operator-set ANTHROPIC_BASE_URL — if the user
-# provided one explicitly via secrets (e.g. a Xiaomi MiMo Token Plan
-# endpoint such as https://token-plan-sgp.xiaomimimo.com/anthropic),
-# that wins. The mapping below is only the fallback for known model
-# prefixes.
-#
-# Supported Xiaomi MiMo endpoints:
-#   - Pay-as-you-go: https://api.xiaomimimo.com/anthropic
-#   - Token Plan SG:  https://token-plan-sgp.xiaomimimo.com/anthropic
-#   - Token Plan HK:   https://token-plan-hk.xiaomimimo.com/anthropic
-# (Set ANTHROPIC_BASE_URL explicitly to use a specific endpoint.)
-#
-# Long-term this should move to a data-driven `runtime_env` field in
-# config.yaml read by the platform provisioner; tracked separately.
-case "${MODEL:-}" in
-    mimo-*)
-        if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
-            export ANTHROPIC_BASE_URL="https://api.xiaomimimo.com/anthropic"
-            echo "[entrypoint] MODEL=${MODEL} → ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}" >&2
-        else
-            echo "[entrypoint] MODEL=${MODEL} but ANTHROPIC_BASE_URL already set; not overriding" >&2
-        fi
-        ;;
-esac
+# Third-party provider routing is now handled by adapter.py at boot —
+# it reads the `providers:` registry from /configs/config.yaml and sets
+# ANTHROPIC_BASE_URL based on the picked MODEL. Adding a new provider
+# is a one-line YAML edit (see config.yaml's `providers:` section).
+# Operator-set ANTHROPIC_BASE_URL still wins as the escape hatch for
+# regional endpoints (e.g. Xiaomi's token-plan-sgp.*, MiniMax's
+# api.minimaxi.com China endpoint).
 
 exec molecule-runtime "$@"
