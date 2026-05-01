@@ -34,8 +34,82 @@ if [ "$(id -u)" = "0" ]; then
         chown -R agent:agent /root/.claude /home/agent/.claude 2>/dev/null
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
+
+    # GitHub credential helper setup (fix #1933 / #1866 / #547).
+    # Runs as root so the global gitconfig is written before we drop to agent.
+    # The helper fetches fresh GitHub App installation tokens from the
+    # platform API on every git push/clone, with caching + env-var fallback.
+    if [ -x /app/scripts/molecule-git-token-helper.sh ]; then
+        git config --global "credential.https://github.com.helper" \
+            "!/app/scripts/molecule-git-token-helper.sh"
+        git config --global "credential.https://github.com.useHttpPath" true
+        if [ -f /root/.gitconfig ]; then
+            cp /root/.gitconfig /home/agent/.gitconfig
+            chown agent:agent /home/agent/.gitconfig
+        fi
+    fi
+    mkdir -p /home/agent/.molecule-token-cache
+    chown agent:agent /home/agent/.molecule-token-cache
+    chmod 700 /home/agent/.molecule-token-cache
+
     exec gosu agent "$0" "$@"
 fi
 
 # Now running as agent (uid 1000)
+
+# Background token refresh daemon — keeps `gh` CLI auth + credential helper
+# cache warm across the ~60 min GitHub App installation token TTL. Wrapped
+# in a respawn loop so a daemon crash doesn't silently leave the workspace
+# stuck on an expired token (which is exactly how #1933 was discovered).
+if [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
+    nohup bash -c '
+        while true; do
+            /app/scripts/molecule-gh-token-refresh.sh
+            rc=$?
+            echo "[molecule-gh-token-refresh] daemon exited rc=$rc — respawning in 30s" >&2
+            sleep 30
+        done
+    ' > /home/agent/.gh-token-refresh.log 2>&1 &
+fi
+
+# Initial gh auth — primes the CLI with whatever GH_TOKEN/GITHUB_TOKEN was
+# injected at provision time, so commands work in the ~60s window before the
+# background daemon's first refresh fires.
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+    echo "${GITHUB_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
+elif [ -n "${GH_TOKEN:-}" ]; then
+    echo "${GH_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
+fi
+
+# Third-party Anthropic-API-compatible provider routing.
+# The `claude` CLI honors ANTHROPIC_BASE_URL natively; we rewrite it
+# based on MODEL so a Xiaomi MiMo selection lands on Xiaomi's endpoint
+# without code changes inside the SDK. ANTHROPIC_API_KEY in this case
+# is the third-party provider key, not an Anthropic Console key.
+#
+# Refuses to clobber an operator-set ANTHROPIC_BASE_URL — if the user
+# provided one explicitly via secrets (e.g. a Xiaomi MiMo Token Plan
+# endpoint such as https://token-plan-sgp.xiaomimimo.com/anthropic),
+# that wins. The mapping below is only the fallback for known model
+# prefixes.
+#
+# Supported Xiaomi MiMo endpoints:
+#   - Pay-as-you-go: https://api.xiaomimimo.com/anthropic
+#   - Token Plan SG:  https://token-plan-sgp.xiaomimimo.com/anthropic
+#   - Token Plan HK:   https://token-plan-hk.xiaomimimo.com/anthropic
+# (Set ANTHROPIC_BASE_URL explicitly to use a specific endpoint.)
+#
+# Long-term this should move to a data-driven `runtime_env` field in
+# config.yaml read by the platform provisioner; tracked separately.
+case "${MODEL:-}" in
+    mimo-*)
+        if [ -z "${ANTHROPIC_BASE_URL:-}" ]; then
+            export ANTHROPIC_BASE_URL="https://api.xiaomimimo.com/anthropic"
+            echo "[entrypoint] MODEL=${MODEL} → ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}" >&2
+        else
+            echo "[entrypoint] MODEL=${MODEL} but ANTHROPIC_BASE_URL already set; not overriding" >&2
+        fi
+        ;;
+esac
+
 exec molecule-runtime "$@"

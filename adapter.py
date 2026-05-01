@@ -4,6 +4,7 @@ import json
 import os
 import logging
 from pathlib import Path
+from urllib.parse import urlparse
 
 from molecule_runtime.adapters.base import BaseAdapter, AdapterConfig, RuntimeCapabilities
 from a2a.server.agent_execution import AgentExecutor
@@ -13,6 +14,47 @@ logger = logging.getLogger(__name__)
 # Cap one transcript response at 1000 lines so a paranoid client can't OOM
 # the workspace by polling /transcript?limit=999999.
 _TRANSCRIPT_MAX_LIMIT = 1000
+
+# Auth-mode classification for a selected model id. The Claude Code CLI
+# accepts three auth paths and the right env var differs per path; warning
+# at boot about the wrong var (the pre-multi-provider behavior) misled
+# operators who picked an API-key or third-party model. New third-party
+# providers add a prefix → mode entry below + a model-prefix → base-URL
+# mapping in entrypoint.sh until the data-driven `runtime_env` schema
+# field lands platform-side.
+_AUTH_MODE_OAUTH = "oauth"
+_AUTH_MODE_ANTHROPIC_API = "anthropic_api"
+_AUTH_MODE_THIRD_PARTY = "third_party_anthropic_compat"
+
+_THIRD_PARTY_PREFIXES = ("mimo-",)
+_OAUTH_ALIASES = frozenset({"sonnet", "opus", "haiku"})
+
+
+def _detect_auth_mode(model: str) -> str:
+    """Classify the picked model into one of three auth paths.
+
+    Used by setup() to validate the right env var is set so operators see
+    the misconfiguration at boot instead of on the first LLM call.
+    Unknown ids default to OAuth — the historical default and the safest
+    fallback for the warning path.
+    """
+    if not model:
+        return _AUTH_MODE_OAUTH
+    m = model.lower()
+    if any(m.startswith(p) for p in _THIRD_PARTY_PREFIXES):
+        return _AUTH_MODE_THIRD_PARTY
+    if m.startswith("claude-"):
+        return _AUTH_MODE_ANTHROPIC_API
+    if m in _OAUTH_ALIASES:
+        return _AUTH_MODE_OAUTH
+    return _AUTH_MODE_OAUTH
+
+
+def _required_env_for_mode(mode: str) -> str:
+    """The env var the claude CLI needs to authenticate for a given mode."""
+    if mode == _AUTH_MODE_OAUTH:
+        return "CLAUDE_CODE_OAUTH_TOKEN"
+    return "ANTHROPIC_API_KEY"
 
 
 class ClaudeCodeAdapter(BaseAdapter):
@@ -94,6 +136,60 @@ class ClaudeCodeAdapter(BaseAdapter):
         ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
         :class:`AgentskillsAdaptor` writes to both.
         """
+        # KI-001 fix, generalized for the three auth paths the CLI supports:
+        # OAuth (CLAUDE_CODE_OAUTH_TOKEN), Anthropic API (ANTHROPIC_API_KEY),
+        # and third-party Anthropic-API-compat (ANTHROPIC_API_KEY + provider
+        # ANTHROPIC_BASE_URL). Detect the path from the picked model so the
+        # warning targets the *right* env var — the pre-multi-provider code
+        # always warned about CLAUDE_CODE_OAUTH_TOKEN even when the user had
+        # legitimately picked an API-key model and set ANTHROPIC_API_KEY.
+        rc = config.runtime_config
+        if isinstance(rc, dict):
+            picked_model = rc.get("model") or "sonnet"
+        else:
+            picked_model = getattr(rc, "model", None) or "sonnet"
+        auth_mode = _detect_auth_mode(picked_model)
+        required_var = _required_env_for_mode(auth_mode)
+
+        # Single-line startup banner — operators reading boot logs can see
+        # which provider path was selected and whether ANTHROPIC_BASE_URL
+        # (set by entrypoint.sh for third-party mimo-*) took effect. URL is
+        # logged as host-only; defensive against credential-shaped query
+        # strings even though base_url shouldn't carry one.
+        base_url = os.environ.get("ANTHROPIC_BASE_URL")
+        base_url_host = ""
+        if base_url:
+            try:
+                base_url_host = urlparse(base_url).netloc or "<unparseable>"
+            except Exception:
+                base_url_host = "<unparseable>"
+        logger.info(
+            "Claude Code adapter starting: model=%s auth_mode=%s required_env=%s%s",
+            picked_model, auth_mode, required_var,
+            f" base_url_host={base_url_host}" if base_url_host else "",
+        )
+
+        if not os.environ.get(required_var):
+            logger.warning(
+                "%s is not set for model=%s (auth_mode=%s) — the adapter will fail "
+                "on the first LLM call with an AuthenticationError. Set the env "
+                "var or configure the key in your platform workspace settings.",
+                required_var, picked_model, auth_mode,
+            )
+
+        # Third-party paths additionally need ANTHROPIC_BASE_URL; entrypoint.sh
+        # sets it for known mimo-* prefixes. Surface the missing-base-URL
+        # case explicitly — the symptom otherwise is the CLI silently hitting
+        # api.anthropic.com with a third-party key, which 401s.
+        if auth_mode == _AUTH_MODE_THIRD_PARTY and not base_url:
+            logger.warning(
+                "model=%s is a third-party Anthropic-compat model but "
+                "ANTHROPIC_BASE_URL is unset — requests will land on the real "
+                "api.anthropic.com and fail with 401. Check entrypoint.sh's "
+                "model→base-URL mapping or set ANTHROPIC_BASE_URL via secrets.",
+                picked_model,
+            )
+
         from molecule_runtime.plugins import load_plugins
         workspace_plugins_dir = os.path.join(config.config_path, "plugins")
         plugins = load_plugins(

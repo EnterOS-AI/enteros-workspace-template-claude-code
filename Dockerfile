@@ -55,6 +55,19 @@ COPY claude_sdk_executor.py .
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter
 
+# Git credential helper + background refresh daemon — fix for #1933 / #1866 / #547.
+# Without these, GH_TOKEN injected at provision time expires after ~60 min
+# and every subsequent git push/clone returns 401, causing agents to
+# infinite-loop status reports back to PMs and overflow A2A queues.
+#
+# The helper hits the platform's /admin/github-installation-token endpoint
+# (and falls back to env-var GH_TOKEN when platform is unreachable). The
+# refresh daemon calls _refresh_gh every ~45 min so `gh` CLI auth and the
+# helper cache stay warm even when no git operation triggers a refresh.
+COPY scripts/molecule-git-token-helper.sh /app/scripts/molecule-git-token-helper.sh
+COPY scripts/molecule-gh-token-refresh.sh /app/scripts/molecule-gh-token-refresh.sh
+RUN chmod +x /app/scripts/molecule-git-token-helper.sh /app/scripts/molecule-gh-token-refresh.sh
+
 # Drop-priv entrypoint — claude-code refuses --dangerously-skip-permissions
 # as root, so we run molecule-runtime as the agent user (uid 1000).
 # The script handles volume-ownership fix + session-dir symlink before
