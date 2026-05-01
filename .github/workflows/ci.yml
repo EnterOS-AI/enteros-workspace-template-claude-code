@@ -13,7 +13,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -q pytest pytest-asyncio
+      # pyyaml is the runtime dep that adapter.py's _load_providers reads
+      # /configs/config.yaml through. In production it arrives transitively
+      # via molecule-ai-workspace-runtime; in this minimal test env we
+      # install it explicitly so the YAML-loading code path is actually
+      # exercised (without it, _load_providers' broad except-Exception
+      # swallows the ImportError and silently falls back to _BUILTIN_PROVIDERS,
+      # which is exactly the behavior that bit us 2026-04-30 when CI
+      # claimed green on a build that couldn't route any third-party model).
+      - run: pip install -q pytest pytest-asyncio pyyaml
       # Tests live under tests/ with their own pytest.ini that anchors
       # rootdir there — keeps pytest from importing the package
       # __init__.py (which does `from .adapter import ...` for runtime
