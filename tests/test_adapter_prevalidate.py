@@ -877,18 +877,28 @@ async def test_create_executor_strips_anthropic_prefix_dataclass(
 
 
 @pytest.mark.asyncio
-async def test_setup_strip_routes_prefixed_anthropic_to_anthropic_api(
+async def test_setup_keeps_prefix_routing_oauth_for_anthropic_prefix(
     adapter, monkeypatch, configs_dir, caplog
 ):
-    """With the prefix intact, `anthropic:claude-opus-4-7` doesn't match
-    anthropic-api's model_prefixes=("claude-",) and falls back to
-    anthropic-oauth — wrong for users on ANTHROPIC_API_KEY. The strip in
-    setup() must run BEFORE _resolve_provider so routing sees the bare id.
+    """The wheel default `anthropic:claude-opus-4-7` paired with an OAuth
+    workspace (CLAUDE_CODE_OAUTH_TOKEN set, no ANTHROPIC_API_KEY) is the
+    realistic production shape. setup() must NOT strip the prefix — doing
+    so makes `_resolve_provider` match anthropic-api's `claude-` prefix
+    and route the user away from oauth, after which the CLI hangs at
+    `initialize` because no API key is set. Caught live on workspace
+    dd40faf8 on 2026-05-01: the first prefix-strip pass in setup()
+    routed banner to `provider=anthropic-api`, OAuth user wedged.
+
+    Pin: leave routing untouched. The strip lives only in
+    create_executor() so the CLI gets a bare id. _resolve_provider's
+    fallback (providers[0] = anthropic-oauth) correctly serves the
+    OAuth + wheel-default combo.
     """
     import logging
 
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oat-test")
     cfg = _StubAdapterConfig(
         runtime_config={"model": "anthropic:claude-opus-4-7"},
         config_path=configs_dir,
@@ -902,6 +912,14 @@ async def test_setup_strip_routes_prefixed_anthropic_to_anthropic_api(
          if "Claude Code adapter starting" in r.getMessage()),
         "",
     )
-    assert "provider=anthropic-api" in banner, (
-        f"Expected provider=anthropic-api after stripping prefix; banner={banner!r}"
+    assert "provider=anthropic-oauth" in banner, (
+        f"Prefixed model with OAuth env must keep oauth routing; banner={banner!r}"
+    )
+    # And the no-API-key warning must NOT fire (OAuth env satisfies oauth).
+    auth_warnings = [
+        r.getMessage() for r in caplog.records
+        if "AuthenticationError" in r.getMessage()
+    ]
+    assert not auth_warnings, (
+        f"OAuth users should not see API-key warnings; got {auth_warnings}"
     )
