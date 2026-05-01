@@ -213,9 +213,59 @@ class ClaudeCodeAdapter(BaseAdapter):
         # RuntimeConfig dataclass. Read `model` defensively from either shape.
         rc = config.runtime_config
         if isinstance(rc, dict):
-            model = rc.get("model") or "sonnet"
+            explicit_model = rc.get("model") or ""
         else:
-            model = getattr(rc, "model", None) or "sonnet"
+            explicit_model = getattr(rc, "model", None) or ""
+
+        # Pre-validation: detect the misconfiguration combo that drove the
+        # 2026-04-30 staging incident — ANTHROPIC_BASE_URL pointed at a
+        # non-Anthropic upstream (MiniMax / OpenAI shim) but no explicit
+        # model was set, so we'd silently fall back to "sonnet" and the
+        # upstream would hang on the SDK --print probe for 30s before
+        # timing out. The platform's phantom-busy sweep then resets the
+        # workspace at the 10min mark — the user-visible failure is "every
+        # workspace dead" but the root cause is one missing env var.
+        #
+        # Fail fast here with an actionable message so the operator sees
+        # exactly what to fix instead of chasing ghosts in workspace logs.
+        # We only fire when ALL three are true:
+        #   1. ANTHROPIC_BASE_URL is set (custom upstream is in play)
+        #   2. The host is NOT api.anthropic.com (real Anthropic accepts
+        #      "sonnet" as a known alias, so the fallback is fine there)
+        #   3. The user did NOT set an explicit model (the check we want)
+        # Anthropic-native users with no model picked still get the
+        # "sonnet" fallback — that's correct behavior, no error.
+        base_url = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+        if base_url and not explicit_model:
+            from urllib.parse import urlparse
+            host = urlparse(base_url).hostname or ""
+            if host and host != "api.anthropic.com":
+                raise ValueError(
+                    "claude-code adapter: ANTHROPIC_BASE_URL points at a "
+                    f"non-Anthropic host ({host}) but no model is configured. "
+                    "The default fallback ('sonnet') is an Anthropic-native "
+                    "alias; non-Anthropic shims (MiniMax, OpenAI gateways, "
+                    "etc.) won't recognize it and the SDK --print probe will "
+                    "hang for 30s before timing out. Fix: set MODEL_PROVIDER "
+                    "as a workspace secret (canvas: Save+Restart with model "
+                    "picked) or set runtime_config.model in /configs/config.yaml."
+                )
+
+        model = explicit_model or "sonnet"
+        # Surface what we resolved to in logs — when the workspace agent
+        # eventually fails, this single line in the logs explains "the
+        # adapter sent X to Y" without having to dig into the SDK
+        # subprocess. Cheap diagnostic, no runtime cost.
+        if base_url:
+            from urllib.parse import urlparse
+            logger.info(
+                "claude-code: model=%s base_url_host=%s%s",
+                model,
+                urlparse(base_url).hostname or "<unparseable>",
+                " (custom upstream)" if base_url else "",
+            )
+        else:
+            logger.info("claude-code: model=%s base_url=anthropic-default", model)
 
         return ClaudeSDKExecutor(
             system_prompt=system_prompt,
