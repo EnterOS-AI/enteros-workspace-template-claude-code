@@ -23,6 +23,17 @@ if [ "$(id -u)" = "0" ]; then
         if [ -n "$first_entry" ] && [ "$(stat -c '%u' "$first_entry" 2>/dev/null)" = "0" ]; then
             chown -R agent:agent /workspace 2>/dev/null
         fi
+        # Pre-create /workspace/.molecule/chat-uploads so the upload
+        # handler in workspace/internal_chat_uploads.py never has to
+        # mkdir as agent inside a root-owned tree. Without this the
+        # first upload after a fresh provision fails with "failed to
+        # prepare uploads dir" because the volume mount comes up with
+        # root-owned `.molecule` whenever a sibling subsystem (e.g. an
+        # adapter writing telemetry, or a workspace runtime that ran
+        # before the chown landed) raced ahead. Idempotent: a re-run
+        # finds the dir already there, mode 0755 / agent:agent.
+        mkdir -p /workspace/.molecule/chat-uploads 2>/dev/null || true
+        chown -R agent:agent /workspace/.molecule 2>/dev/null || true
     fi
     # Claude Code session directory — mounted at /root/.claude/sessions by
     # the platform provisioner. Symlink it into agent's home so the SDK
