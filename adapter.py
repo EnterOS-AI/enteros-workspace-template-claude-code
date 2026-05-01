@@ -49,20 +49,66 @@ _BUILTIN_PROVIDERS = (
 )
 
 
-def _normalize_provider(entry: dict) -> dict:
+def _coerce_string_list(value, lowercase: bool = False) -> tuple:
+    """Defensively coerce a YAML field expected to be a list-of-strings.
+
+    Operator typos in config.yaml come in two shapes that both used to
+    silently produce wrong routing:
+      1. forgot brackets:  ``model_prefixes: mimo-``  (string, not list)
+      2. mixed types:      ``model_prefixes: [mimo-, 123]``  (int slips in)
+
+    Case 1 used to iterate over characters → ``('m','i','m','o','-')``,
+    making the entry match every model whose id starts with any of those
+    letters. Case 2 raised AttributeError mid-comprehension, killing the
+    whole registry build and silently falling back to builtins-only —
+    exactly the silent-fallback failure mode this PR was meant to fix.
+
+    Returns an empty tuple for any non-list (treated as "no entries");
+    drops non-string items in the list with a warning.
+
+    ``lowercase`` controls case-folding: True for case-insensitive
+    comparisons (model_prefixes, model_aliases — operators write
+    ``MiniMax-M2`` in YAML, model id arrives lowercased downstream),
+    False to preserve case (auth_env — env var names are
+    case-sensitive: ``CLAUDE_CODE_OAUTH_TOKEN`` ≠
+    ``claude_code_oauth_token``).
+    """
+    if not isinstance(value, list):
+        return ()
+    out = []
+    for item in value:
+        if not isinstance(item, str):
+            logger.warning(
+                "providers: skipping non-string list item %r (type %s)",
+                item, type(item).__name__,
+            )
+            continue
+        out.append(item.lower() if lowercase else item)
+    return tuple(out)
+
+
+def _normalize_provider(entry: dict):
     """Coerce a YAML-loaded provider dict into the shape adapter logic expects.
 
     YAML gives us lists (not tuples) and may omit optional keys. Normalize
     to the union of all fields so downstream lookups work without scattered
-    .get(...) calls.
+    .get(...) calls. Returns ``None`` for entries that can't be salvaged
+    (e.g. missing name) so the caller can drop them without poisoning the
+    rest of the registry.
     """
+    if not isinstance(entry, dict):
+        return None
+    name = entry.get("name")
+    if not name or not isinstance(name, str):
+        logger.warning("providers: skipping entry without a string name: %r", entry)
+        return None
     return {
-        "name": entry.get("name") or "<unnamed>",
+        "name": name,
         "auth_mode": entry.get("auth_mode") or _AUTH_MODE_OAUTH,
-        "model_prefixes": tuple(p.lower() for p in entry.get("model_prefixes") or ()),
-        "model_aliases": tuple(a.lower() for a in entry.get("model_aliases") or ()),
+        "model_prefixes": _coerce_string_list(entry.get("model_prefixes"), lowercase=True),
+        "model_aliases": _coerce_string_list(entry.get("model_aliases"), lowercase=True),
         "base_url": entry.get("base_url") or None,
-        "auth_env": tuple(entry.get("auth_env") or ()),
+        "auth_env": _coerce_string_list(entry.get("auth_env"), lowercase=False),
     }
 
 
@@ -76,22 +122,42 @@ def _load_providers(config_path: str) -> tuple:
     if the file is missing, malformed, or has no providers section, so a
     bare-bones workspace still boots with the historical defaults.
 
-    Mode mismatches (e.g. a provider entry without a name) are logged
-    but don't fail the load — better-something-than-nothing for boot.
+    Per-entry isolation: a single bad provider entry is dropped with a
+    warning; the rest of the registry survives. Used to be a generator
+    inside tuple(...) that propagated any AttributeError out and reverted
+    the whole registry to builtins — exactly the silent-fallback failure
+    mode this file's existence was meant to fix.
     """
     yaml_path = os.path.join(config_path, "config.yaml")
     try:
         import yaml  # transitive dep via molecule-ai-workspace-runtime
         with open(yaml_path, "r") as f:
             data = yaml.safe_load(f) or {}
-        raw = data.get("providers")
-        if isinstance(raw, list) and raw:
-            return tuple(_normalize_provider(p) for p in raw if isinstance(p, dict))
     except FileNotFoundError:
         logger.info("providers: %s not found, using builtin defaults", yaml_path)
+        return _BUILTIN_PROVIDERS
     except Exception as exc:  # noqa: BLE001 — defensive: never block boot on YAML
         logger.warning("providers: failed to load from %s (%s); using builtins", yaml_path, exc)
-    return _BUILTIN_PROVIDERS
+        return _BUILTIN_PROVIDERS
+
+    raw = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(raw, list) or not raw:
+        return _BUILTIN_PROVIDERS
+
+    parsed = []
+    for entry in raw:
+        try:
+            normalized = _normalize_provider(entry)
+        except Exception as exc:  # noqa: BLE001 — per-entry isolation
+            logger.warning("providers: dropping unparseable entry %r (%s)", entry, exc)
+            continue
+        if normalized is not None:
+            parsed.append(normalized)
+
+    if not parsed:
+        logger.warning("providers: no valid entries in %s; using builtins", yaml_path)
+        return _BUILTIN_PROVIDERS
+    return tuple(parsed)
 
 
 def _resolve_provider(model: str, providers: tuple) -> dict:

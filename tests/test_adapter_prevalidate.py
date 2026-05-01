@@ -622,6 +622,137 @@ def test_resolve_provider_minimax_prefix_matches_minimax_provider():
     assert result2["name"] == "minimax"
 
 
+def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog):
+    """Per-entry isolation: one malformed entry shouldn't nuke the registry.
+
+    Pre-fix: ``_load_providers`` built the registry via a generator inside
+    ``tuple(...)``. A single AttributeError mid-comprehension propagated
+    out and the broad except caught it, silently reverting to
+    ``_BUILTIN_PROVIDERS`` (oauth + anthropic-api only). Every third-party
+    model would then route to anthropic-oauth — exactly the silent-fallback
+    failure mode this PR was meant to eliminate.
+
+    Post-fix: per-entry try/except drops the bad entry with a warning,
+    rest of the registry survives.
+    """
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    yaml_with_typo = textwrap.dedent("""
+        providers:
+          - name: good-zai
+            auth_mode: third_party_anthropic_compat
+            model_prefixes: [glm-]
+            base_url: https://api.z.ai/api/anthropic
+            auth_env: [ANTHROPIC_AUTH_TOKEN]
+
+          # Operator typo: forgot list brackets, ints slipped in.
+          # Pre-fix: AttributeError on the int's .lower() killed the
+          # whole tuple build → registry fell back to builtins.
+          - name: bad-one
+            auth_mode: third_party_anthropic_compat
+            model_prefixes: [bad-, 123]
+            base_url: https://example.com
+            auth_env: [SOME_TOKEN]
+
+          - name: good-anthropic
+            auth_mode: anthropic_api
+            model_prefixes: [claude-]
+            auth_env: [ANTHROPIC_API_KEY]
+    """)
+    (tmp_path / "config.yaml").write_text(yaml_with_typo)
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        result = adapter_module._load_providers(str(tmp_path))
+
+    # All three entries survive — the integer is dropped, the rest of
+    # the bad-one entry's prefix list is kept (just `bad-`).
+    names = [p["name"] for p in result]
+    assert names == ["good-zai", "bad-one", "good-anthropic"], (
+        f"Expected all three entries to survive (with the int dropped from "
+        f"bad-one's prefixes), got {names}"
+    )
+
+    # Confirm the int got skipped, not silently coerced or crash-bubbled.
+    bad = next(p for p in result if p["name"] == "bad-one")
+    assert bad["model_prefixes"] == ("bad-",), (
+        f"Non-string list element should be dropped; got {bad['model_prefixes']}"
+    )
+
+    # Operator should see a warning so they can fix the YAML.
+    assert any("non-string" in r.getMessage() for r in caplog.records), (
+        "Expected a warning about the non-string list item"
+    )
+
+
+def test_load_providers_string_as_prefix_does_not_split_into_chars(tmp_path, caplog):
+    """A YAML field declared as list-of-strings but written as a bare
+    string (operator forgot brackets) used to silently iterate over
+    characters → ``('m','i','m','o','-')``. Post-fix: non-list value
+    coerces to empty tuple with no exception. The entry survives but
+    matches nothing — operator notices in the boot banner instead of
+    via mysteriously-misrouted requests.
+    """
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    yaml_str_prefix = textwrap.dedent("""
+        providers:
+          - name: typo-prefix
+            auth_mode: third_party_anthropic_compat
+            model_prefixes: mimo-
+            base_url: https://api.xiaomimimo.com/anthropic
+            auth_env: [ANTHROPIC_AUTH_TOKEN]
+    """)
+    (tmp_path / "config.yaml").write_text(yaml_str_prefix)
+
+    result = adapter_module._load_providers(str(tmp_path))
+    typo = next(p for p in result if p["name"] == "typo-prefix")
+    assert typo["model_prefixes"] == (), (
+        f"String value (forgot brackets) must coerce to empty tuple, not "
+        f"split into characters; got {typo['model_prefixes']}"
+    )
+
+
+def test_load_providers_drops_entry_without_name(tmp_path, caplog):
+    """An entry without ``name`` is operator error — no silent fallback
+    to ``<unnamed>``. Drop the entry with a warning so the boot log
+    surfaces the typo.
+    """
+    _install_stubs()
+    parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if parent_dir not in sys.path:
+        sys.path.insert(0, parent_dir)
+    sys.modules.pop("adapter", None)
+    import adapter as adapter_module
+
+    yaml_no_name = textwrap.dedent("""
+        providers:
+          - name: good
+            auth_mode: oauth
+            auth_env: [CLAUDE_CODE_OAUTH_TOKEN]
+          - auth_mode: third_party_anthropic_compat
+            model_prefixes: [foo-]
+    """)
+    (tmp_path / "config.yaml").write_text(yaml_no_name)
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        result = adapter_module._load_providers(str(tmp_path))
+
+    assert [p["name"] for p in result] == ["good"]
+    assert any("without a string name" in r.getMessage() for r in caplog.records)
+
+
 def test_resolve_provider_falls_back_to_first_when_unknown():
     """Unknown model id → fallback to first provider (OAuth by convention)."""
     _install_stubs()
