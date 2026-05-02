@@ -463,14 +463,6 @@ class ClaudeSDKExecutor(AgentExecutor):
             mcp_servers=mcp_servers,
             system_prompt=self._build_system_prompt(),
             resume=self._session_id,
-            # Forward --dangerously-load-development-channels to the spawned
-            # claude CLI so the host registers our experimental.claude/channel
-            # capability instead of dropping the notification on the allowlist
-            # check. The wheel ships the gates (PR molecule-core#2463) and the
-            # inbox bridge fires the notification, but without this flag the
-            # CLI silently filters it during the channels research preview.
-            # Remove once channels graduate to the default allowlist.
-            extra_args={"dangerously-load-development-channels": None},
         )
 
         # --- output_config: effort + task_budget (issue #652) ---
