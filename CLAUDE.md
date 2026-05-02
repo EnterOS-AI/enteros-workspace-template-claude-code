@@ -71,3 +71,22 @@ Skills persist across restarts. Use them to codify best practices, coding standa
 
 ## Language
 Always respond in the same language the user uses. If Chinese, respond in Chinese. If English, respond in English. Match exactly.
+
+## Runtime wedge integration
+
+The `runtime_wedge` module (in `molecule_runtime`) is the universal cross-cutting holder for "this Python process can no longer serve queries — only a workspace restart will recover." It surfaces unrecoverable wedges to two consumers:
+
+- **Heartbeat** — reads `runtime_wedge.is_wedged()` on each beat and reports `runtime_state="wedged"` to the platform, which flips the workspace card to `degraded` so the canvas surfaces a Restart hint instead of leaving the user staring at a green dot while every chat hangs.
+- **Boot smoke (`smoke_mode`)** — when the publish-image workflow boots the image with `MOLECULE_SMOKE_MODE=1`, the smoke runner consults `runtime_wedge.is_wedged()` at the end of every result path and upgrades a provisional PASS to FAIL when the flag is set. Catches PR-25-class regressions (malformed CLI argv → SDK init wedge) BEFORE the broken image ships to GHCR.
+
+The executor sets the flag in its catch arm in `claude_sdk_executor.py` (`_mark_sdk_wedged`) when `claude_agent_sdk` raises `Control request timeout: initialize` — that wedge corrupts the SDK's internal client-process state for the rest of the Python process, so every subsequent `_run_query()` call would hit the same wedge and re-throw without intervention. The flag is cleared automatically on the next successful query (`_clear_sdk_wedge_on_success`) so a transient handshake blip self-heals to `online` without a manual restart.
+
+## Channels CLI flag
+
+The executor passes `extra_args={"dangerously-load-development-channels": "server:molecule"}` to `claude-agent-sdk` when building `ClaudeAgentOptions` (see `_build_options` in `claude_sdk_executor.py`). This forwards `--dangerously-load-development-channels server:molecule` to the spawned `claude` CLI so the host registers the experimental `experimental.claude/channel` capability instead of dropping the notification on the allowlist check.
+
+The flag's value MUST be in tagged form — `server:<name>` for manually-configured MCP servers, `plugin:<name>@<marketplace>` for plugin channels. Claude Code 2.1.x+ rejects the bare flag with `argument missing` and the SDK times out at `initialize`, surfacing as `Control request timeout: initialize` upstream (which then trips the wedge path described above).
+
+Why this is needed: the in-workspace MCP server (the `a2a` server) emits `experimental.claude/channel` notifications so inbound peer/canvas messages render as `<channel>` push tags inline in the host claude session, without the agent having to poll an inbox. The wheel ships the gates and the inbox bridge fires the notification, but without this flag the CLI silently filters it during the channels research preview.
+
+Drop this flag once channels graduate from research preview to the default allowlist.
