@@ -463,6 +463,27 @@ class ClaudeSDKExecutor(AgentExecutor):
             mcp_servers=mcp_servers,
             system_prompt=self._build_system_prompt(),
             resume=self._session_id,
+            # Forward --dangerously-load-development-channels to the spawned
+            # claude CLI so the host registers our experimental.claude/channel
+            # capability instead of dropping the notification on the allowlist
+            # check. The wheel ships the gates (PR molecule-core#2463) and the
+            # inbox bridge fires the notification, but without this flag the
+            # CLI silently filters it during the channels research preview.
+            #
+            # The flag's signature in Claude Code 2.1.x takes an *allowlist*
+            # of tagged entries — `server:<name>` for manually-configured
+            # MCP servers, `plugin:<name>@<marketplace>` for plugin
+            # channels. Passing `None` (the original PR #25 shape) renders
+            # as a bare `--<flag>` with no value; the CLI rejects with
+            # `argument missing` and the SDK times out at `initialize`,
+            # surfacing as `Control request timeout: initialize` upstream
+            # (caught live on workspace dd40faf8 on 2026-05-01 — every
+            # A2A turn wedged 100% of the time). Verified live: with the
+            # tagged value, A2A returns coherent replies AND the host
+            # claude session renders inbound messages as `<channel>` tags
+            # inline (no inbox poll needed). Drop once channels graduate
+            # to the default allowlist.
+            extra_args={"dangerously-load-development-channels": "server:molecule"},
         )
 
         # --- output_config: effort + task_budget (issue #652) ---
