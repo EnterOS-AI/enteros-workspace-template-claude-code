@@ -147,16 +147,26 @@ def _mark_sdk_wedged(reason: str) -> None:
     if _sdk_wedged_reason is None:
         _sdk_wedged_reason = reason
         logger.error("SDK wedge detected: %s — workspace will report degraded until a successful query clears it", reason)
+        # Catch is narrowed to import errors: a SIGNATURE drift
+        # (mark_wedged renamed/removed) must surface so the smoke gate
+        # + heartbeat aren't silently blind. The runtime's structural
+        # snapshot test (molecule-core task #169) catches the rename
+        # at PR-time. Older runtimes that don't ship runtime_wedge at
+        # all hit ImportError here and silently no-op the mirror —
+        # the local sticky flag still gates is_wedged() inside this
+        # module so internal callers (retry loop, cancel handler)
+        # keep working.
         try:
             from molecule_runtime.runtime_wedge import mark_wedged as _mark_runtime_wedged
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             return
         try:
             _mark_runtime_wedged(reason)
         except Exception:
-            # Mirror is best-effort — a runtime_wedge regression
-            # (signature change, internal raise) must not silently
-            # suppress the local wedge state.
+            # Mirror call (not import) is still best-effort — a
+            # runtime_wedge internal raise must not silently suppress
+            # the local wedge state. Logged loudly so the regression
+            # is at least visible in the executor log.
             logger.exception("runtime_wedge.mark_wedged mirror failed — local SDK wedge flag is still set")
 
 
@@ -177,9 +187,10 @@ def _clear_sdk_wedge_on_success() -> None:
     if _sdk_wedged_reason is not None:
         logger.info("SDK wedge cleared after successful query — workspace will recover to online on next heartbeat")
         _sdk_wedged_reason = None
+        # Same import-narrowing rationale as _mark_sdk_wedged above.
         try:
             from molecule_runtime.runtime_wedge import clear_wedge as _clear_runtime_wedge
-        except Exception:
+        except (ImportError, ModuleNotFoundError):
             return
         try:
             _clear_runtime_wedge()

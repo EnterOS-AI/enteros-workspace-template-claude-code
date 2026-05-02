@@ -228,3 +228,100 @@ def test_mirror_swallows_runtime_wedge_import_error():
     # Clear path also swallows.
     mod._clear_sdk_wedge_on_success()
     assert mod.is_wedged() is False
+
+
+# ─── Mirror-call-failure injection (review follow-up) ──────────────────
+#
+# The recorder above never raises, so the inner `try` arm around
+# `_mark_runtime_wedged(reason)` (and the symmetric clear) wasn't
+# pinned by the original mirror tests. Inject a recorder whose
+# call-side raises so the catch arm is exercised: the mirror failure
+# must be logged but must NOT suppress the local sticky flag.
+
+
+def _install_runtime_wedge_raising_recorder() -> dict:
+    """Replace molecule_runtime.runtime_wedge with a recorder whose
+    mark_wedged + clear_wedge implementations RAISE on call (not on
+    import). Captures the call-attempt count so the test can verify
+    the catch arm fired without leaking the exception. Returns the
+    recorder dict (mark_attempts, clear_attempts)."""
+    rec = {"mark_attempts": 0, "clear_attempts": 0}
+    mod = types.ModuleType("molecule_runtime.runtime_wedge")
+
+    def _mark(_reason: str) -> None:
+        rec["mark_attempts"] += 1
+        raise RuntimeError("simulated runtime_wedge.mark_wedged internal raise")
+
+    def _clear() -> None:
+        rec["clear_attempts"] += 1
+        raise RuntimeError("simulated runtime_wedge.clear_wedge internal raise")
+
+    mod.mark_wedged = _mark
+    mod.clear_wedge = _clear
+    sys.modules["molecule_runtime.runtime_wedge"] = mod
+    return rec
+
+
+def test_mark_sdk_wedged_swallows_mirror_call_exception(caplog):
+    """If runtime_wedge.mark_wedged itself raises (signature is fine,
+    body has a bug), the caller in claude_sdk_executor must log AND
+    keep the local sticky flag set. Otherwise an internal regression
+    in runtime_wedge would silently make this workspace appear healthy
+    while every chat actually hangs.
+    """
+    import logging
+    rec = _install_runtime_wedge_raising_recorder()
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+
+    with caplog.at_level(logging.ERROR, logger="claude_sdk_executor"):
+        mod._mark_sdk_wedged("local-and-mirror reason")
+
+    assert rec["mark_attempts"] == 1, (
+        "executor never called runtime_wedge.mark_wedged — the inner "
+        "try block was skipped or short-circuited"
+    )
+    assert mod.is_wedged() is True, (
+        "mirror-call exception suppressed the local sticky flag — "
+        "violates the 'mirror is best-effort, local is source of truth' "
+        "contract"
+    )
+    assert mod.wedge_reason() == "local-and-mirror reason"
+    # Loud log line is the only operator-visible signal that the mirror
+    # silently failed — pin its presence so a future logger.exception →
+    # logger.debug downgrade can't sneak through.
+    assert any(
+        "runtime_wedge.mark_wedged mirror failed" in r.message
+        for r in caplog.records
+    ), "mirror-call failure was not logged at ERROR — operator can't see the regression"
+
+
+def test_clear_sdk_wedge_on_success_swallows_mirror_call_exception(caplog):
+    """Symmetric to the mark test: a runtime_wedge.clear_wedge bug
+    must not leave the local flag stuck-on (which would make
+    auto-recovery silently broken even though the SDK started working
+    again)."""
+    import logging
+    rec = _install_runtime_wedge_raising_recorder()
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    mod._mark_sdk_wedged("transient")
+    # Mark also raised but local flag is set — that's the precondition.
+    assert mod.is_wedged() is True
+    rec["mark_attempts"] = 0  # only count the clear attempt below
+
+    with caplog.at_level(logging.ERROR, logger="claude_sdk_executor"):
+        mod._clear_sdk_wedge_on_success()
+
+    assert rec["clear_attempts"] == 1, (
+        "executor never called runtime_wedge.clear_wedge — inner try "
+        "block was skipped"
+    )
+    assert mod.is_wedged() is False, (
+        "mirror clear-call exception left the local sticky flag set — "
+        "auto-recovery is silently broken"
+    )
+    assert any(
+        "runtime_wedge.clear_wedge mirror failed" in r.message
+        for r in caplog.records
+    ), "clear mirror-call failure was not logged at ERROR"
