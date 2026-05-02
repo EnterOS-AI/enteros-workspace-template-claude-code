@@ -95,10 +95,18 @@ _RETRYABLE_PATTERNS = (
 # its read pipe are in an unrecoverable state); only a workspace restart
 # clears it.
 #
-# The heartbeat task reads these helpers and reports
-# `runtime_state="wedged"` to the platform, which flips the workspace to
-# `degraded` so the canvas surfaces a Restart hint instead of leaving
-# the user staring at a green dot while every chat hangs.
+# Two consumers read these helpers:
+#   1. Heartbeat (via molecule_runtime.runtime_wedge — see _mark_sdk_wedged
+#      below). Reports `runtime_state="wedged"` to the platform, which
+#      flips the workspace to `degraded` so the canvas surfaces a Restart
+#      hint instead of leaving the user staring at a green dot while
+#      every chat hangs.
+#   2. Boot smoke (molecule-core task #131). When the publish-image
+#      workflow boots the image with MOLECULE_SMOKE_MODE=1,
+#      run_executor_smoke consults runtime_wedge.is_wedged() at the end
+#      of every result path and upgrades a provisional PASS to FAIL when
+#      the flag is set. Catches PR-25-class regressions (malformed CLI
+#      argv → SDK init wedge) BEFORE the broken image ships to GHCR.
 #
 # Module scope (not instance scope) is deliberate: the wedge is a
 # property of the Python process, not the executor. A future per-org
@@ -123,11 +131,33 @@ def wedge_reason() -> str:
 def _mark_sdk_wedged(reason: str) -> None:
     """Internal — flag the SDK as wedged. Only the first call wins
     (subsequent identical wedges shouldn't overwrite a more specific
-    reason). Tests use `_reset_sdk_wedge_for_test()` to clear."""
+    reason). Tests use `_reset_sdk_wedge_for_test()` to clear.
+
+    Mirrors the flag into molecule_runtime.runtime_wedge — that's the
+    universal cross-cutting wedge holder that heartbeat.py reads (to
+    flip the workspace to `degraded`) and that smoke_mode reads (to
+    fail the publish-image gate on init wedges, task #131). Without
+    this mirror the local sticky flag is unobserved by both consumers.
+    Best-effort: a missing/older runtime that doesn't ship runtime_wedge
+    silently no-ops the mirror — the local flag still gates
+    is_wedged() inside this module so internal callers (retry loop,
+    cancel handler) keep working.
+    """
     global _sdk_wedged_reason
     if _sdk_wedged_reason is None:
         _sdk_wedged_reason = reason
         logger.error("SDK wedge detected: %s — workspace will report degraded until a successful query clears it", reason)
+        try:
+            from molecule_runtime.runtime_wedge import mark_wedged as _mark_runtime_wedged
+        except Exception:
+            return
+        try:
+            _mark_runtime_wedged(reason)
+        except Exception:
+            # Mirror is best-effort — a runtime_wedge regression
+            # (signature change, internal raise) must not silently
+            # suppress the local wedge state.
+            logger.exception("runtime_wedge.mark_wedged mirror failed — local SDK wedge flag is still set")
 
 
 def _clear_sdk_wedge_on_success() -> None:
@@ -139,11 +169,22 @@ def _clear_sdk_wedge_on_success() -> None:
     next heartbeat after a working query reports `runtime_state` empty
     and the platform flips status back to online.
 
+    Symmetric with _mark_sdk_wedged: also clears the universal
+    runtime_wedge flag so heartbeat + smoke_mode see the same state.
+
     No-op when not wedged (the common case)."""
     global _sdk_wedged_reason
     if _sdk_wedged_reason is not None:
         logger.info("SDK wedge cleared after successful query — workspace will recover to online on next heartbeat")
         _sdk_wedged_reason = None
+        try:
+            from molecule_runtime.runtime_wedge import clear_wedge as _clear_runtime_wedge
+        except Exception:
+            return
+        try:
+            _clear_runtime_wedge()
+        except Exception:
+            logger.exception("runtime_wedge.clear_wedge mirror failed — local clear succeeded")
 
 
 def _reset_sdk_wedge_for_test() -> None:
