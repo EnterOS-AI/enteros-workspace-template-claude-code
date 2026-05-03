@@ -58,7 +58,10 @@ providers:
     model_prefixes: [minimax-]
     model_aliases: []
     base_url: https://api.minimax.io/anthropic
-    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+    # Vendor-specific name FIRST so the boot-time projection helper
+    # (_project_vendor_auth in adapter.py) picks it over a stale
+    # ANTHROPIC_AUTH_TOKEN belonging to a sibling vendor.
+    auth_env: [MINIMAX_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
   # Z.ai — GLM family. docs.z.ai/scenario-example/develop-tools/claude.
   # Model ids are uppercase (GLM-4.6) but the registry lowercases for
@@ -68,7 +71,7 @@ providers:
     model_prefixes: [glm-]
     model_aliases: []
     base_url: https://api.z.ai/api/anthropic
-    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+    auth_env: [GLM_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
   # Moonshot AI — Kimi family. platform.kimi.ai/docs/guide/agent-support.
   - name: moonshot
@@ -76,7 +79,7 @@ providers:
     model_prefixes: [kimi-]
     model_aliases: []
     base_url: https://api.moonshot.ai/anthropic
-    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+    auth_env: [KIMI_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
   # DeepSeek — api-docs.deepseek.com/guides/anthropic_api. Note: their
   # endpoint silently maps unknown model ids to deepseek-v4-flash, so a
@@ -87,7 +90,7 @@ providers:
     model_prefixes: [deepseek-]
     model_aliases: []
     base_url: https://api.deepseek.com/anthropic
-    auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+    auth_env: [DEEPSEEK_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
 runtime: claude-code
 runtime_config:
@@ -145,50 +148,54 @@ runtime_config:
       required_env: [ANTHROPIC_API_KEY]
 
     # --- MiniMax (third-party, Anthropic-API-compatible) ---
-    # Routed via the `minimax` provider entry above. MiniMax docs prefer
-    # ANTHROPIC_AUTH_TOKEN (Bearer-style) — see platform.minimax.io/docs/token-plan/claude-code.
-    # ANTHROPIC_API_KEY also works (the claude CLI accepts both).
+    # Vendor-specific env var so a user with multiple third-party Anthropic-
+    # compat keys can run multiple workspaces simultaneously without them
+    # fighting over a shared ANTHROPIC_AUTH_TOKEN slot. The adapter projects
+    # MINIMAX_API_KEY → ANTHROPIC_AUTH_TOKEN at boot (only when
+    # ANTHROPIC_AUTH_TOKEN is unset, so an explicit operator override wins).
+    # Mirrors hermes-side fix from task #249 / hermes PR #38.
     - id: MiniMax-M2
       name: MiniMax M2 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [MINIMAX_API_KEY]
     - id: MiniMax-M2.7
       name: MiniMax M2.7 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [MINIMAX_API_KEY]
     - id: MiniMax-M2.7-highspeed
       name: MiniMax M2.7 High-Speed (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [MINIMAX_API_KEY]
 
     # --- Z.ai GLM family (third-party, Anthropic-API-compatible) ---
-    # Routed via the `zai` provider entry. docs.z.ai for the full
-    # Anthropic-compat docs. GLM-4.6 is the current-gen flagship; 4.5
-    # remains for users on legacy quotas.
+    # GLM_API_KEY → ANTHROPIC_AUTH_TOKEN projection at boot. docs.z.ai for
+    # the full Anthropic-compat docs. GLM-4.6 is the current-gen flagship;
+    # 4.5 remains for users on legacy quotas.
     - id: GLM-4.6
       name: Z.ai GLM-4.6 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [GLM_API_KEY]
     - id: GLM-4.5
       name: Z.ai GLM-4.5 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [GLM_API_KEY]
 
     # --- Moonshot AI Kimi family (third-party, Anthropic-API-compatible) ---
-    # Routed via the `moonshot` provider entry. platform.kimi.ai for docs.
-    # K2.5 is the latest agentic-coding tier; K2 stays as a cheaper option.
+    # KIMI_API_KEY → ANTHROPIC_AUTH_TOKEN projection at boot.
+    # platform.kimi.ai for docs. K2.5 is the latest agentic-coding tier;
+    # K2 stays as a cheaper option.
     - id: kimi-k2.5
       name: Moonshot Kimi K2.5 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [KIMI_API_KEY]
     - id: kimi-k2
       name: Moonshot Kimi K2 (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [KIMI_API_KEY]
 
     # --- DeepSeek (third-party, Anthropic-API-compatible) ---
-    # Routed via the `deepseek` provider entry. api-docs.deepseek.com.
-    # Note: unknown deepseek-* ids silently fall back to v4-flash on
-    # DeepSeek's side — pick the exact tier you mean.
+    # DEEPSEEK_API_KEY → ANTHROPIC_AUTH_TOKEN projection at boot.
+    # api-docs.deepseek.com. Note: unknown deepseek-* ids silently fall
+    # back to v4-flash on DeepSeek's side — pick the exact tier you mean.
     - id: deepseek-v4-pro
       name: DeepSeek V4 Pro (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [DEEPSEEK_API_KEY]
     - id: deepseek-v4-flash
       name: DeepSeek V4 Flash (third-party, Anthropic-API-compatible)
-      required_env: [ANTHROPIC_AUTH_TOKEN]
+      required_env: [DEEPSEEK_API_KEY]
 
   # Default required_env — per-model entries above override this once a
   # model is picked. Keep CLAUDE_CODE_OAUTH_TOKEN as the default so
