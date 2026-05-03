@@ -223,6 +223,63 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
+# Vendor-specific env names that are SAFE to copy into ANTHROPIC_AUTH_TOKEN
+# at boot. Limited to per-vendor names so a stray ANTHROPIC_API_KEY (which
+# the SDK reads on its own path) is never misrouted into the AUTH_TOKEN
+# slot. Keep in sync with the canvas-side env name suggestions.
+_VENDOR_KEY_NAMES = frozenset({
+    "MINIMAX_API_KEY",
+    "GLM_API_KEY",
+    "KIMI_API_KEY",
+    "DEEPSEEK_API_KEY",
+})
+
+
+def _project_vendor_auth(provider: dict) -> None:
+    """Project a per-vendor API key onto ANTHROPIC_AUTH_TOKEN at boot.
+
+    Third-party Anthropic-compat providers (MiniMax, Z.ai, Moonshot,
+    DeepSeek) all reuse the Anthropic SDK's wire format, which means the
+    ``claude`` CLI / claude-code-sdk reads the bearer token from
+    ``ANTHROPIC_AUTH_TOKEN`` no matter which vendor is being talked to.
+    Pre-#244 the canvas surfaced the vendor-specific name
+    (``MINIMAX_API_KEY``, etc.) to the user — so a user who saved only
+    that name hit a silent 401 on first call while the boot audit said
+    ``MINIMAX_API_KEY=set``. Mirrors the hermes-side fix from task #249
+    / hermes PR #38.
+
+    Behavior:
+      * If the matched provider's ``auth_env`` lists any of
+        ``_VENDOR_KEY_NAMES`` and that var is set, copy its value into
+        ``ANTHROPIC_AUTH_TOKEN`` so the SDK finds it.
+      * **Idempotent**: if ``ANTHROPIC_AUTH_TOKEN`` is already set we
+        do NOT overwrite — an explicit operator value (workspace
+        secret) always wins over auto-projection.
+      * Logs the projection by NAME (e.g. ``MINIMAX_API_KEY ->
+        ANTHROPIC_AUTH_TOKEN``); never logs the secret VALUE. Same
+        contract as ``_audit_auth_env_presence``.
+      * No-op for providers whose ``auth_env`` doesn't reference a
+        vendor-specific name (oauth, anthropic-api, or a third-party
+        entry that hasn't been added to the registry yet).
+    """
+    auth_env = provider.get("auth_env") or ()
+    if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        # Operator override wins — never clobber an explicit value.
+        return
+    for name in auth_env:
+        if name not in _VENDOR_KEY_NAMES:
+            continue
+        value = os.environ.get(name)
+        if not value:
+            continue
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = value
+        logger.info(
+            "auth env projection: %s -> ANTHROPIC_AUTH_TOKEN (provider=%s)",
+            name, provider.get("name", "<unknown>"),
+        )
+        return
+
+
 def _resolve_provider(model: str, providers: tuple) -> dict:
     """Return the provider entry matching this model id.
 
@@ -356,6 +413,15 @@ class ClaudeCodeAdapter(BaseAdapter):
         # the CLI invocation site (create_executor below).
         provider = _resolve_provider(picked_model, providers)
         auth_env_options = provider["auth_env"]
+
+        # Project the per-vendor API key (MINIMAX_API_KEY, GLM_API_KEY,
+        # KIMI_API_KEY, DEEPSEEK_API_KEY) onto ANTHROPIC_AUTH_TOKEN so the
+        # claude-code-sdk finds the bearer token. Idempotent: explicit
+        # ANTHROPIC_AUTH_TOKEN (operator override) is never clobbered.
+        # Must run BEFORE the auth audit + auth check below so the audit
+        # reflects the post-projection state and the check sees the right
+        # value. Task #244; mirrors hermes PR #38 (task #249).
+        _project_vendor_auth(provider)
 
         # Endpoint precedence: operator-set ANTHROPIC_BASE_URL wins (escape
         # hatch for custom regional endpoints — e.g. token-plan-sgp.* for
