@@ -9,6 +9,36 @@
 # Pattern matches the legacy monorepo workspace-template/entrypoint.sh:
 # fix volume ownership as root, then re-exec via gosu as agent (uid 1000).
 
+# Boot-context snapshot — emitted on EVERY container start, including
+# every restart of a crash-loop. Lets `docker logs` answer "what env
+# was actually present?" without having to docker exec into a dying
+# container. Logs NAMES of auth-relevant env vars, never VALUES. Fires
+# twice (once as root pre-gosu, once as agent post-gosu) so an operator
+# can see whether a value was lost across the privilege drop.
+# Keep the env-name list in sync with adapter.py's _AUTH_ENV_AUDIT —
+# the same set of vendors should be audited from both sides.
+log_boot_context() {
+    echo "----- entrypoint boot $(date -u +%Y-%m-%dT%H:%M:%SZ) -----"
+    echo "uid=$(id -u) gid=$(id -g) user=$(id -un 2>/dev/null || echo unknown)"
+    echo "hostname=$(hostname) workspace_id=${WORKSPACE_ID:-<unset>}"
+    echo "platform_url=${PLATFORM_URL:-<unset>}"
+    echo "configs_dir: $(ls -ld /configs 2>/dev/null || echo MISSING)"
+    echo "configs_contents: $(ls /configs 2>/dev/null | tr '\n' ' ' || echo MISSING)"
+    echo "workspace_dir: $(ls -ld /workspace 2>/dev/null || echo MISSING)"
+    # Auth env presence (NAMES + set/unset only — never the values).
+    # Mirror of _AUTH_ENV_AUDIT in adapter.py — keep in sync if you add a vendor.
+    for var in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL MINIMAX_API_KEY GLM_API_KEY KIMI_API_KEY DEEPSEEK_API_KEY; do
+        eval "val=\$$var"
+        if [ -n "$val" ]; then
+            echo "env $var=set"
+        else
+            echo "env $var=unset"
+        fi
+    done
+    echo "------------------------------------------------"
+}
+log_boot_context
+
 if [ "$(id -u)" = "0" ]; then
     # Configs volume is created by Docker as root; agent needs write access
     # for plugin installs, memory writes, .auth_token rotation, etc.

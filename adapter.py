@@ -15,6 +15,41 @@ logger = logging.getLogger(__name__)
 # the workspace by polling /transcript?limit=999999.
 _TRANSCRIPT_MAX_LIMIT = 1000
 
+# Auth env names to audit at boot. Order is informational; presence/absence
+# of each is logged so the operator can see at a glance which key the
+# workspace was started with vs which is missing. NEVER log values — just
+# the boolean "set"/"unset" per name. Adding a new vendor: add its env
+# name here so the audit reports it too. Keep in sync with the matching
+# list in entrypoint.sh's log_boot_context().
+_AUTH_ENV_AUDIT = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "MINIMAX_API_KEY",
+    "GLM_API_KEY",
+    "KIMI_API_KEY",
+    "DEEPSEEK_API_KEY",
+)
+
+
+def _audit_auth_env_presence() -> None:
+    """Log a one-line snapshot of which auth env names are set.
+
+    Logs NAMES + presence ("set"/"unset"), never VALUES. Lets an
+    operator reading docker logs answer "is this a missing key
+    problem or a routing problem?" in one glance. The boot-banner in
+    setup() answers "which provider got picked"; this audit answers
+    "is the env even there for it." Together they make the
+    crash-loop diagnosis path that bit us 2026-05-02 a one-line read.
+    """
+    snapshot = ", ".join(
+        f"{name}={'set' if os.environ.get(name) else 'unset'}"
+        for name in _AUTH_ENV_AUDIT
+    )
+    logger.info("auth env audit: %s", snapshot)
+
+
 # Auth-mode constants — provider entries use one of these strings.
 # Drives validation behavior in setup() (third-party requires base_url
 # resolution; oauth/anthropic-api leave base_url=None for CLI defaults).
@@ -358,6 +393,16 @@ class ClaudeCodeAdapter(BaseAdapter):
             base_url_host or "anthropic-default", base_url_source,
             "/".join(auth_env_options),
         )
+
+        # Audit which auth-relevant env vars are actually present (NAMES
+        # ONLY — never values). Boot-time visibility into "is the key
+        # missing or wrong" was the #1 ask after the 2026-05-02
+        # crash-loop incident: docker logs showed "missing X" with no
+        # hint about which vendor envs WERE set, so an operator with
+        # MINIMAX_API_KEY couldn't tell at a glance whether the
+        # ANTHROPIC_AUTH_TOKEN gap was the cause. This one-line audit
+        # closes that gap. See _audit_auth_env_presence above.
+        _audit_auth_env_presence()
 
         # Auth check — any of the provider's accepted env vars satisfies.
         # Warning (not raise) so a workspace can still boot for non-LLM
