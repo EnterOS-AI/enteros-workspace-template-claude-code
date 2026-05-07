@@ -33,7 +33,7 @@ permissions:
 
 jobs:
   publish:
-    uses: Molecule-AI/molecule-ci/.github/workflows/publish-template-image.yml@main
+    uses: molecule-ai/molecule-ci/.github/workflows/publish-template-image.yml@main
     secrets: inherit
     with:
       # When the cascade fires, client_payload.runtime_version is the
