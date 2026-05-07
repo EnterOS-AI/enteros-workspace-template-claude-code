@@ -280,13 +280,28 @@ def _project_vendor_auth(provider: dict) -> None:
         return
 
 
-def _resolve_provider(model: str, providers: tuple) -> dict:
+def _resolve_provider(
+    model: str,
+    providers: tuple,
+    explicit_provider: str = None,
+) -> dict:
     """Return the provider entry matching this model id.
 
-    Match is case-insensitive: prefix wins over alias when both could
-    apply. Unknown ids fall back to the first provider in the registry
-    (by convention, the OAuth/safest default — anthropic-oauth in both
-    _BUILTIN_PROVIDERS and the shipped config.yaml).
+    If ``explicit_provider`` is given (set via the ``provider:`` field in
+    workspace config.yaml or runtime_config), look up by name first. If the
+    named provider is not in the registry, RAISE ``ValueError`` with an
+    actionable message — silent fallback to ``providers[0]`` is the bug
+    that motivated #180 (workspace operator picks ``provider: minimax``
+    in the canvas Config tab, the adapter ignores it, the Claude SDK
+    silently keeps using ``CLAUDE_CODE_OAUTH_TOKEN`` and the operator has
+    no way to tell from the canvas that their provider switch did
+    nothing).
+
+    Without an explicit name: match is case-insensitive, prefix wins over
+    alias when both could apply, and unknown ids fall back to the first
+    provider in the registry (by convention, the OAuth/safest default —
+    ``anthropic-oauth`` in both _BUILTIN_PROVIDERS and the shipped
+    config.yaml).
 
     Pre-condition: ``providers`` is non-empty. _load_providers always
     returns at least one entry (built-ins when YAML is missing or every
@@ -298,6 +313,44 @@ def _resolve_provider(model: str, providers: tuple) -> dict:
             "_load_providers must always return at least one entry "
             "(falling back to _BUILTIN_PROVIDERS when needed)"
         )
+
+    # Explicit provider name takes precedence — fail fast if it's not in
+    # the registry. Anything else would silently route the operator's
+    # picked provider through the wrong auth/base_url path. The error
+    # message tells them exactly which two paths fix it.
+    if explicit_provider:
+        ep_lower = explicit_provider.lower()
+        for provider in providers:
+            if provider["name"].lower() == ep_lower:
+                return provider
+        names = ", ".join(p["name"] for p in providers)
+        raise ValueError(
+            f"claude-code adapter: workspace config picks "
+            f"provider='{explicit_provider}' but it is not in the "
+            f"providers registry.\n"
+            f"\n"
+            f"Known providers: {names}\n"
+            f"\n"
+            f"Two ways to fix:\n"
+            f"  (a) Add '{explicit_provider}' to /configs/config.yaml as a "
+            f"providers: entry. Required keys:\n"
+            f"        providers:\n"
+            f"          - name: {explicit_provider}\n"
+            f"            auth_mode: third_party_anthropic_compat\n"
+            f"            base_url: https://...   # provider's Anthropic-compat endpoint\n"
+            f"            auth_env: [{explicit_provider.upper()}_API_KEY]\n"
+            f"            model_prefixes: [...]\n"
+            f"  (b) Switch the workspace runtime template to one that "
+            f"natively supports {explicit_provider} (CrewAI, LangGraph, or "
+            f"DeepAgents read provider/model from runtime_config and route "
+            f"directly without needing an Anthropic-compat shim).\n"
+            f"\n"
+            f"Note: claude-code SDK speaks the Anthropic API protocol. "
+            f"Providers that only expose OpenAI-compatible endpoints "
+            f"(MiniMax, GLM, Kimi, DeepSeek native APIs) need either an "
+            f"Anthropic-compat proxy in front, or option (b)."
+        )
+
     if not model:
         return providers[0]
     m = model.lower()
@@ -401,8 +454,36 @@ class ClaudeCodeAdapter(BaseAdapter):
         rc = config.runtime_config
         if isinstance(rc, dict):
             picked_model = rc.get("model") or "sonnet"
+            explicit_provider_name = rc.get("provider")
         else:
             picked_model = getattr(rc, "model", None) or "sonnet"
+            explicit_provider_name = getattr(rc, "provider", None)
+
+        # Also honor the top-level `provider:` field in /configs/config.yaml.
+        # The canvas Config-tab Provider dropdown writes there (not into
+        # runtime_config) on some legacy paths. Either source is canonical;
+        # whichever is set wins. Root cause of #180: the adapter used to
+        # ignore both, silently routing every non-Anthropic provider pick
+        # through anthropic-oauth.
+        if not explicit_provider_name:
+            yaml_path = os.path.join(config.config_path, "config.yaml")
+            try:
+                import yaml  # transitive dep via molecule-ai-workspace-runtime
+                with open(yaml_path, "r") as f:
+                    data = yaml.safe_load(f) or {}
+                if isinstance(data, dict):
+                    val = data.get("provider")
+                    if isinstance(val, str) and val.strip():
+                        explicit_provider_name = val.strip()
+            except FileNotFoundError:
+                pass
+            except Exception as exc:  # noqa: BLE001 — defensive: never block boot
+                logger.warning(
+                    "providers: failed to read top-level provider: from %s (%s); "
+                    "falling back to model-based resolution",
+                    yaml_path, exc,
+                )
+
         # NOTE: do NOT strip the provider prefix here. The pre-fix routing
         # behavior — `anthropic:claude-opus-4-7` falls through to
         # providers[0] (anthropic-oauth) when no model_prefixes match — is
@@ -411,7 +492,15 @@ class ClaudeCodeAdapter(BaseAdapter):
         # `anthropic-api` provider and the CLI then hangs at `initialize`
         # because ANTHROPIC_API_KEY isn't set. The strip belongs only at
         # the CLI invocation site (create_executor below).
-        provider = _resolve_provider(picked_model, providers)
+        #
+        # Pass the explicit provider name through so _resolve_provider
+        # raises ValueError with an actionable message (instead of silently
+        # routing to providers[0]) when an operator picks a provider that
+        # isn't in the registry. See #180.
+        provider = _resolve_provider(
+            picked_model, providers,
+            explicit_provider=explicit_provider_name,
+        )
         auth_env_options = provider["auth_env"]
 
         # Project the per-vendor API key (MINIMAX_API_KEY, GLM_API_KEY,
