@@ -11,6 +11,11 @@ These tests mirror the production failure mode reported by Hongming
 adapter ignored it entirely, the SDK kept calling the Anthropic API with
 CLAUDE_CODE_OAUTH_TOKEN, hit the OAuth quota, and the canvas surfaced
 "Agent error (Exception)" with no clue why.
+
+Import-shim setup (sys.path + molecule_runtime / a2a / claude_sdk_executor
+stubs) lives in tests/conftest.py — shared with test_adapter_prevalidate
+so the two stub installers can't disagree on shape (e.g. BaseAdapter
+having install_plugins_via_registry).
 """
 
 import pytest
