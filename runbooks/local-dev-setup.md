@@ -24,7 +24,7 @@ common problems.
 ## Step 1 — Clone the Repository
 
 ```bash
-git clone https://github.com/Molecule-AI/molecule-ai-workspace-template-claude-code.git
+git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template-claude-code.git
 cd molecule-ai-workspace-template-claude-code
 ```
 
