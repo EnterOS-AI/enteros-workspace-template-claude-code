@@ -73,10 +73,11 @@ def test_persona_env_minimax_resolves_correctly(monkeypatch):
 
 def test_persona_env_lead_claude_code_resolves_correctly(monkeypatch):
     """Lead persona env (MODEL=opus, MODEL_PROVIDER=claude-code) —
-    ``claude-code`` isn't a registered provider name (registry uses
-    ``anthropic-oauth``), so it falls back to legacy interpretation
-    and yields no explicit provider, letting the model-based
-    fall-through to providers[0]=anthropic-oauth do the right thing."""
+    ``claude-code`` is the persona-friendly alias for the canonical
+    ``anthropic-oauth`` registry name. Must resolve via the alias map
+    so the lead boots through the OAuth subscription path even when
+    MODEL is a non-Anthropic model id (e.g. an operator who picked
+    MiniMax in canvas but whose persona env still pins claude-code)."""
     _clear_env(monkeypatch)
     monkeypatch.setenv("MODEL", "opus")
     monkeypatch.setenv("MODEL_PROVIDER", "claude-code")
@@ -84,10 +85,38 @@ def test_persona_env_lead_claude_code_resolves_correctly(monkeypatch):
         yaml_model="", yaml_provider="", providers=_REGISTRY,
     )
     assert model == "opus"
-    # claude-code is not a registered slug, so this falls back —
-    # provider is None and the caller will model-resolve to
-    # anthropic-oauth via the alias match on "opus".
-    assert provider is None
+    # claude-code → anthropic-oauth via the alias map
+    assert provider == "anthropic-oauth"
+
+
+def test_persona_env_lead_with_minimax_model_routes_via_oauth(monkeypatch):
+    """Lead workspace whose persona pins MODEL_PROVIDER=claude-code but
+    whose YAML/canvas selection happens to be a MiniMax model still
+    routes via OAuth — the persona's provider pin wins over the
+    model-prefix matcher. Without the alias map, the fall-through
+    mis-routed leads to MiniMax even when their CLAUDE_CODE_OAUTH_TOKEN
+    was set."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MODEL", "MiniMax-M2.7")
+    monkeypatch.setenv("MODEL_PROVIDER", "claude-code")
+    model, provider = _resolve_model_and_provider_from_env(
+        yaml_model="", yaml_provider="", providers=_REGISTRY,
+    )
+    assert model == "MiniMax-M2.7"
+    assert provider == "anthropic-oauth"
+
+
+def test_anthropic_alias_resolves_to_anthropic_api(monkeypatch):
+    """``MODEL_PROVIDER=anthropic`` alias → ``anthropic-api`` (direct
+    Anthropic API key path)."""
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("MODEL", "claude-opus-4-7")
+    monkeypatch.setenv("MODEL_PROVIDER", "anthropic")
+    model, provider = _resolve_model_and_provider_from_env(
+        yaml_model="", yaml_provider="", providers=_REGISTRY,
+    )
+    assert model == "claude-opus-4-7"
+    assert provider == "anthropic-api"
 
 
 def test_persona_env_glm_resolves_correctly(monkeypatch):
