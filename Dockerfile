@@ -43,6 +43,19 @@ RUN pip install --no-cache-dir -r requirements.txt && \
 # Copy adapter code
 COPY adapter.py .
 COPY __init__.py .
+# Provider registry. The adapter's _load_providers walks 4 paths:
+#   1. /opt/adapter/config.yaml          — provisioner-managed canonical
+#   2. os.path.dirname(__file__)/config.yaml  — alongside adapter.py (this image)
+#   3. ${WORKSPACE_CONFIG_PATH}/config.yaml   — workspace per-instance overrides
+#   4. _BUILTIN_PROVIDERS                — oauth + anthropic-api only
+# On this image /opt/adapter/ is never populated by the platform
+# provisioner, so path 2 (/app/config.yaml) is the load-bearing one.
+# Without this COPY the file isn't in the image, all 3 file paths fail,
+# and _load_providers falls through to _BUILTIN_PROVIDERS — every
+# MiniMax/GLM/Kimi/DeepSeek model silently routes to anthropic-oauth →
+# "Not logged in. Please run /login" at first LLM call. Caused the
+# canary's 38h chronic red on 2026-05-07/08 (molecule-core#129).
+COPY config.yaml .
 # Adapter-specific executor — owned by THIS template (universal-runtime
 # refactor, molecule-core task #87). Lives alongside adapter.py so
 # Python's import system picks the local /app/claude_sdk_executor.py
