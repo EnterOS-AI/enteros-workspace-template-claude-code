@@ -154,6 +154,12 @@ def _normalize_provider(entry: dict):
 # against the site-packages copy that bit us 2026-05-04 11:08Z.
 _CANONICAL_ADAPTER_DIR = "/opt/adapter"
 
+# Adjacent-to-adapter.py path. Module-level so tests can monkeypatch it
+# to redirect the path-2 lookup at a controlled tmp dir. Production code
+# resolves this once at import time and never touches it again — same
+# semantics as before.
+_TEMPLATE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 def _load_providers(config_path: str) -> tuple:
     """Load the provider registry from the template's bundled config.yaml.
@@ -207,9 +213,7 @@ def _load_providers(config_path: str) -> tuple:
     a warning; the rest of the registry survives.
     """
     canonical_yaml = os.path.join(_CANONICAL_ADAPTER_DIR, "config.yaml")
-    template_yaml = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "config.yaml"
-    )
+    template_yaml = os.path.join(_TEMPLATE_DIR, "config.yaml")
     workspace_yaml = os.path.join(config_path, "config.yaml")
     # Deduplicate while preserving order — _CANONICAL_ADAPTER_DIR and
     # the __file__ dir collide in dev/test (when imported from

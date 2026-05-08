@@ -514,14 +514,25 @@ async def test_setup_auth_token_alone_satisfies_third_party_check(
 # ---- _load_providers / _resolve_provider unit tests ----
 
 
-def test_load_providers_returns_builtin_when_yaml_missing(tmp_path):
-    """FileNotFoundError path returns the in-code defaults verbatim."""
+def test_load_providers_returns_builtin_when_yaml_missing(tmp_path, monkeypatch):
+    """FileNotFoundError path returns the in-code defaults verbatim.
+
+    Monkeypatches the canonical + template paths to a non-existent dir
+    so only the workspace config_path is in scope. Without this, the
+    multi-path lookup picks up the repo-root config.yaml that ships
+    with the template (path 2 finds the bundled providers list and
+    returns it instead of falling through to builtins).
+    """
     _install_stubs()
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
     sys.modules.pop("adapter", None)
     import adapter as adapter_module
+
+    nonexistent = str(tmp_path / "_isolate_canonical")
+    monkeypatch.setattr(adapter_module, "_CANONICAL_ADAPTER_DIR", nonexistent)
+    monkeypatch.setattr(adapter_module, "_TEMPLATE_DIR", nonexistent)
 
     result = adapter_module._load_providers(str(tmp_path))
     assert result == adapter_module._BUILTIN_PROVIDERS
@@ -576,14 +587,22 @@ async def test_setup_routes_extra_providers(
     assert os.environ.get("ANTHROPIC_BASE_URL") == expected_url
 
 
-def test_load_providers_falls_back_on_malformed_yaml(tmp_path, caplog):
-    """Malformed YAML → log warning + fallback (don't kill boot)."""
+def test_load_providers_falls_back_on_malformed_yaml(tmp_path, caplog, monkeypatch):
+    """Malformed YAML → log warning + fallback (don't kill boot).
+
+    Isolated from the multi-path lookup by pinning canonical + template
+    dirs at a non-existent path; only the workspace config_path is read.
+    """
     _install_stubs()
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
     sys.modules.pop("adapter", None)
     import adapter as adapter_module
+
+    nonexistent = str(tmp_path / "_isolate_canonical")
+    monkeypatch.setattr(adapter_module, "_CANONICAL_ADAPTER_DIR", nonexistent)
+    monkeypatch.setattr(adapter_module, "_TEMPLATE_DIR", nonexistent)
 
     (tmp_path / "config.yaml").write_text("providers: [not valid yaml: {{{")
 
@@ -622,7 +641,7 @@ def test_resolve_provider_minimax_prefix_matches_minimax_provider():
     assert result2["name"] == "minimax"
 
 
-def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog):
+def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog, monkeypatch):
     """Per-entry isolation: one malformed entry shouldn't nuke the registry.
 
     Pre-fix: ``_load_providers`` built the registry via a generator inside
@@ -634,6 +653,9 @@ def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog):
 
     Post-fix: per-entry try/except drops the bad entry with a warning,
     rest of the registry survives.
+
+    Isolated from the multi-path lookup so only the test's tmp config.yaml
+    is read.
     """
     _install_stubs()
     parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -641,6 +663,10 @@ def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog):
         sys.path.insert(0, parent_dir)
     sys.modules.pop("adapter", None)
     import adapter as adapter_module
+
+    nonexistent = str(tmp_path / "_isolate_canonical")
+    monkeypatch.setattr(adapter_module, "_CANONICAL_ADAPTER_DIR", nonexistent)
+    monkeypatch.setattr(adapter_module, "_TEMPLATE_DIR", nonexistent)
 
     yaml_with_typo = textwrap.dedent("""
         providers:
@@ -690,7 +716,7 @@ def test_load_providers_drops_bad_entry_keeps_rest(tmp_path, caplog):
     )
 
 
-def test_load_providers_string_as_prefix_does_not_split_into_chars(tmp_path, caplog):
+def test_load_providers_string_as_prefix_does_not_split_into_chars(tmp_path, caplog, monkeypatch):
     """A YAML field declared as list-of-strings but written as a bare
     string (operator forgot brackets) used to silently iterate over
     characters → ``('m','i','m','o','-')``. Post-fix: non-list value
@@ -704,6 +730,10 @@ def test_load_providers_string_as_prefix_does_not_split_into_chars(tmp_path, cap
         sys.path.insert(0, parent_dir)
     sys.modules.pop("adapter", None)
     import adapter as adapter_module
+
+    nonexistent = str(tmp_path / "_isolate_canonical")
+    monkeypatch.setattr(adapter_module, "_CANONICAL_ADAPTER_DIR", nonexistent)
+    monkeypatch.setattr(adapter_module, "_TEMPLATE_DIR", nonexistent)
 
     yaml_str_prefix = textwrap.dedent("""
         providers:
@@ -723,7 +753,7 @@ def test_load_providers_string_as_prefix_does_not_split_into_chars(tmp_path, cap
     )
 
 
-def test_load_providers_drops_entry_without_name(tmp_path, caplog):
+def test_load_providers_drops_entry_without_name(tmp_path, caplog, monkeypatch):
     """An entry without ``name`` is operator error — no silent fallback
     to ``<unnamed>``. Drop the entry with a warning so the boot log
     surfaces the typo.
@@ -734,6 +764,10 @@ def test_load_providers_drops_entry_without_name(tmp_path, caplog):
         sys.path.insert(0, parent_dir)
     sys.modules.pop("adapter", None)
     import adapter as adapter_module
+
+    nonexistent = str(tmp_path / "_isolate_canonical")
+    monkeypatch.setattr(adapter_module, "_CANONICAL_ADAPTER_DIR", nonexistent)
+    monkeypatch.setattr(adapter_module, "_TEMPLATE_DIR", nonexistent)
 
     yaml_no_name = textwrap.dedent("""
         providers:
