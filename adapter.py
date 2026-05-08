@@ -278,6 +278,26 @@ def _load_providers(config_path: str) -> tuple:
     return tuple(parsed)
 
 
+# Aliases for `MODEL_PROVIDER` env values that should map to a registry
+# provider name. The persona env files use shorter / friendlier slugs
+# than the registry's canonical names — without this alias map a value
+# like ``MODEL_PROVIDER=claude-code`` would fall through to YAML-based
+# resolution and (when the YAML doesn't pin a provider) hit the
+# model-prefix matcher with the operator-picked MODEL, mis-routing a
+# lead workspace through MiniMax even though its CLAUDE_CODE_OAUTH_TOKEN
+# was clearly meant to be used.
+#
+# Maintain this list in sync with the persona env file convention:
+#   - ``claude-code``  → ``anthropic-oauth`` (Claude Code subscription path)
+#   - ``anthropic``    → ``anthropic-api``  (direct Anthropic API key)
+# Provider names already in the registry alias to themselves implicitly
+# (the ``in registry`` check catches them before this map is consulted).
+_PROVIDER_SLUG_ALIASES = {
+    "claude-code": "anthropic-oauth",
+    "anthropic": "anthropic-api",
+}
+
+
 def _resolve_model_and_provider_from_env(
     yaml_model: str,
     yaml_provider: str,
@@ -331,8 +351,20 @@ def _resolve_model_and_provider_from_env(
     # (provider name) vs. the legacy convention (model id). Persona-
     # convention wins when the value matches a registered provider; we
     # fall back to legacy interpretation only when it doesn't.
+    #
+    # First, apply the alias map so persona-friendly slugs like
+    # ``claude-code`` resolve to the canonical registry name
+    # ``anthropic-oauth``. Without this, a lead workspace's
+    # ``MODEL_PROVIDER=claude-code`` env would fall through to the model-
+    # prefix matcher, see ``MODEL=MiniMax-M2.7`` and mis-route to MiniMax
+    # even though the operator's intent (and the OAuth token they set)
+    # was the OAuth subscription path.
+    env_provider_resolved = _PROVIDER_SLUG_ALIASES.get(
+        env_provider.lower(), env_provider,
+    ) if env_provider else ""
     env_provider_is_slug = (
-        bool(env_provider) and env_provider.lower() in provider_names_lower
+        bool(env_provider_resolved)
+        and env_provider_resolved.lower() in provider_names_lower
     )
 
     # Picked model resolution
@@ -345,10 +377,10 @@ def _resolve_model_and_provider_from_env(
     else:
         picked_model = yaml_model or ""
 
-    # Explicit provider resolution — env wins when it's a registered slug,
-    # otherwise fall back to YAML.
+    # Explicit provider resolution — env wins when it's a registered slug
+    # (after alias mapping), otherwise fall back to YAML.
     if env_provider_is_slug:
-        explicit_provider = env_provider
+        explicit_provider = env_provider_resolved
     else:
         explicit_provider = yaml_provider or None
 
