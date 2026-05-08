@@ -147,36 +147,114 @@ def _normalize_provider(entry: dict):
     }
 
 
+# Canonical install path the platform provisioner is contracted to clone
+# the template repo into. Hardcoded so the adapter's config.yaml lookup
+# is invariant across Docker (mounted /app→/opt/adapter) and EC2-host
+# (cloned by molecule-controlplane's ec2.go) install paths — robust
+# against the site-packages copy that bit us 2026-05-04 11:08Z.
+_CANONICAL_ADAPTER_DIR = "/opt/adapter"
+
+
 def _load_providers(config_path: str) -> tuple:
-    """Load the provider registry from /configs/config.yaml.
+    """Load the provider registry from the template's bundled config.yaml.
 
-    The YAML's top-level ``providers:`` list is the canonical source —
-    canvas Config tab reads the same list to populate its Provider
-    dropdown so the UI and the adapter never disagree on what's
-    available. Falls back to ``_BUILTIN_PROVIDERS`` (oauth + anthropic-api)
-    if the file is missing, malformed, or has no providers section, so a
-    bare-bones workspace still boots with the historical defaults.
+    The providers list is a TEMPLATE concern — it describes which
+    models/auth-modes this runtime image supports — and ships in the
+    template's own config.yaml alongside adapter.py. The per-workspace
+    ``${WORKSPACE_CONFIG_PATH}/config.yaml`` (default ``/configs/``)
+    only contains workspace-specific overrides (model, runtime, skills,
+    prompt files) and does NOT carry a providers section.
 
-    Per-entry isolation: a single bad provider entry is dropped with a
-    warning; the rest of the registry survives. Used to be a generator
-    inside tuple(...) that propagated any AttributeError out and reverted
-    the whole registry to builtins — exactly the silent-fallback failure
-    mode this file's existence was meant to fix.
+    Two-step incident history:
+      • Pre-2026-05-04 09:00Z: only checked ``config_path``, fell back
+        to ``_BUILTIN_PROVIDERS`` (oauth + anthropic-api). Every
+        MiniMax / GLM / Kimi / DeepSeek model resolved to
+        ``anthropic-oauth`` and crashed at first LLM call with
+        "Not logged in. Please run /login". Fixed by adding a
+        template-bundled lookup using
+        ``os.path.dirname(os.path.abspath(__file__))``.
+      • 2026-05-04 11:08Z: that ``__file__`` lookup misses on EC2-host
+        installs because the provisioner copies adapter.py to
+        ``/opt/molecule-venv/lib/python3.12/site-packages/`` —
+        site-packages wins over PYTHONPATH=/opt/adapter (which the
+        host install doesn't set), so __file__ resolves to the venv
+        path WITHOUT an adjacent config.yaml. Same silent fallback
+        to anthropic-oauth + same "Not logged in" symptom.
+      • 2026-05-08 (#129): the multi-path lookup that fixed both of
+        the above was lost in a post-suspension migration cycle (the
+        Gitea main branch never carried the fix even though the
+        :latest image had it baked in from a prior build). Canary
+        chronic red for 38h before this commit restored the lookup.
+
+    Resolution order:
+      1. ``/opt/adapter/config.yaml`` — canonical provisioner-managed
+         install dir. Hardcoded because the platform contract is
+         "provisioner clones template repo into /opt/adapter"; this
+         is invariant across Docker (mounted /app→/opt/adapter) and
+         EC2-host (cloned by ec2.go) install paths. Robust against
+         site-packages copy.
+      2. Adjacent to ``adapter.__file__`` — works in dev/test where
+         the canonical path doesn't exist. Also covers the Docker
+         image's /app/config.yaml (bundled by Dockerfile #6).
+      3. Per-workspace ``${config_path}/config.yaml`` — fallback for
+         operator-shipped overrides on a private deployment that
+         wants a custom providers list.
+      4. ``_BUILTIN_PROVIDERS`` — oauth + anthropic-api defaults so a
+         bare-bones workspace still boots even with no config.yaml
+         anywhere.
+
+    Per-entry isolation: a single bad provider entry is dropped with
+    a warning; the rest of the registry survives.
     """
-    yaml_path = os.path.join(config_path, "config.yaml")
+    canonical_yaml = os.path.join(_CANONICAL_ADAPTER_DIR, "config.yaml")
+    template_yaml = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "config.yaml"
+    )
+    workspace_yaml = os.path.join(config_path, "config.yaml")
+    # Deduplicate while preserving order — _CANONICAL_ADAPTER_DIR and
+    # the __file__ dir collide in dev/test (when imported from
+    # /opt/adapter directly), and workspace_yaml may also collide if
+    # config_path == /opt/adapter in tests.
+    seen = set()
+    candidates = []
+    for path in (canonical_yaml, template_yaml, workspace_yaml):
+        if path not in seen:
+            seen.add(path)
+            candidates.append(path)
+
+    raw = None
+    chosen_path = None
     try:
         import yaml  # transitive dep via molecule-ai-workspace-runtime
-        with open(yaml_path, "r") as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        logger.info("providers: %s not found, using builtin defaults", yaml_path)
-        return _BUILTIN_PROVIDERS
-    except Exception as exc:  # noqa: BLE001 — defensive: never block boot on YAML
-        logger.warning("providers: failed to load from %s (%s); using builtins", yaml_path, exc)
+    except ImportError:
+        logger.warning("providers: yaml import failed; using builtins")
         return _BUILTIN_PROVIDERS
 
-    raw = data.get("providers") if isinstance(data, dict) else None
-    if not isinstance(raw, list) or not raw:
+    for yaml_path in candidates:
+        try:
+            with open(yaml_path, "r") as f:
+                data = yaml.safe_load(f) or {}
+        except FileNotFoundError:
+            logger.info("providers: %s not found, trying next candidate", yaml_path)
+            continue
+        except Exception as exc:  # noqa: BLE001 — defensive: never block boot on YAML
+            logger.warning(
+                "providers: failed to load from %s (%s); trying next candidate",
+                yaml_path, exc,
+            )
+            continue
+
+        candidate_raw = data.get("providers") if isinstance(data, dict) else None
+        if isinstance(candidate_raw, list) and candidate_raw:
+            raw = candidate_raw
+            chosen_path = yaml_path
+            break
+
+    if raw is None:
+        logger.info(
+            "providers: no providers section found in %s; using builtin defaults",
+            " or ".join(candidates),
+        )
         return _BUILTIN_PROVIDERS
 
     parsed = []
@@ -190,8 +268,9 @@ def _load_providers(config_path: str) -> tuple:
             parsed.append(normalized)
 
     if not parsed:
-        logger.warning("providers: no valid entries in %s; using builtins", yaml_path)
+        logger.warning("providers: no valid entries in %s; using builtins", chosen_path)
         return _BUILTIN_PROVIDERS
+    logger.info("providers: loaded %d entries from %s", len(parsed), chosen_path)
     return tuple(parsed)
 
 
