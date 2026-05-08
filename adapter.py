@@ -278,6 +278,83 @@ def _load_providers(config_path: str) -> tuple:
     return tuple(parsed)
 
 
+def _resolve_model_and_provider_from_env(
+    yaml_model: str,
+    yaml_provider: str,
+    providers: tuple,
+) -> tuple:
+    """Reconcile model + provider from env vars vs YAML, with the persona-env
+    convention winning over the legacy ``MODEL_PROVIDER``-as-model-id usage.
+
+    The persona env files (``~/.molecule-ai/personas/<name>/env`` on the host,
+    sourced into each workspace container at provision time) declare TWO env
+    vars with distinct semantics:
+
+      * ``MODEL`` — the model id (e.g. ``MiniMax-M2.7-highspeed``, ``opus``).
+      * ``MODEL_PROVIDER`` — the provider slug (e.g. ``minimax``,
+        ``claude-code``, ``anthropic``).
+
+    The legacy ``workspace/config.py`` (in molecule-ai-workspace-runtime)
+    historically interpreted ``MODEL_PROVIDER`` as the *model id* — a name
+    chosen before there was a separate ``MODEL`` env var. When both env vars
+    are set with the persona convention, the legacy code reads
+    ``MODEL_PROVIDER=minimax`` into ``runtime_config.model``, which then
+    fails to match any registry prefix (``minimax-`` requires a hyphen
+    suffix) and silently falls through to providers[0] (``anthropic-oauth``).
+    OAuth-token-less workspaces then wedge at ``query.initialize()`` because
+    the claude CLI can't authenticate. This is the 2026-05-08 dev-tree
+    incident — 22/27 non-lead workspaces stuck in ``degraded``.
+
+    Resolution order (this function):
+      1. ``MODEL`` env var → picked_model. Authoritative when set; the
+         persona env always sets it alongside ``MODEL_PROVIDER`` so the
+         model id never has to be inferred.
+      2. ``MODEL_PROVIDER`` env var → explicit_provider, BUT only when the
+         value matches a known provider name in the registry. This guards
+         against the legacy case where some callers still set
+         ``MODEL_PROVIDER`` to a model id (e.g. canvas Save+Restart prior to
+         this fix). If the value isn't a registered provider name and YAML
+         didn't supply a model, treat it as a model id for back-compat.
+      3. YAML ``runtime_config.model`` / ``provider`` — used for any field
+         the env didn't supply. Carries the operator's canvas selection
+         on workspaces that haven't yet adopted the persona env shape.
+
+    Returns ``(picked_model, explicit_provider_name)``. Either may be
+    empty/None — the caller (``setup``) handles the empty cases via
+    ``_resolve_provider``'s registry fallback.
+    """
+    env_model = (os.environ.get("MODEL") or "").strip()
+    env_provider = (os.environ.get("MODEL_PROVIDER") or "").strip()
+    provider_names_lower = {p.get("name", "").lower() for p in providers}
+
+    # Detect whether MODEL_PROVIDER carries the persona-convention slug
+    # (provider name) vs. the legacy convention (model id). Persona-
+    # convention wins when the value matches a registered provider; we
+    # fall back to legacy interpretation only when it doesn't.
+    env_provider_is_slug = (
+        bool(env_provider) and env_provider.lower() in provider_names_lower
+    )
+
+    # Picked model resolution
+    if env_model:
+        picked_model = env_model
+    elif env_provider and not env_provider_is_slug:
+        # Legacy: MODEL_PROVIDER env carried the model id. Honor it so
+        # canvas Save+Restart workflows that predate this fix keep working.
+        picked_model = env_provider
+    else:
+        picked_model = yaml_model or ""
+
+    # Explicit provider resolution — env wins when it's a registered slug,
+    # otherwise fall back to YAML.
+    if env_provider_is_slug:
+        explicit_provider = env_provider
+    else:
+        explicit_provider = yaml_provider or None
+
+    return picked_model, explicit_provider
+
+
 def _strip_provider_prefix(model: str) -> str:
     """Strip LangChain-style "<provider>:<model>" prefix from a model id.
 
@@ -536,11 +613,11 @@ class ClaudeCodeAdapter(BaseAdapter):
         # validation + ANTHROPIC_BASE_URL routing from that single decision.
         rc = config.runtime_config
         if isinstance(rc, dict):
-            picked_model = rc.get("model") or "sonnet"
-            explicit_provider_name = rc.get("provider")
+            yaml_model = rc.get("model") or ""
+            yaml_provider_name = rc.get("provider") or ""
         else:
-            picked_model = getattr(rc, "model", None) or "sonnet"
-            explicit_provider_name = getattr(rc, "provider", None)
+            yaml_model = getattr(rc, "model", None) or ""
+            yaml_provider_name = getattr(rc, "provider", None) or ""
 
         # Also honor the top-level `provider:` field in /configs/config.yaml.
         # The canvas Config-tab Provider dropdown writes there (not into
@@ -548,7 +625,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         # whichever is set wins. Root cause of #180: the adapter used to
         # ignore both, silently routing every non-Anthropic provider pick
         # through anthropic-oauth.
-        if not explicit_provider_name:
+        if not yaml_provider_name:
             yaml_path = os.path.join(config.config_path, "config.yaml")
             try:
                 import yaml  # transitive dep via molecule-ai-workspace-runtime
@@ -557,7 +634,7 @@ class ClaudeCodeAdapter(BaseAdapter):
                 if isinstance(data, dict):
                     val = data.get("provider")
                     if isinstance(val, str) and val.strip():
-                        explicit_provider_name = val.strip()
+                        yaml_provider_name = val.strip()
             except FileNotFoundError:
                 pass
             except Exception as exc:  # noqa: BLE001 — defensive: never block boot
@@ -566,6 +643,21 @@ class ClaudeCodeAdapter(BaseAdapter):
                     "falling back to model-based resolution",
                     yaml_path, exc,
                 )
+
+        # Reconcile env vars (persona convention: MODEL=<id>,
+        # MODEL_PROVIDER=<slug>) against YAML. Env wins over YAML — the
+        # persona env files are the canonical per-agent provider mapping
+        # (Phase 2 mapping 2026-05-08), and the workspace-runtime wheel's
+        # legacy ``MODEL_PROVIDER``-as-model-id reading would otherwise
+        # silently route non-leads to providers[0] = anthropic-oauth.
+        # Documented in detail at _resolve_model_and_provider_from_env.
+        picked_model, explicit_provider_name = _resolve_model_and_provider_from_env(
+            yaml_model=yaml_model,
+            yaml_provider=yaml_provider_name,
+            providers=providers,
+        )
+        if not picked_model:
+            picked_model = "sonnet"
 
         # NOTE: do NOT strip the provider prefix here. The pre-fix routing
         # behavior — `anthropic:claude-opus-4-7` falls through to
@@ -694,9 +786,26 @@ class ClaudeCodeAdapter(BaseAdapter):
         # RuntimeConfig dataclass. Read `model` defensively from either shape.
         rc = config.runtime_config
         if isinstance(rc, dict):
-            explicit_model = rc.get("model") or ""
+            yaml_model = rc.get("model") or ""
+            yaml_provider = rc.get("provider") or ""
         else:
-            explicit_model = getattr(rc, "model", None) or ""
+            yaml_model = getattr(rc, "model", None) or ""
+            yaml_provider = getattr(rc, "provider", None) or ""
+
+        # Reconcile against env vars (persona convention: MODEL=<id>,
+        # MODEL_PROVIDER=<slug>) using the same helper that ``setup`` uses,
+        # so the executor and the boot banner agree on the picked model.
+        # Without this, a workspace whose env says ``MODEL=MiniMax-M2.7``
+        # but whose runtime wheel pre-dates the persona-env fix would set
+        # runtime_config.model="minimax" (the slug, mistakenly read by the
+        # legacy ``MODEL_PROVIDER``-as-model-id path); this helper restores
+        # the correct model id before it reaches the SDK.
+        providers = _load_providers(config.config_path)
+        explicit_model, _ = _resolve_model_and_provider_from_env(
+            yaml_model=yaml_model,
+            yaml_provider=yaml_provider,
+            providers=providers,
+        )
         explicit_model = _strip_provider_prefix(explicit_model)
 
         # Pre-validation: detect the misconfiguration combo that drove the
@@ -727,7 +836,7 @@ class ClaudeCodeAdapter(BaseAdapter):
                     "The default fallback ('sonnet') is an Anthropic-native "
                     "alias; non-Anthropic shims (MiniMax, OpenAI gateways, "
                     "etc.) won't recognize it and the SDK --print probe will "
-                    "hang for 30s before timing out. Fix: set MODEL_PROVIDER "
+                    "hang for 30s before timing out. Fix: set MODEL "
                     "as a workspace secret (canvas: Save+Restart with model "
                     "picked) or set runtime_config.model in /configs/config.yaml."
                 )
