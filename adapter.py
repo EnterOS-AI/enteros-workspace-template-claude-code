@@ -379,10 +379,28 @@ def _resolve_model_and_provider_from_env(
 
     # Explicit provider resolution — env wins when it's a registered slug
     # (after alias mapping), otherwise fall back to YAML.
+    #
+    # YAML aliasing: the molecule-runtime wheel (config.py) auto-derives
+    # ``runtime_config.provider`` from the YAML/default model slug — the
+    # default model ``anthropic:claude-opus-4-7`` yields ``anthropic`` as
+    # the inferred provider. Without applying the alias map here, that
+    # auto-derived ``anthropic`` slug fails registry lookup and the
+    # adapter raises ValueError ("provider='anthropic' but it is not in
+    # the providers registry"), wedging the workspace at boot. The alias
+    # map already handles this for the env-var path above; mirror the
+    # same treatment for the YAML path so the runtime-wheel default
+    # produces a registered provider name in both cases. Caught
+    # 2026-05-09 on staging-cplead-2 — every workspace booted with
+    # ``configuration_status=not_configured`` because the YAML provider
+    # ``anthropic`` was passed through verbatim instead of being aliased
+    # to ``anthropic-api``.
     if env_provider_is_slug:
         explicit_provider = env_provider_resolved
+    elif yaml_provider:
+        yp_lower = yaml_provider.lower()
+        explicit_provider = _PROVIDER_SLUG_ALIASES.get(yp_lower, yaml_provider)
     else:
-        explicit_provider = yaml_provider or None
+        explicit_provider = None
 
     return picked_model, explicit_provider
 
