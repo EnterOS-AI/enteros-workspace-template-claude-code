@@ -213,6 +213,54 @@ def test_no_env_no_yaml_returns_empty(monkeypatch):
     assert provider is None
 
 
+def test_yaml_provider_anthropic_is_aliased_to_anthropic_api(monkeypatch):
+    """Regression for 2026-05-09 staging-cplead-2 incident: every
+    workspace booted ``configuration_status=not_configured`` because the
+    molecule-runtime wheel auto-derives ``runtime_config.provider =
+    "anthropic"`` from the default model slug ``anthropic:claude-opus-4-7``.
+    The adapter received ``yaml_provider="anthropic"`` from the wheel and
+    rejected it with ``ValueError: provider='anthropic' but it is not in
+    the providers registry`` — but ``anthropic`` is already in
+    ``_PROVIDER_SLUG_ALIASES`` for the env-var path. Mirror the alias map
+    on the YAML path so the wheel default produces a registered provider
+    name."""
+    _clear_env(monkeypatch)
+    _, provider = _resolve_model_and_provider_from_env(
+        yaml_model="", yaml_provider="anthropic", providers=_REGISTRY,
+    )
+    assert provider == "anthropic-api", (
+        f"yaml_provider='anthropic' must resolve through the alias map to "
+        f"'anthropic-api'; got {provider!r}. Without this aliasing the "
+        f"wheel-default workspace boot wedges at adapter.setup()."
+    )
+
+
+def test_yaml_provider_claude_code_is_aliased_to_anthropic_oauth(monkeypatch):
+    """Symmetric coverage: persona-friendly ``claude-code`` slug from the
+    YAML ``provider:`` field must alias to ``anthropic-oauth``, the same
+    way the env-var path resolves it. Lead workspaces that pin the OAuth
+    path in YAML (instead of via env) must not wedge."""
+    _clear_env(monkeypatch)
+    _, provider = _resolve_model_and_provider_from_env(
+        yaml_model="", yaml_provider="claude-code", providers=_REGISTRY,
+    )
+    assert provider == "anthropic-oauth"
+
+
+def test_yaml_provider_unknown_passes_through_for_actionable_error(monkeypatch):
+    """An unaliased, unknown YAML provider (e.g. ``yaml_provider="mystery"``)
+    must NOT be silently swapped to providers[0] — it must reach
+    ``_resolve_provider`` so the adapter raises the actionable
+    ``Known providers: ...`` error message. The alias map is a
+    convenience for the two persona-convention slugs only; everything
+    else must keep its original semantics."""
+    _clear_env(monkeypatch)
+    _, provider = _resolve_model_and_provider_from_env(
+        yaml_model="", yaml_provider="mystery", providers=_REGISTRY,
+    )
+    assert provider == "mystery"
+
+
 # ------------------------------------------------------------------
 # Whitespace / empty-value defensive cases
 # ------------------------------------------------------------------
