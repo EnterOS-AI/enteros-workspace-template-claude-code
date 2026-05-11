@@ -1,0 +1,232 @@
+name: CI
+
+# Ported from .github/workflows/ci.yml on 2026-05-11 per internal#326
+# (Class-A root: cross-repo `uses:` blocker for Gitea 1.22.6 —
+# feedback_gitea_cross_repo_uses_blocked).
+#
+# Root cause of the main-red CI on this repo:
+#   The .github/ original used
+#     uses: molecule-ai/molecule-ci/.github/workflows/validate-workspace-template.yml@main
+#   which Gitea 1.22.6 rejects (DEFAULT_ACTIONS_URL=github → 404 against
+#   the remote repo even though it lives on the same Gitea instance).
+#   Gitea reads .github/ as a fallback when .gitea/ is absent
+#   (reference_per_repo_gitea_vs_github_actions_dir), so the .github/
+#   workflow was firing on Gitea and failing in 1s.
+#
+# Fix shape: inline the validation logic directly. The canonical
+# validator in molecule-ai/molecule-ci already self-clones into the
+# runner via a direct HTTPS `git clone` step (validate-workspace-template.yml
+# does this verbatim) — so the inline port is just "do that clone +
+# invoke the validator script in-place", preserving the
+# single-source-of-truth property (each CI run still fetches the
+# canonical validator fresh).
+#
+# Four-surface migration audit (feedback_gitea_actions_migration_audit_pattern):
+#   1. YAML — no `workflow_dispatch.inputs`; no `merge_group`; preserved
+#      `on: [push, pull_request]` from the original. Added workflow-level
+#      env.GITHUB_SERVER_URL (feedback_act_runner_github_server_url).
+#   2. Cache — `actions/setup-python` `cache: pip` preserved; works against
+#      Gitea's built-in cache server when runner.cache is configured.
+#   3. Token — uses auto-injected GITHUB_TOKEN (Gitea-aliased). Validator
+#      job needs only `contents: read` (no write to issues/PRs).
+#   4. Docs — anonymous git-clone of molecule-ci (no token in URL); the
+#      molecule-ci repo is public on the Gitea instance.
+#
+# Fork-PR semantics: validate-runtime is intentionally skipped on fork
+# PRs because pip-install + docker-build + adapter-import are arbitrary
+# code execution. Internal PRs and main pushes get full coverage. The
+# `github.event.pull_request.head.repo.fork` field is null for non-PR
+# events; the `!= true` comparison defaults to running.
+#
+# Cross-links:
+#   - internal#326 — parent tracking issue
+#   - molecule-ai/molecule-ci/.github/workflows/validate-workspace-template.yml — pattern source
+#   - molecule-ai/molecule-core/.gitea/workflows/ci.yml — Gitea port style reference
+
+on: [push, pull_request]
+
+env:
+  # Belt-and-suspenders against the runner-default trap
+  # (feedback_act_runner_github_server_url). Runners are configured
+  # with this env via /opt/molecule/runners/config.yaml runner.envs,
+  # but pinning at the workflow level protects against a runner
+  # regenerated without the config file.
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+
+# Defense-in-depth on the GITHUB_TOKEN scope. The validate-runtime job
+# runs untrusted-by-design code from the calling repo — pip-installs
+# requirements.txt (post-install hooks), imports adapter.py, and
+# docker-builds the Dockerfile. Each primitive can execute arbitrary
+# code with the token in env. Pinning `contents: read` means the worst
+# a malicious template PR can do with the token is read public repo
+# state — no write to issues, no push to branches, no comment-spam.
+permissions:
+  contents: read
+
+jobs:
+  validate-static:
+    name: Template validation (static)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # Canonical validator script lives in molecule-ci, fetched fresh on
+      # every run. Anonymous fetch of the public molecule-ci repo — no
+      # token needed; no actions/checkout cross-repo idiosyncrasies.
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Secret scan — the most important check. Always runs, including
+      # on fork PRs (no third-party code executes here).
+      - name: Check for secrets
+        run: |
+          python3 - << 'PYEOF'
+          import os, re, sys
+          from pathlib import Path
+
+          PATTERNS = [
+              re.compile(r'''["']sk-ant-[a-zA-Z0-9]{50,}["']'''),
+              re.compile(r'''["']ghp_[a-zA-Z0-9]{36,}["']'''),
+              re.compile(r'''["']AKIA[A-Z0-9]{16}["']'''),
+              re.compile(r'''["'][a-zA-Z0-9/+=]{40}["']'''),
+              re.compile(r'''["']sk_test_[a-zA-Z0-9]{24,}["']'''),
+              re.compile(r'''["']Bearer\s+[a-zA-Z0-9_.-]{20,}["']'''),
+              re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
+              re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
+          ]
+          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
+
+          def is_false_positive(line):
+              ctx = line.lower()
+              return '...' in ctx or '<example' in ctx or '</example' in ctx
+
+          root = Path(os.environ.get('GITHUB_WORKSPACE', '.'))
+          warnings = []
+          for dirpath, dirnames, filenames in os.walk(root):
+              dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+              for filename in filenames:
+                  if Path(filename).suffix not in EXTENSIONS:
+                      continue
+                  filepath = Path(dirpath) / filename
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          for lineno, line in enumerate(f.readlines(), 1):
+                              for pattern in PATTERNS:
+                                  for match in pattern.finditer(line):
+                                      if not is_false_positive(line):
+                                          warnings.append(f"  {filepath}:{lineno}: {match.group(0)[:40]}...")
+                  except Exception:
+                      pass
+
+          if warnings:
+              print("::error::Potential secret found in committed files:")
+              for w in warnings:
+                  print(w)
+              sys.exit(1)
+          else:
+              print("::notice::No secrets detected")
+          PYEOF
+      # Static-only validator — file existence checks, YAML parse,
+      # AST inspection of adapter.py (no import). Doesn't execute any
+      # third-party code; safe on fork PRs.
+      - run: pip install pyyaml -q
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
+
+  validate-runtime:
+    name: Template validation (runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: validate-static
+    # Skip when the PR comes from a fork — those are external,
+    # untrusted, and would let attackers run pip install / docker build
+    # / adapter.py import on our runner.
+    if: github.event.pull_request.head.repo.fork != true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+      - run: pip install pyyaml -q
+      # Install the template's runtime dependencies so the validator's
+      # check_adapter_runtime_load() can import adapter.py the same way
+      # the workspace container does at boot. Without this, a
+      # syntactically-valid adapter that ImportErrors on a missing
+      # transitive dep would build clean and crash on first user prompt.
+      - if: hashFiles('requirements.txt') != ''
+        run: pip install -q -r requirements.txt
+      - if: hashFiles('requirements.txt') == ''
+        run: pip install -q molecule-ai-workspace-runtime
+      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Docker build smoke test
+        if: hashFiles('Dockerfile') != ''
+        run: |
+          # Graceful skip when the runner's job-container can't reach the
+          # Docker daemon (e.g. /var/run/docker.sock not mounted into the
+          # act job container, or the in-container uid not in the docker
+          # group). Without this guard, CI stays red even when the
+          # template's Dockerfile is fine — see internal#222 for the
+          # proper runner-config fix.
+          if ! docker info >/dev/null 2>&1; then
+            echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
+            exit 0
+          fi
+          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+
+  # Aggregator that emits a single `validate` check name — matches the
+  # historical required-check name on this repo's branch protection.
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    needs: [validate-static, validate-runtime]
+    if: always()
+    timeout-minutes: 1
+    steps:
+      - name: Aggregate
+        run: |
+          static="${{ needs.validate-static.result }}"
+          runtime="${{ needs.validate-runtime.result }}"
+          echo "validate-static:  $static"
+          echo "validate-runtime: $runtime"
+          if [ "$static" != "success" ]; then
+            echo "::error::validate-static did not succeed: $static"
+            exit 1
+          fi
+          # Treat `skipped` as a pass for fork-PR semantics (validate-runtime
+          # is intentionally skipped on forks; static coverage is the gate).
+          if [ "$runtime" != "success" ] && [ "$runtime" != "skipped" ]; then
+            echo "::error::validate-runtime did not succeed: $runtime"
+            exit 1
+          fi
+          echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime)"
+
+  tests:
+    name: Adapter unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # pyyaml is the runtime dep that adapter.py's _load_providers reads
+      # /configs/config.yaml through. In production it arrives transitively
+      # via molecule-ai-workspace-runtime; in this minimal test env we
+      # install it explicitly so the YAML-loading code path is actually
+      # exercised (without it, _load_providers' broad except-Exception
+      # swallows the ImportError and silently falls back to _BUILTIN_PROVIDERS,
+      # which is exactly the behavior that bit us 2026-04-30 when CI
+      # claimed green on a build that couldn't route any third-party model).
+      - run: pip install -q pytest pytest-asyncio pyyaml
+      # Tests live under tests/ with their own pytest.ini that anchors
+      # rootdir there — keeps pytest from importing the package
+      # __init__.py (which does `from .adapter import ...` for runtime
+      # discovery and can't be satisfied without molecule_runtime
+      # installed). See tests/pytest.ini for the full rationale.
+      - run: python3 -m pytest tests/ -v
