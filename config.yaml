@@ -331,6 +331,4 @@ runtime_config:
 
   timeout: 0
 
-skills:
-  - coding-discipline
 template_schema_version: 1
