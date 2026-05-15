@@ -1,0 +1,214 @@
+name: publish-image
+
+# Builds the claude-code workspace template Dockerfile and pushes it to ECR as
+# `<REGISTRY>/workspace-template-claude-code:latest` + `:sha-<7>`.
+#
+# Ported/inlined from molecule-ci's publish-template-image.yml reusable
+# workflow. Cross-repo `uses:` is BLOCKED on Gitea 1.22.6 because
+# DEFAULT_ACTIONS_URL=github causes the runner to attempt the lookup against
+# github.com, which always 404s even for same-instance repos.
+# (feedback_gitea_cross_repo_uses_blocked)
+#
+# Registry: production uses ECR (MOLECULE_IMAGE_REGISTRY env var on EC2 /
+# Railway) backed by org-level AWS creds. The OSS default in registry.go is
+# ghcr.io/molecule-ai but the ECR repo `molecule-ai/workspace-template-claude-code`
+# already exists (created by the migration sweep). No GHCR token is in the
+# credentials store — Gitea's GITHUB_TOKEN cannot authenticate to ghcr.io.
+#
+# Gitea 1.22.6 hostile-shape checklist applied:
+#   - No workflow_dispatch.inputs (silently rejected on 1.22.6)
+#   - No merge_group: trigger
+#   - No cross-repo uses:
+#   - GITHUB_SERVER_URL pinned at workflow level
+#     (feedback_act_runner_github_server_url)
+#   - No on.push.paths: (would permanently block path-excluded pushes)
+#   - timeout-minutes on every job
+#
+# Cascade signal: molecule-core/publish-runtime.yml fans out by git-pushing
+# an updated `.runtime-version` file to this repo's main branch, which trips
+# the `on: push: branches: [main]` trigger here. The resolve-version job reads
+# that file and forwards the version as a RUNTIME_VERSION docker build-arg so
+# pip install resolves the exact fresh version.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  # Belt-and-suspenders for act_runner runners regenerated without the
+  # config.yaml envs block. (feedback_act_runner_github_server_url)
+  GITHUB_SERVER_URL: https://git.moleculesai.app
+  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
+  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-claude-code
+  AWS_DEFAULT_REGION: us-east-2
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    name: Resolve runtime version
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+      sha: ${{ steps.read.outputs.sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: read
+        shell: bash
+        run: |
+          if [ -f .runtime-version ]; then
+            v="$(head -n1 .runtime-version | tr -d '[:space:]')"
+            echo "version=${v}" >> "$GITHUB_OUTPUT"
+            echo "resolved runtime version from .runtime-version: ${v}"
+          else
+            echo "version=" >> "$GITHUB_OUTPUT"
+            echo "no .runtime-version file — will use Dockerfile/requirements.txt pin"
+          fi
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build & push workspace-template-claude-code image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: resolve-version
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Lint — no bare imports of runtime modules
+        # Catches `from plugins import ...` style bare imports that work in the
+        # monorepo layout but explode at startup in the published container
+        # (ModuleNotFoundError). Runs before Docker login so a bad adapter
+        # returns red in seconds.
+        # Fallback module list mirrors scripts/build_runtime_package.py:
+        # TOP_LEVEL_MODULES as of 2026-04-27.
+        shell: bash
+        run: |
+          set -eu
+          FALLBACK_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
+          RUNTIME_MODULES=""
+          mkdir -p /tmp/runtime-wheel
+          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
+            WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
+            if [ -n "$WHEEL" ]; then
+              RUNTIME_MODULES=$(unzip -p "$WHEEL" molecule_runtime/_runtime_modules.json 2>/dev/null \
+                | python3 -c "import sys,json; m=json.load(sys.stdin); print('|'.join(sorted(set(m['top_level_modules']) | set(m['subpackages']))))" 2>/dev/null || echo "")
+            fi
+          fi
+          if [ -n "$RUNTIME_MODULES" ]; then
+            echo "::notice::lint module list from published wheel"
+          else
+            RUNTIME_MODULES="$FALLBACK_MODULES"
+            echo "::warning::could not read _runtime_modules.json from wheel — using inline fallback"
+          fi
+          if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" *.py 2>/dev/null); then
+            echo "::error::Bare imports of runtime modules found — use 'from molecule_runtime.<module> import'"
+            echo "$HITS" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "::notice::no bare imports of runtime modules in *.py files"
+
+      - name: Log in to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Verify Docker daemon access
+        run: |
+          set -euo pipefail
+          docker info >/dev/null 2>&1 || {
+            echo "::error::Docker daemon is not accessible — check runner sock mount"
+            exit 1
+          }
+          echo "Docker daemon OK"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Ensure ECR repository exists
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          repo_path="${IMAGE_NAME#*/}"
+          repo_path="${repo_path#*/}"  # strip registry host + first slash → molecule-ai/workspace-template-claude-code
+          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name "${repo_path}" \
+              --image-scanning-configuration scanOnPush=true \
+              --region us-east-2 >/dev/null
+            echo "::notice::created ECR repository ${repo_path}"
+          else
+            echo "ECR repository ${repo_path} already exists"
+          fi
+
+      - name: Build image (load for smoke test, do not push yet)
+        # Build into runner-local docker first. Smoke test runs before push so
+        # a broken adapter.py never poisons :latest.
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI workspace template — claude-code runtime
+
+      - name: Smoke test — import every /app/*.py
+        # Boot the locally-loaded image and import each *.py module to verify
+        # all module-level imports resolve against the pip-installed runtime.
+        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -eu
+          docker run --rm \
+            -e WORKSPACE_ID=smoke-test \
+            -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
+            -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
+            -e OPENAI_API_KEY=sk-fake-smoke-key \
+            --entrypoint sh "${IMAGE}" -c '
+            set -e
+            cd /app
+            for f in *.py; do
+              [ "$f" = "__init__.py" ] && continue
+              mod="${f%.py}"
+              python3 -c "import $mod" || { echo "::error::failed to import $mod"; exit 1; }
+              echo "  import $mod OK"
+            done
+          '
+          echo "::notice::${IMAGE}: all /app/*.py modules import cleanly"
+
+      - name: Push image to ECR (post-smoke)
+        # Smoke passed — push both :latest and :sha-<7>. build-push-action
+        # reuses the cached layers so this is a layer-push, not a rebuild.
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI workspace template — claude-code runtime
+
