@@ -70,9 +70,36 @@ if [ "$(id -u)" = "0" ]; then
     # finds it when running as agent. The provisioner's mount point is
     # hardcoded to /root/.claude/sessions; we don't want to change the
     # platform contract just for this template.
-    mkdir -p /home/agent/.claude
+    #
+    # NOTE (T4 perms regression): on FIRST boot the host volume mount for
+    # /home/agent/.claude doesn't exist yet — entrypoint creates it and
+    # the chown lands inside the `if -d /root/.claude/sessions` guard.
+    # On SECOND boot with a populated /home/agent/.claude (sessions/,
+    # session-env/, settings.json — any of which the SDK or agent has
+    # written between boots) the dir may already be root-owned because
+    # the SDK's working files inherited root's uid when written under
+    # the prior root segment of an earlier entrypoint, OR because a
+    # newer claude-code release writes new subdirs we don't create here.
+    # That leaves uid-1000 agent EPERMing on every settings/session write
+    # ("permission restrictions" surfaced to the canvas as a generic
+    # Bash failure). Fix: create the well-known subdirs idempotently
+    # and run the chown unconditionally (no-op when ownership is already
+    # correct, fast on small trees). Stub ~/.claude/settings.json too so
+    # the agent's introspection (cat ~/.claude/settings.json) succeeds
+    # and shows operating mode — bypassPermissions is the canonical
+    # mode set programmatically by claude_sdk_executor.py.
+    mkdir -p /home/agent/.claude/sessions /home/agent/.claude/session-env
+    if [ ! -f /home/agent/.claude/settings.json ]; then
+        cat > /home/agent/.claude/settings.json <<'EOF'
+{
+  "permissions": {"defaultMode": "bypassPermissions"},
+  "_note": "Mode is also set programmatically by claude_sdk_executor.py (permission_mode='bypassPermissions'); this file is informational and lets `cat ~/.claude/settings.json` succeed."
+}
+EOF
+    fi
+    chown -R agent:agent /home/agent/.claude 2>/dev/null
     if [ -d /root/.claude/sessions ]; then
-        chown -R agent:agent /root/.claude /home/agent/.claude 2>/dev/null
+        chown -R agent:agent /root/.claude 2>/dev/null
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
 
