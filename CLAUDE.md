@@ -72,6 +72,27 @@ Skills persist across restarts. Use them to codify best practices, coding standa
 ## Language
 Always respond in the same language the user uses. If Chinese, respond in Chinese. If English, respond in English. Match exactly.
 
+## Workspace ownership tier — T4 (top-tier)
+
+**T4 (top-tier) workspaces grant full host control.** The Docker socket is mounted into the container; the runtime is started with `--privileged`; the workspace owner can `docker exec` into siblings on the same host and read/write anything the host kernel will let it touch.
+
+What this means in practice:
+
+- The container's home directory `~/.claude/` (and its `sessions/`, `session-env/`, `settings.json`) is persisted across restarts via a host bind mount. Anything you (or the SDK) write there survives container churn — but ownership can drift.
+- If you see `EPERM` / "permission denied" on `~/.claude/` writes after a restart — particularly on `settings.json` or anything under `sessions/` — the volume picked up `root:root` ownership from a prior boot or a newer claude-code release wrote subdirs the entrypoint didn't pre-create.
+- Recovery (do this yourself; you have the rights): `sudo chown -R agent:agent ~/.claude/`. The entrypoint already runs a recursive chown unconditionally on every boot, so a restart also clears it — but `sudo chown` is faster and doesn't drop the active session.
+- The provisioned `~/.claude/settings.json` is informational: it documents that `permission_mode='bypassPermissions'` is the canonical operating mode, which is also set programmatically in `claude_sdk_executor.py` (the file is NOT the source of truth — the SDK kwargs are).
+
+If `cat ~/.claude/settings.json` returns `No such file or directory` you're on a workspace image older than 2026-05-15 — restart picks up the new entrypoint and stubs the file in place.
+
+## Knowing your own model
+
+Use the `get_runtime_identity` MCP tool to know what model you actually are. It reads the live process env (`MODEL`, `MODEL_PROVIDER`, `MOLECULE_MODEL`, `ANTHROPIC_BASE_URL`, `TIER`, `WORKSPACE_ID`, `ADAPTER_MODULE`) and returns the resolved values — no HTTP call, always works, always permitted by RBAC. Do NOT guess from your system prompt or from `requirements.txt`; the operator may have routed you to a different model via persona env between boots.
+
+## Editing your own agent_card
+
+Use the `update_agent_card` MCP tool to update this workspace's `agent_card` on the platform. Pass a JSON object — the platform validates required fields server-side. The change is broadcast as an `agent_card_updated` event so the canvas reflects the new card live. The tool is gated on `memory.write` capability, so read-only agents won't accidentally rewrite the card; T4 owners always have this capability.
+
 ## Runtime wedge integration
 
 The `runtime_wedge` module (in `molecule_runtime`) is the universal cross-cutting holder for "this Python process can no longer serve queries — only a workspace restart will recover." It surfaces unrecoverable wedges to two consumers:
