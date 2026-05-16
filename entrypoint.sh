@@ -42,6 +42,15 @@ log_boot_context
 if [ "$(id -u)" = "0" ]; then
     # Configs volume is created by Docker as root; agent needs write access
     # for plugin installs, memory writes, .auth_token rotation, etc.
+    #
+    # T4 atomic-co-sequencing contract (RFC internal#456 §10): the T4
+    # escalation leg (sudo NOPASSWD + docker group, baked in the
+    # Dockerfile) is ADDITIVE. The agent still runs uid-1000 and
+    # /configs/.auth_token MUST remain agent-owned — escalation must
+    # NOT regress the Hermes list_peers-401 token-ownership class.
+    # This chown -R is the agent-ownership half of that contract; the
+    # Layer-3 conformance gate asserts owner_uid==1000 on the running
+    # container alongside the host-root-reach assertion.
     chown -R agent:agent /configs 2>/dev/null
     # /workspace handling — only chown when the contents are root-owned
     # (typical on Docker Desktop on Windows where host uid maps to 0).
