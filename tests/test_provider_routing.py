@@ -219,7 +219,6 @@ def test_glm_kimi_deepseek_also_project(adapter_module, monkeypatch):
     """
     cases = [
         ("zai", "GLM_API_KEY"),
-        ("moonshot", "KIMI_API_KEY"),
         ("deepseek", "DEEPSEEK_API_KEY"),
     ]
     for provider_name, env_name in cases:
@@ -242,3 +241,83 @@ def test_glm_kimi_deepseek_also_project(adapter_module, monkeypatch):
             f"{env_name} must project onto ANTHROPIC_AUTH_TOKEN for "
             f"provider={provider_name}"
         )
+
+
+def test_kimi_coding_projects_into_anthropic_api_key(adapter_module, monkeypatch):
+    """Kimi For Coding's gateway authenticates with the x-api-key header
+    (kimi.com official Claude Code doc), which the Anthropic SDK / claude
+    CLI emits from ANTHROPIC_API_KEY — NOT the Bearer ANTHROPIC_AUTH_TOKEN
+    used by MiniMax/GLM/DeepSeek. The kimi-coding provider sets
+    auth_token_env: ANTHROPIC_API_KEY so KIMI_API_KEY projects there.
+
+    Regression guard for the original mis-route: KIMI_API_KEY landing in
+    ANTHROPIC_AUTH_TOKEN against api.kimi.com/coding 401s.
+    """
+    import os
+    _clear_all_auth_env(monkeypatch, adapter_module)
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-sentinel")
+    provider = {
+        "name": "kimi-coding",
+        "auth_mode": "third_party_anthropic_compat",
+        "model_prefixes": ("kimi-",),
+        "model_aliases": (),
+        "base_url": "https://api.kimi.com/coding/",
+        "auth_env": ("KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+        "auth_token_env": "ANTHROPIC_API_KEY",
+    }
+
+    adapter_module._project_vendor_auth(provider)
+
+    assert os.environ.get("ANTHROPIC_API_KEY") == "sk-kimi-sentinel", (
+        "KIMI_API_KEY must project onto ANTHROPIC_API_KEY (x-api-key) for "
+        "the kimi-coding provider per kimi.com's official Claude Code doc"
+    )
+    assert os.environ.get("ANTHROPIC_AUTH_TOKEN") is None, (
+        "KIMI_API_KEY must NOT land in ANTHROPIC_AUTH_TOKEN — the Bearer "
+        "header 401s against api.kimi.com/coding (the original mis-route)"
+    )
+
+
+def test_kimi_coding_operator_anthropic_api_key_wins(adapter_module, monkeypatch):
+    """Idempotency holds for the per-provider target too: an explicit
+    operator ANTHROPIC_API_KEY is never clobbered by the projection."""
+    import os
+    _clear_all_auth_env(monkeypatch, adapter_module)
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-sentinel")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "operator-value")
+    provider = {
+        "name": "kimi-coding",
+        "auth_mode": "third_party_anthropic_compat",
+        "model_prefixes": ("kimi-",),
+        "model_aliases": (),
+        "base_url": "https://api.kimi.com/coding/",
+        "auth_env": ("KIMI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+        "auth_token_env": "ANTHROPIC_API_KEY",
+    }
+
+    adapter_module._project_vendor_auth(provider)
+
+    assert os.environ.get("ANTHROPIC_API_KEY") == "operator-value", (
+        "explicit operator ANTHROPIC_API_KEY must win over auto-projection"
+    )
+
+
+def test_normalize_provider_parses_auth_token_env(adapter_module):
+    """_normalize_provider surfaces auth_token_env; absent → the
+    ANTHROPIC_AUTH_TOKEN default (preserves MiniMax/GLM/DeepSeek)."""
+    with_override = adapter_module._normalize_provider({
+        "name": "kimi-coding",
+        "auth_mode": "third_party_anthropic_compat",
+        "base_url": "https://api.kimi.com/coding/",
+        "auth_env": ["KIMI_API_KEY", "ANTHROPIC_API_KEY"],
+        "auth_token_env": "ANTHROPIC_API_KEY",
+    })
+    assert with_override["auth_token_env"] == "ANTHROPIC_API_KEY"
+
+    default = adapter_module._normalize_provider({
+        "name": "minimax",
+        "auth_mode": "third_party_anthropic_compat",
+        "base_url": "https://api.minimax.io/anthropic",
+        "auth_env": ["MINIMAX_API_KEY"],
+    })
+    assert default["auth_token_env"] == "ANTHROPIC_AUTH_TOKEN"
