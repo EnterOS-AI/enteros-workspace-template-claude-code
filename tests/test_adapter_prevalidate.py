@@ -129,12 +129,13 @@ _FIXTURE_PROVIDERS_YAML = textwrap.dedent("""
         base_url: https://api.z.ai/api/anthropic
         auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
-      - name: moonshot
+      - name: kimi-coding
         auth_mode: third_party_anthropic_compat
         model_prefixes: [kimi-]
         model_aliases: []
-        base_url: https://api.moonshot.ai/anthropic
-        auth_env: [ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+        base_url: https://api.kimi.com/coding/
+        auth_env: [KIMI_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
+        auth_token_env: ANTHROPIC_API_KEY
 
       - name: deepseek
         auth_mode: third_party_anthropic_compat
@@ -554,7 +555,7 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
     names = [p["name"] for p in result]
     assert names == [
         "anthropic-oauth", "anthropic-api", "xiaomi-mimo", "minimax",
-        "zai", "moonshot", "deepseek",
+        "zai", "kimi-coding", "deepseek",
     ]
     # YAML lists must be normalized to tuples for downstream lookup ergonomics.
     assert isinstance(result[0]["model_aliases"], tuple)
@@ -564,15 +565,16 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
 @pytest.mark.parametrize("model,expected_provider,expected_url", [
     ("GLM-4.6", "zai", "https://api.z.ai/api/anthropic"),
     ("glm-4.5", "zai", "https://api.z.ai/api/anthropic"),
-    ("kimi-k2.5", "moonshot", "https://api.moonshot.ai/anthropic"),
+    ("kimi-k2.5", "kimi-coding", "https://api.kimi.com/coding/"),
+    ("kimi-for-coding", "kimi-coding", "https://api.kimi.com/coding/"),
     ("deepseek-v4-pro", "deepseek", "https://api.deepseek.com/anthropic"),
 ])
 @pytest.mark.asyncio
 async def test_setup_routes_extra_providers(
     adapter, monkeypatch, configs_dir, model, expected_provider, expected_url
 ):
-    """The Z.ai / Moonshot / DeepSeek providers added in this PR must
-    route correctly: model id → provider entry → ANTHROPIC_BASE_URL.
+    """The Z.ai / Kimi-For-Coding / DeepSeek providers must route
+    correctly: model id → provider entry → ANTHROPIC_BASE_URL.
     Parametrized to keep the matrix coverage tight without 3 near-identical
     test bodies. Locks in the per-vendor base_url so a future YAML edit
     that mistypes z.ai's `/api/anthropic` suffix gets caught.

@@ -144,6 +144,20 @@ def _normalize_provider(entry: dict):
         "model_aliases": _coerce_string_list(entry.get("model_aliases"), lowercase=True),
         "base_url": entry.get("base_url") or None,
         "auth_env": _coerce_string_list(entry.get("auth_env"), lowercase=False),
+        # Which env var the boot-time vendor-key projection writes the
+        # vendor key INTO. Defaults to ANTHROPIC_AUTH_TOKEN (Bearer-style
+        # — correct for MiniMax/GLM/DeepSeek Anthropic-compat shims).
+        # Kimi For Coding's gateway authenticates with the x-api-key
+        # header (per kimi.com's official Claude Code doc), which the
+        # Anthropic SDK / claude CLI emits from ANTHROPIC_API_KEY — so
+        # that provider's entry sets auth_token_env: ANTHROPIC_API_KEY.
+        # Env-var names are case-sensitive; preserve case.
+        "auth_token_env": (
+            entry.get("auth_token_env")
+            if isinstance(entry.get("auth_token_env"), str)
+            and entry.get("auth_token_env").strip()
+            else "ANTHROPIC_AUTH_TOKEN"
+        ),
     }
 
 
@@ -446,12 +460,18 @@ _VENDOR_KEY_NAMES = frozenset({
 
 
 def _project_vendor_auth(provider: dict) -> None:
-    """Project a per-vendor API key onto ANTHROPIC_AUTH_TOKEN at boot.
+    """Project a per-vendor API key onto the provider's auth-token env at boot.
 
-    Third-party Anthropic-compat providers (MiniMax, Z.ai, Moonshot,
-    DeepSeek) all reuse the Anthropic SDK's wire format, which means the
-    ``claude`` CLI / claude-code-sdk reads the bearer token from
-    ``ANTHROPIC_AUTH_TOKEN`` no matter which vendor is being talked to.
+    Third-party Anthropic-compat providers (MiniMax, Z.ai, DeepSeek)
+    reuse the Anthropic SDK's wire format with a Bearer token, which the
+    ``claude`` CLI / claude-code-sdk reads from ``ANTHROPIC_AUTH_TOKEN``.
+    Kimi For Coding's gateway instead authenticates with the
+    ``x-api-key`` header (per kimi.com's official Claude Code
+    integration doc), which the SDK emits from ``ANTHROPIC_API_KEY`` —
+    so the projection target is per-provider, declared as
+    ``auth_token_env`` in the registry (default ``ANTHROPIC_AUTH_TOKEN``
+    preserves the existing MiniMax/GLM/DeepSeek behavior unchanged).
+
     Pre-#244 the canvas surfaced the vendor-specific name
     (``MINIMAX_API_KEY``, etc.) to the user — so a user who saved only
     that name hit a silent 401 on first call while the boot audit said
@@ -459,21 +479,24 @@ def _project_vendor_auth(provider: dict) -> None:
     / hermes PR #38.
 
     Behavior:
+      * Let ``target`` = the provider's ``auth_token_env`` (default
+        ``ANTHROPIC_AUTH_TOKEN``).
       * If the matched provider's ``auth_env`` lists any of
         ``_VENDOR_KEY_NAMES`` and that var is set, copy its value into
-        ``ANTHROPIC_AUTH_TOKEN`` so the SDK finds it.
-      * **Idempotent**: if ``ANTHROPIC_AUTH_TOKEN`` is already set we
-        do NOT overwrite — an explicit operator value (workspace
-        secret) always wins over auto-projection.
-      * Logs the projection by NAME (e.g. ``MINIMAX_API_KEY ->
-        ANTHROPIC_AUTH_TOKEN``); never logs the secret VALUE. Same
+        ``target`` so the SDK finds it.
+      * **Idempotent**: if ``target`` is already set we do NOT
+        overwrite — an explicit operator value (workspace secret)
+        always wins over auto-projection.
+      * Logs the projection by NAME (e.g. ``KIMI_API_KEY ->
+        ANTHROPIC_API_KEY``); never logs the secret VALUE. Same
         contract as ``_audit_auth_env_presence``.
       * No-op for providers whose ``auth_env`` doesn't reference a
         vendor-specific name (oauth, anthropic-api, or a third-party
         entry that hasn't been added to the registry yet).
     """
     auth_env = provider.get("auth_env") or ()
-    if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+    target = provider.get("auth_token_env") or "ANTHROPIC_AUTH_TOKEN"
+    if os.environ.get(target):
         # Operator override wins — never clobber an explicit value.
         return
     for name in auth_env:
@@ -482,10 +505,10 @@ def _project_vendor_auth(provider: dict) -> None:
         value = os.environ.get(name)
         if not value:
             continue
-        os.environ["ANTHROPIC_AUTH_TOKEN"] = value
+        os.environ[target] = value
         logger.info(
-            "auth env projection: %s -> ANTHROPIC_AUTH_TOKEN (provider=%s)",
-            name, provider.get("name", "<unknown>"),
+            "auth env projection: %s -> %s (provider=%s)",
+            name, target, provider.get("name", "<unknown>"),
         )
         return
 

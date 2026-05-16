@@ -31,6 +31,16 @@ tier: 2
 #   model_aliases  : exact lowercase ids (e.g. ["sonnet", "opus"])
 #   base_url       : ANTHROPIC_BASE_URL to set; null = CLI default (anthropic-native)
 #   auth_env       : env vars accepted; any one being set satisfies auth
+#   auth_token_env : (optional) the env var the boot-time vendor-key
+#                    projection writes the vendor key INTO. Defaults to
+#                    ANTHROPIC_AUTH_TOKEN (Bearer-style; correct for
+#                    MiniMax/GLM/DeepSeek Anthropic-compat shims). Kimi
+#                    For Coding's gateway authenticates with the
+#                    x-api-key header per kimi.com's official Claude Code
+#                    integration doc, which the Anthropic SDK / claude
+#                    CLI emits from ANTHROPIC_API_KEY (NOT the Bearer
+#                    ANTHROPIC_AUTH_TOKEN) — so its entry sets
+#                    auth_token_env: ANTHROPIC_API_KEY.
 providers:
   - name: anthropic-oauth
     auth_mode: oauth
@@ -73,13 +83,27 @@ providers:
     base_url: https://api.z.ai/api/anthropic
     auth_env: [GLM_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
 
-  # Moonshot AI — Kimi family. platform.kimi.ai/docs/guide/agent-support.
-  - name: moonshot
+  # Kimi For Coding — Moonshot's coding-agent tier (K2.6 / "Kimi for
+  # Coding"). Per kimi.com's OFFICIAL Claude Code integration doc
+  # (kimi.com/code/docs/en/third-party-tools/other-coding-agents.html,
+  # "Claude Code" section) the contract is:
+  #   ANTHROPIC_BASE_URL=https://api.kimi.com/coding/   (trailing slash)
+  #   ANTHROPIC_API_KEY=<the Kimi key>                  (x-api-key header)
+  # The `sk-kimi-*` key (KIMI_API_KEY in SSOT) authenticates ONLY against
+  # this gateway — the legacy api.moonshot.ai/anthropic surface 401s it.
+  # The gateway routes to the served K2.6 model regardless of the Claude
+  # model name on the wire (proven end-to-end via the OpenClaw template's
+  # api.kimi.com/coding path, winnerProvider=custom-api-kimi-com).
+  # auth_token_env pins the projection to ANTHROPIC_API_KEY (x-api-key)
+  # rather than the default ANTHROPIC_AUTH_TOKEN (Bearer), which this
+  # gateway rejects.
+  - name: kimi-coding
     auth_mode: third_party_anthropic_compat
     model_prefixes: [kimi-]
     model_aliases: []
-    base_url: https://api.moonshot.ai/anthropic
-    auth_env: [KIMI_API_KEY, ANTHROPIC_AUTH_TOKEN, ANTHROPIC_API_KEY]
+    base_url: https://api.kimi.com/coding/
+    auth_env: [KIMI_API_KEY, ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
+    auth_token_env: ANTHROPIC_API_KEY
 
   # DeepSeek — api-docs.deepseek.com/guides/anthropic_api. Note: their
   # endpoint silently maps unknown model ids to deepseek-v4-flash, so a
@@ -175,15 +199,23 @@ runtime_config:
       name: Z.ai GLM-4.5 (third-party, Anthropic-API-compatible)
       required_env: [GLM_API_KEY]
 
-    # --- Moonshot AI Kimi family (third-party, Anthropic-API-compatible) ---
-    # KIMI_API_KEY → ANTHROPIC_AUTH_TOKEN projection at boot.
-    # platform.kimi.ai for docs. K2.5 is the latest agentic-coding tier;
-    # K2 stays as a cheaper option.
+    # --- Kimi For Coding (third-party, Anthropic-API-compatible) ---
+    # Routed via the `kimi-coding` provider entry above: the adapter
+    # auto-sets ANTHROPIC_BASE_URL=https://api.kimi.com/coding/ and
+    # projects KIMI_API_KEY → ANTHROPIC_API_KEY (x-api-key) per
+    # kimi.com's official Claude Code integration doc. The gateway
+    # serves the K2.6 model regardless of the wire model id; the id
+    # below is the gateway's own served-model name (mirrors the proven
+    # OpenClaw `kimi-for-coding` route). K2.5 / K2 stay as aliases for
+    # workspaces pinned to the older labels — they hit the same gateway.
+    - id: kimi-for-coding
+      name: Kimi K2.6 (Kimi For Coding, third-party Anthropic-API-compatible)
+      required_env: [KIMI_API_KEY]
     - id: kimi-k2.5
-      name: Moonshot Kimi K2.5 (third-party, Anthropic-API-compatible)
+      name: Kimi K2.5 (Kimi For Coding, third-party Anthropic-API-compatible)
       required_env: [KIMI_API_KEY]
     - id: kimi-k2
-      name: Moonshot Kimi K2 (third-party, Anthropic-API-compatible)
+      name: Kimi K2 (Kimi For Coding, third-party Anthropic-API-compatible)
       required_env: [KIMI_API_KEY]
 
     # --- DeepSeek (third-party, Anthropic-API-compatible) ---
