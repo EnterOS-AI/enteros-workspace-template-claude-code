@@ -119,6 +119,27 @@ COPY scripts/molecule-git-token-helper.sh /app/scripts/molecule-git-token-helper
 COPY scripts/molecule-gh-token-refresh.sh /app/scripts/molecule-gh-token-refresh.sh
 RUN chmod +x /app/scripts/molecule-git-token-helper.sh /app/scripts/molecule-gh-token-refresh.sh
 
+# Generic GIT_ASKPASS helper — image-side companion to molecule-core PR
+# #1525 (workspace-server applyAgentGitIdentity, merge_sha 73a09443a086).
+# Reads HTTPS Basic-Auth credentials from env vars (GIT_HTTP_USERNAME /
+# GIT_HTTP_PASSWORD, with GITEA_USER / GITEA_TOKEN as fallback) and emits
+# them on the git credential-prompt protocol, so container-side `git` can
+# authenticate to any private HTTPS remote without on-disk ~/.gitconfig
+# or ~/.git-credentials mutation. The platform provisioner sets
+# GIT_ASKPASS=/usr/local/bin/molecule-askpass via applyAgentGitIdentity;
+# until this binary ships in the runtime image, git invocations error
+# with "exec: /usr/local/bin/molecule-askpass: not found" (forward-only
+# pin gap — same class as Hermes list_peers and codex template breakage,
+# fixed image-side here).
+#
+# No hardcoded hostnames or vendor names — the script body is identical
+# to the one shipped in molecule-core workspace/scripts/molecule-askpass
+# and the parallel external workspace template repos, so any deployer
+# can fork this template and use it against their own git host without
+# editing.
+COPY scripts/molecule-askpass /usr/local/bin/molecule-askpass
+RUN chmod +x /usr/local/bin/molecule-askpass
+
 # Drop-priv entrypoint — claude-code refuses --dangerously-skip-permissions
 # as root, so we run molecule-runtime as the agent user (uid 1000).
 # The script handles volume-ownership fix + session-dir symlink before
