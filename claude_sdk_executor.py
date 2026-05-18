@@ -535,7 +535,16 @@ class ClaudeSDKExecutor(AgentExecutor):
             # claude session renders inbound messages as `<channel>` tags
             # inline (no inbox poll needed). Drop once channels graduate
             # to the default allowlist.
-            extra_args={"dangerously-load-development-channels": "server:molecule"},
+            #
+            # Task #214 — CLI 2.1.143 made the flag variadic (nargs='+').
+            # The `{flag: value}` shape renders as TWO argv elements (see
+            # claude_agent_sdk subprocess_cli.py:340) and the channels
+            # parser then greedily absorbs the SDK's downstream `--print
+            # <prompt>` argv pair, wedging the SDK at initialize. Fix:
+            # pack `=value` into the key so the renderer's None-value
+            # path emits a single argv element which the variadic parser
+            # cannot reach across.
+            extra_args={"dangerously-load-development-channels=server:molecule": None},
         )
 
         # --- output_config: effort + task_budget (issue #652) ---
