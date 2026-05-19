@@ -110,6 +110,18 @@ def _load_executor():
     return claude_sdk_executor
 
 
+def _channels_entry(extra_args):
+    """Return (key, value) for the dev-channels flag, tolerating both shapes.
+
+    - separate-value shape: {"dangerously-load-development-channels": "server:X"}
+    - packed `=` shape (task #214 fix): {"dangerously-load-development-channels=server:X": None}
+    """
+    for k, v in extra_args.items():
+        if k.split("=", 1)[0] == "dangerously-load-development-channels":
+            return k, v
+    return None, None
+
+
 def test_build_options_forwards_tagged_dev_channels_flag(tmp_path):
     """``_build_options`` must pass the tagged ``server:molecule`` entry to
     ``--dangerously-load-development-channels``. The Claude Code 2.1.x CLI
@@ -142,25 +154,28 @@ def test_build_options_forwards_tagged_dev_channels_flag(tmp_path):
         "extra_args missing — host claude CLI will never see the dev-channels "
         "flag and notifications/claude/channel will be filtered at the allowlist"
     )
-    flag_value = kwargs["extra_args"].get("dangerously-load-development-channels")
-    assert flag_value == "server:molecule", (
-        f"dev-channels entry must be tagged 'server:molecule' to match the "
-        f"workspace's MCP-server registration. The CLI rejects bare server "
+    key, value = _channels_entry(kwargs["extra_args"])
+    # Resolve the tagged payload from whichever shape the executor used.
+    tagged = value if value is not None else (key.split("=", 1)[1] if "=" in key else None)
+    assert tagged == "server:molecule", (
+        f"dev-channels entry must resolve to tagged 'server:molecule' to match "
+        f"the workspace's MCP-server registration. The CLI rejects bare server "
         f"names with `entries must be tagged` and bare-switch values (None) "
         f"with `argument missing`; the latter wedges SDK initialize. "
-        f"got {flag_value!r}"
+        f"got key={key!r} value={value!r}"
     )
 
 
 def test_build_options_dev_channels_value_is_not_bare_none(tmp_path):
     """Defense in depth against the original PR #25 bare-switch shape.
 
-    ``{flag: None}`` in claude-agent-sdk's extra_args forwarding renders
-    as a bare ``--flag`` with no value, which the post-2.1.x CLI rejects.
-    Pin the invariant (non-None, non-empty, contains a tag colon) so a
-    regression to the old shape fails immediately at unit-test time
-    instead of surfacing as a live `Control request timeout: initialize`
-    wedge in production.
+    A bare ``--dangerously-load-development-channels`` (no value, no
+    ``=value`` packed into the key) renders as an argument-less flag,
+    which the post-2.1.x CLI rejects with `argument missing`. Pin the
+    invariant (the rendered payload is non-empty and tag-colon-shaped)
+    so a regression to the old shape fails immediately at unit-test
+    time instead of surfacing as a live `Control request timeout:
+    initialize` wedge in production.
     """
     mod = _load_executor()
     sdk = sys.modules["claude_agent_sdk"]
@@ -174,17 +189,56 @@ def test_build_options_dev_channels_value_is_not_bare_none(tmp_path):
     )
     executor._build_options()
 
-    flag_value = (
+    key, value = _channels_entry(
         sdk.ClaudeAgentOptions.call_args.kwargs["extra_args"]
-        ["dangerously-load-development-channels"]
     )
-    assert flag_value is not None, (
-        "flag value must not be None — bare switch wedges SDK initialize"
+    payload = key if value is None else f"{key}={value}"
+    assert ":" in payload.split("=", 1)[-1], (
+        f"flag payload must be tagged (server:<name> or plugin:<name>@<marketplace>); "
+        f"got key={key!r} value={value!r} which the CLI rejects with "
+        f"`entries must be tagged` or `argument missing`"
     )
-    assert isinstance(flag_value, str) and flag_value, (
-        f"flag value must be a non-empty string; got {flag_value!r}"
+
+
+def test_dev_channels_does_not_swallow_print_prompt_cli_2_1_143(tmp_path):
+    """Task #214 regression — claude-code CLI 2.1.143.
+
+    CLI 2.1.143 made ``--dangerously-load-development-channels`` variadic
+    (``nargs='+'``).  claude-agent-sdk's renderer (subprocess_cli.py:340)
+    emits ``{flag: value}`` as TWO argv elements, so the channels parser
+    greedily absorbs the following ``--print <prompt>`` argv pair as
+    channel entries and the SDK wedges at initialize.  Fix: pack ``=``
+    into the key so the renderer's ``None``-value path emits ONE argv —
+    ``--dangerously-load-development-channels=server:molecule`` — that
+    the variadic parser cannot reach across.  Both argv orderings
+    around ``--print <prompt>`` (channels-then-print, print-then-
+    channels) must keep the prompt argv adjacent to ``--print``.
+    """
+    mod = _load_executor()
+    sdk = sys.modules["claude_agent_sdk"]
+    sdk.ClaudeAgentOptions.reset_mock()
+    executor = mod.ClaudeSDKExecutor(
+        system_prompt=None, config_path=str(tmp_path), heartbeat=None, model="sonnet",
     )
-    assert ":" in flag_value, (
-        f"flag value must be tagged (server:<name> or plugin:<name>@<marketplace>); "
-        f"got {flag_value!r} which the CLI rejects with `entries must be tagged`"
+    executor._build_options()
+    extra_args = sdk.ClaudeAgentOptions.call_args.kwargs["extra_args"]
+
+    # Mirror claude_agent_sdk/_internal/transport/subprocess_cli.py:340.
+    channels_argv = []
+    for flag, val in extra_args.items():
+        channels_argv.append(f"--{flag}") if val is None else channels_argv.extend([f"--{flag}", str(val)])
+
+    slots = [a for a in channels_argv if a.startswith("--dangerously-load-development-channels")]
+    assert len(slots) == 1 and "=" in slots[0] and channels_argv == slots, (
+        f"channels flag must render as a single argv with `=value` packed in so "
+        f"CLI 2.1.143's nargs='+' parser cannot swallow --print <prompt>; "
+        f"got channels_argv={channels_argv!r}"
     )
+    for orientation, full_argv in (
+        ("channels_then_print", channels_argv + ["--print", "hello world"]),
+        ("print_then_channels", ["--print", "hello world"] + channels_argv),
+    ):
+        idx = full_argv.index("--print")
+        assert full_argv[idx + 1] == "hello world", (
+            f"--print prompt argv must stay adjacent ({orientation}); got {full_argv!r}"
+        )
