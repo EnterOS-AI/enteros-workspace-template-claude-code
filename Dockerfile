@@ -68,14 +68,15 @@ WORKDIR /app
 # baked in (the cache trap that bit us 5x on 2026-04-27).
 # Empty default = falls back to whatever requirements.txt resolves to.
 ARG RUNTIME_VERSION=
+ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
 # the RUN command itself but its presence as a declared ARG above
 # means buildx hashes it into the cache key.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 # Copy adapter code

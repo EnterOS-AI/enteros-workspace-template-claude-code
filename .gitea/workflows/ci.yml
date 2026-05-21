@@ -25,8 +25,8 @@ name: CI
 #   1. YAML — no `workflow_dispatch.inputs`; no `merge_group`; preserved
 #      `on: [push, pull_request]` from the original. Added workflow-level
 #      env.GITHUB_SERVER_URL (feedback_act_runner_github_server_url).
-#   2. Cache — `actions/setup-python` `cache: pip` preserved; works against
-#      Gitea's built-in cache server when runner.cache is configured.
+#   2. Package source — pip resolves through the Gitea PyPI registry;
+#      no runtime dependency is fetched from PyPI/GitHub in CI.
 #   3. Token — uses auto-injected GITHUB_TOKEN (Gitea-aliased). Validator
 #      job needs only `contents: read` (no write to issues/PRs).
 #   4. Docs — anonymous git-clone of molecule-ci (no token in URL); the
@@ -67,6 +67,7 @@ env:
   # but pinning at the workflow level protects against a runner
   # regenerated without the config file.
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Defense-in-depth on the GITHUB_TOKEN scope. The validate-runtime job
 # runs untrusted-by-design code from the calling repo — pip-installs
@@ -90,9 +91,6 @@ jobs:
       # token needed; no actions/checkout cross-repo idiosyncrasies.
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       # Secret scan — the most important check. Always runs, including
       # on fork PRs (no third-party code executes here).
       - name: Check for secrets
@@ -163,11 +161,6 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
       - run: pip install pyyaml -q
       # Install the template's runtime dependencies so the validator's
       # check_adapter_runtime_load() can import adapter.py the same way
@@ -249,9 +242,6 @@ jobs:
       - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
         with:
           go-version: "1.25"
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       - run: pip install -q pyyaml
       - name: Fetch molecule-core + generate t4_capabilities.yaml from the uniform contract
         run: |
@@ -414,9 +404,6 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
       # pyyaml is the runtime dep that adapter.py's _load_providers reads
       # /configs/config.yaml through. In production it arrives transitively
       # via molecule-ai-workspace-runtime; in this minimal test env we
