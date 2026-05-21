@@ -150,9 +150,13 @@ jobs:
       - run: pip install pyyaml -q
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py --static-only
 
+  # pc2-safe: false — needs docker for Docker build smoke; routes to docker-host only
+  # (task #390 B-lite — PC2 native runners advertise `ubuntu-latest` but cannot
+  # docker due to npipe→Linux-container bridging gap; AND-match on both labels
+  # excludes them while keeping the Linux operator-host runners eligible.)
   validate-runtime:
     name: Template validation (runtime)
-    runs-on: ubuntu-latest
+    runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 15
     needs: validate-static
     # Skip when the PR comes from a fork — those are external,
@@ -232,9 +236,11 @@ jobs:
   # same commit share a host Docker daemon (--network host); a static
   # name would collide and false-negative. See sibling template-hermes
   # ci.yml + task #207 for the canonical rationale.
+  # pc2-safe: false — hard-gate docker (builds + runs real container under
+  # tier-4 provisioner flags); routes to docker-host only (task #390 B-lite).
   t4-conformance:
     name: T4 tier-4 conformance (live)
-    runs-on: ubuntu-latest
+    runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 20
     needs: validate-static
     if: github.event.pull_request.head.repo.fork != true
