@@ -1,5 +1,5 @@
 # Molecule AI workspace runtime — shared infrastructure
-molecule-ai-workspace-runtime>=0.1.22
+molecule-ai-workspace-runtime>=0.2.0
 
 # P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"
 # (task #256; forensic a5bb950f). Starlette `Request.form()` raises
