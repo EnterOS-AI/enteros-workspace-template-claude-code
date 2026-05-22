@@ -6,7 +6,7 @@ name: CI
 #
 # Root cause of the main-red CI on this repo:
 #   The .github/ original used
-#     uses: molecule-ai/molecule-ci/.github/workflows/validate-workspace-template.yml@main
+#     uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@main
 #   which Gitea 1.22.6 rejects (DEFAULT_ACTIONS_URL=github → 404 against
 #   the remote repo even though it lives on the same Gitea instance).
 #   Gitea reads .github/ as a fallback when .gitea/ is absent
@@ -40,7 +40,7 @@ name: CI
 #
 # Cross-links:
 #   - internal#326 — parent tracking issue
-#   - molecule-ai/molecule-ci/.github/workflows/validate-workspace-template.yml — pattern source
+#   - molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml — pattern source
 #   - molecule-ai/molecule-core/.gitea/workflows/ci.yml — Gitea port style reference
 
 on: [push, pull_request]
