@@ -289,7 +289,7 @@ jobs:
             -v /:/host \
             -v /var/run/docker.sock:/var/run/docker.sock \
             -e MOLECULE_T4_PROBE_ID="$MOLECULE_T4_PROBE_ID" \
-            -e MOLECULE_T4_EGRESS_TARGETS="https://api.github.com/zen https://www.google.com/generate_204" \
+            -e MOLECULE_T4_EGRESS_TARGETS="https://git.moleculesai.app/api/v1/version" \
             --entrypoint /bin/sh \
             "$T4_TAG" -c 'sleep 600' >/dev/null
           trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT

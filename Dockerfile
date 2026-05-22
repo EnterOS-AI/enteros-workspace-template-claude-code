@@ -37,7 +37,9 @@ RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
 # root. claude-code still refuses --dangerously-skip-permissions as
 # root, and /configs/.auth_token must stay agent-owned (Hermes
 # list_peers 401 class — RFC internal#456 §10).
-RUN useradd -u 1000 -m -s /bin/bash agent
+RUN useradd -u 1000 -m -s /bin/bash agent && \
+    mkdir -p /agent-home && \
+    chown agent:agent /agent-home
 
 # --- T4 escalation leg (RFC internal#456 §9.3 / PR#474) ---
 # Wired path: uid-1000 agent -> host root inside the provisioner's
@@ -54,7 +56,9 @@ RUN set -eux; \
     chmod 0440 /etc/sudoers.d/agent-t4; \
     visudo -cf /etc/sudoers.d/agent-t4; \
     groupadd -f docker; \
+    groupadd -g 988 -f docker-host || true; \
     usermod -aG docker agent; \
+    usermod -aG docker-host agent || true; \
     id agent
 
 WORKDIR /app
