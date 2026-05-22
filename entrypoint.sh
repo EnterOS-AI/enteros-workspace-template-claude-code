@@ -112,11 +112,10 @@ EOF
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
 
-    # GitHub credential helper setup (fix #1933 / #1866 / #547).
-    # Runs as root so the global gitconfig is written before we drop to agent.
-    # The helper fetches fresh GitHub App installation tokens from the
-    # platform API on every git push/clone, with caching + env-var fallback.
-    if [ -x /app/scripts/molecule-git-token-helper.sh ]; then
+    # Optional GitHub mirror credential helper setup.
+    # GitHub is mirror-only for Molecule; keep this disabled unless an
+    # operator explicitly opts a workspace into mirror credentials.
+    if [ "${ENABLE_GITHUB_MIRROR_CREDENTIALS:-false}" = "true" ] && [ -x /app/scripts/molecule-git-token-helper.sh ]; then
         git config --global "credential.https://github.com.helper" \
             "!/app/scripts/molecule-git-token-helper.sh"
         git config --global "credential.https://github.com.useHttpPath" true
@@ -134,11 +133,8 @@ fi
 
 # Now running as agent (uid 1000)
 
-# Background token refresh daemon — keeps `gh` CLI auth + credential helper
-# cache warm across the ~60 min GitHub App installation token TTL. Wrapped
-# in a respawn loop so a daemon crash doesn't silently leave the workspace
-# stuck on an expired token (which is exactly how #1933 was discovered).
-if [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
+# Optional background token refresh daemon for GitHub mirror credentials.
+if [ "${ENABLE_GITHUB_MIRROR_CREDENTIALS:-false}" = "true" ] && [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
     nohup bash -c '
         while true; do
             /app/scripts/molecule-gh-token-refresh.sh
@@ -147,15 +143,6 @@ if [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
             sleep 30
         done
     ' > /home/agent/.gh-token-refresh.log 2>&1 &
-fi
-
-# Initial gh auth — primes the CLI with whatever GH_TOKEN/GITHUB_TOKEN was
-# injected at provision time, so commands work in the ~60s window before the
-# background daemon's first refresh fires.
-if [ -n "${GITHUB_TOKEN:-}" ]; then
-    echo "${GITHUB_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
-elif [ -n "${GH_TOKEN:-}" ]; then
-    echo "${GH_TOKEN}" | gh auth login --hostname github.com --with-token 2>/dev/null || true
 fi
 
 # Third-party provider routing is now handled by adapter.py at boot —

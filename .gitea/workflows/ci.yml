@@ -236,19 +236,16 @@ jobs:
       # Default `main` floats with the latest contract; pin to a SHA
       # for deterministic gate behavior across template branches.
       # Adopters MAY override per-PR to test an unmerged contract change.
-      MOLECULE_CORE_REF: main
+      MOLECULE_CORE_REF: fix/t4-gitea-egress-ssot
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v6.0.0
-        with:
-          go-version: "1.25"
       - run: pip install -q pyyaml
-      - name: Fetch molecule-core + generate t4_capabilities.yaml from the uniform contract
+      - name: Fetch generated t4_capabilities.yaml from the uniform contract
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "${MOLECULE_CORE_REF}" \
-            https://git.moleculesai.app/molecule-ai/molecule-core.git .molecule-core
-          ( cd .molecule-core/workspace-server && go run ./cmd/t4-contract-dump ) > t4_capabilities.yaml
+          curl -fsSL \
+            "https://git.moleculesai.app/molecule-ai/molecule-core/raw/branch/${MOLECULE_CORE_REF}/workspace-server/internal/provisioner/t4_capabilities.yaml" \
+            -o t4_capabilities.yaml
           # Defense-in-depth: schema-version assertion so a contract
           # bump that breaks the parser shape is caught here, not at
           # runtime where it would look like a phantom capability miss.
