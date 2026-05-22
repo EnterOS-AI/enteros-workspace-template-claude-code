@@ -236,7 +236,7 @@ jobs:
       # Default `main` floats with the latest contract; pin to a SHA
       # for deterministic gate behavior across template branches.
       # Adopters MAY override per-PR to test an unmerged contract change.
-      MOLECULE_CORE_REF: fix/t4-gitea-egress-ssot
+      MOLECULE_CORE_REF: fix/t4-pid-probe-agent-safe
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - run: pip install -q pyyaml
