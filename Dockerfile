@@ -1,8 +1,7 @@
 FROM python:3.11-slim
 
-# System deps — curl/gosu/node/npm for the runtime; git + gh for agent
-# autonomy (agents run `gh issue list`, `gh issue create`, `gh issue edit
-# --add-assignee`, `git clone`, etc. per their idle/cron prompts).
+# System deps — curl/gosu/node/npm for the runtime; git for agent
+# autonomy against the Molecule-owned Gitea middleman.
 # Without these the team's claim-and-ship loop silently returns
 # "(no response generated)" because tools error out.
 #
@@ -22,11 +21,6 @@ FROM python:3.11-slim
 #   enforced by entrypoint.sh + the Layer-3 conformance gate).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gosu nodejs npm ca-certificates git sudo util-linux docker.io \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null \
-    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # Install claude-code CLI via npm
@@ -37,7 +31,9 @@ RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
 # root. claude-code still refuses --dangerously-skip-permissions as
 # root, and /configs/.auth_token must stay agent-owned (Hermes
 # list_peers 401 class — RFC internal#456 §10).
-RUN useradd -u 1000 -m -s /bin/bash agent
+RUN useradd -u 1000 -m -s /bin/bash agent && \
+    mkdir -p /agent-home && \
+    chown agent:agent /agent-home
 
 # --- T4 escalation leg (RFC internal#456 §9.3 / PR#474) ---
 # Wired path: uid-1000 agent -> host root inside the provisioner's
@@ -54,7 +50,9 @@ RUN set -eux; \
     chmod 0440 /etc/sudoers.d/agent-t4; \
     visudo -cf /etc/sudoers.d/agent-t4; \
     groupadd -f docker; \
+    groupadd -g 988 -f docker-host || true; \
     usermod -aG docker agent; \
+    usermod -aG docker-host agent || true; \
     id agent
 
 WORKDIR /app
@@ -68,14 +66,15 @@ WORKDIR /app
 # baked in (the cache trap that bit us 5x on 2026-04-27).
 # Empty default = falls back to whatever requirements.txt resolves to.
 ARG RUNTIME_VERSION=
+ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
 # the RUN command itself but its presence as a declared ARG above
 # means buildx hashes it into the cache key.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt && \
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 # Copy adapter code
@@ -106,15 +105,9 @@ COPY claude_sdk_executor.py .
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter
 
-# Git credential helper + background refresh daemon — fix for #1933 / #1866 / #547.
-# Without these, GH_TOKEN injected at provision time expires after ~60 min
-# and every subsequent git push/clone returns 401, causing agents to
-# infinite-loop status reports back to PMs and overflow A2A queues.
-#
-# The helper hits the platform's /admin/github-installation-token endpoint
-# (and falls back to env-var GH_TOKEN when platform is unreachable). The
-# refresh daemon calls _refresh_gh every ~45 min so `gh` CLI auth and the
-# helper cache stay warm even when no git operation triggers a refresh.
+# Optional GitHub mirror credential helper + background refresh daemon.
+# GitHub is not on the critical path; these scripts are inert unless
+# ENABLE_GITHUB_MIRROR_CREDENTIALS=true is set by an operator.
 COPY scripts/molecule-git-token-helper.sh /app/scripts/molecule-git-token-helper.sh
 COPY scripts/molecule-gh-token-refresh.sh /app/scripts/molecule-gh-token-refresh.sh
 RUN chmod +x /app/scripts/molecule-git-token-helper.sh /app/scripts/molecule-gh-token-refresh.sh
