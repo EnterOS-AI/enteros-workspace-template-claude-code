@@ -30,7 +30,7 @@ import logging
 import os
 import sys
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import yaml
@@ -404,9 +404,14 @@ class QueryResult:
 
     `text` is the canonical final response; `session_id` is the id the SDK
     reports in its ResultMessage (used for resume on the next turn).
+    `tool_uses` is the ordered list of tool names invoked during the turn
+    — used as a UX-friendly fallback when `text` is empty (the agent did
+    only tool calls and no final text block, common for autonomous-tick
+    ticks that delegate or send_message_to_user without explanation).
     """
     text: str
     session_id: str | None
+    tool_uses: list[str] = field(default_factory=list)
 
 
 class ClaudeSDKExecutor(AgentExecutor):
@@ -593,6 +598,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         whether to persist the returned session_id.
         """
         assistant_chunks: list[str] = []
+        tool_uses: list[str] = []
         result_text: str | None = None
         session_id: str | None = None
         self._active_stream = sdk.query(prompt=prompt, options=options)
@@ -610,6 +616,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                             cls = type(block).__name__
                             if cls in ("ToolUseBlock", "ServerToolUseBlock"):
                                 await _report_tool_use(block)
+                                name = getattr(block, "name", "") or ""
+                                if name:
+                                    tool_uses.append(name)
                 elif isinstance(message, sdk.ResultMessage):
                     sid = getattr(message, "session_id", None)
                     if sid:
@@ -632,7 +641,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         # AssistantMessage TextBlock (populates assistant_chunks).
         if result_text is not None or assistant_chunks:
             _clear_sdk_wedge_on_success()
-        return QueryResult(text=text, session_id=session_id)
+        return QueryResult(text=text, session_id=session_id, tool_uses=tool_uses)
 
     # ------------------------------------------------------------------
     # AgentExecutor interface
@@ -748,6 +757,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         prompt = self._prepare_prompt(user_input)
 
         response_text: str = ""
+        tool_uses_for_turn: list[str] = []
         try:
             # set_current_task INSIDE the try so active_tasks is always
             # decremented by the finally block even if CancelledError hits
@@ -763,6 +773,7 @@ class ClaudeSDKExecutor(AgentExecutor):
                     if result.session_id:
                         self._session_id = result.session_id
                     response_text = result.text
+                    tool_uses_for_turn = result.tool_uses
                     break  # success
                 except Exception as exc:
                     formatted = _format_process_error(exc)
@@ -813,6 +824,29 @@ class ClaudeSDKExecutor(AgentExecutor):
             # Auto-push unpushed commits and open PR (non-blocking, best-effort).
             await auto_push_hook()
 
+        # If the agent produced no text but did call tools, surface a brief
+        # summary of which tools were used instead of the bare
+        # "(no response generated)" sentinel. Common case: autonomous-tick
+        # ticks that only do delegate_task_async / send_message_to_user with
+        # no final text block. Canvas users seeing "(no response generated)"
+        # under a fired schedule have no signal that work actually happened;
+        # the tool list makes that visible.
+        if not response_text and tool_uses_for_turn:
+            # Order-preserving de-dupe so e.g. 4× TaskCreate collapses to 1.
+            seen: set[str] = set()
+            unique: list[str] = []
+            for name in tool_uses_for_turn:
+                if name not in seen:
+                    seen.add(name)
+                    unique.append(name)
+            counts: dict[str, int] = {}
+            for name in tool_uses_for_turn:
+                counts[name] = counts.get(name, 0) + 1
+            tool_summary = ", ".join(
+                f"{name}×{counts[name]}" if counts[name] > 1 else name
+                for name in unique
+            )
+            return f"(no text reply — used tools: {tool_summary})"
         return response_text or _NO_RESPONSE_MSG
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue):
