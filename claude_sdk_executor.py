@@ -52,6 +52,7 @@ from molecule_runtime.executor_helpers import (
     extract_attached_files,
     extract_message_text,
     get_a2a_instructions,
+    get_display_instructions,
     get_hma_instructions,
     get_mcp_server_path,
     get_system_prompt,
@@ -448,8 +449,9 @@ class ClaudeSDKExecutor(AgentExecutor):
         """Compose system prompt from file + A2A + HMA memory instructions."""
         base = get_system_prompt(self.config_path, fallback=self.system_prompt)
         a2a = get_a2a_instructions(mcp=True)
+        display = get_display_instructions()
         hma = get_hma_instructions()
-        parts = [p for p in (base, a2a, hma) if p]
+        parts = [p for p in (base, a2a, display, hma) if p]
         return "\n\n".join(parts) if parts else None
 
     def _prepare_prompt(self, user_input: str) -> str:
