@@ -90,6 +90,7 @@ def _install_stubs():
     _ensure_attr(helpers, "extract_attached_files", lambda *a, **kw: [])
     _ensure_attr(helpers, "extract_message_text", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_a2a_instructions", lambda **kw: "")
+    _ensure_attr(helpers, "get_display_instructions", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_hma_instructions", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_mcp_server_path", lambda *a, **kw: "/dev/null")
     _ensure_attr(helpers, "get_system_prompt", lambda *a, **kw: "")
