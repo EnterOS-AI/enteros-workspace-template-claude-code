@@ -20,7 +20,7 @@ FROM python:3.11-slim
 #   uid and does NOT change /configs token ownership (still uid-1000,
 #   enforced by entrypoint.sh + the Layer-3 conformance gate).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl gosu nodejs npm ca-certificates git sudo util-linux docker.io \
+    curl gosu nodejs npm ca-certificates git sudo util-linux docker.io xdotool scrot \
     && rm -rf /var/lib/apt/lists/*
 
 # Install claude-code CLI via npm
