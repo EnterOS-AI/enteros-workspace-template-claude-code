@@ -56,6 +56,18 @@ providers:
     base_url: null
     auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
 
+  # Molecule platform-managed LLM proxy. This is intentionally before
+  # kimi-coding so platform-managed workspaces with MODEL=kimi-* and no
+  # explicit provider route through the Molecule proxy by default. BYOK
+  # users can still select kimi-coding/anthropic-api explicitly.
+  - name: platform
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [kimi-, moonshot/]
+    model_aliases: []
+    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1
+    auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
+    auth_token_env: ANTHROPIC_API_KEY
+
   - name: xiaomi-mimo
     auth_mode: third_party_anthropic_compat
     model_prefixes: [mimo-]

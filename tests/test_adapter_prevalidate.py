@@ -108,6 +108,14 @@ _FIXTURE_PROVIDERS_YAML = textwrap.dedent("""
         base_url: null
         auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
 
+      - name: platform
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [kimi-, moonshot/]
+        model_aliases: []
+        base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1
+        auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
+        auth_token_env: ANTHROPIC_API_KEY
+
       - name: xiaomi-mimo
         auth_mode: third_party_anthropic_compat
         model_prefixes: [mimo-]
@@ -551,11 +559,11 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
     (tmp_path / "config.yaml").write_text(_FIXTURE_PROVIDERS_YAML)
     result = adapter_module._load_providers(str(tmp_path))
 
-    assert len(result) == 7
+    assert len(result) == 8
     names = [p["name"] for p in result]
     assert names == [
-        "anthropic-oauth", "anthropic-api", "xiaomi-mimo", "minimax",
-        "zai", "kimi-coding", "deepseek",
+        "anthropic-oauth", "anthropic-api", "platform", "xiaomi-mimo",
+        "minimax", "zai", "kimi-coding", "deepseek",
     ]
     # YAML lists must be normalized to tuples for downstream lookup ergonomics.
     assert isinstance(result[0]["model_aliases"], tuple)
@@ -565,8 +573,8 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
 @pytest.mark.parametrize("model,expected_provider,expected_url", [
     ("GLM-4.6", "zai", "https://api.z.ai/api/anthropic"),
     ("glm-4.5", "zai", "https://api.z.ai/api/anthropic"),
-    ("kimi-k2.5", "kimi-coding", "https://api.kimi.com/coding/"),
-    ("kimi-for-coding", "kimi-coding", "https://api.kimi.com/coding/"),
+    ("kimi-k2.5", "platform", "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"),
+    ("kimi-for-coding", "platform", "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"),
     ("deepseek-v4-pro", "deepseek", "https://api.deepseek.com/anthropic"),
 ])
 @pytest.mark.asyncio
@@ -587,6 +595,42 @@ async def test_setup_routes_extra_providers(
     await adapter.setup(cfg)
 
     assert os.environ.get("ANTHROPIC_BASE_URL") == expected_url
+
+
+@pytest.mark.asyncio
+async def test_setup_defaults_kimi_model_to_molecule_proxy(
+    adapter, monkeypatch, configs_dir
+):
+    """Platform-managed Kimi models route through Molecule by default."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "proxy-scoped-sentinel")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "kimi-for-coding"},
+        config_path=configs_dir,
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == (
+        "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_routes_explicit_kimi_coding_byok_to_kimi_gateway(
+    adapter, monkeypatch, configs_dir
+):
+    """BYOK Kimi remains available when the provider is explicit."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-sentinel")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "kimi-for-coding", "provider": "kimi-coding"},
+        config_path=configs_dir,
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://api.kimi.com/coding/"
 
 
 def test_load_providers_falls_back_on_malformed_yaml(tmp_path, caplog, monkeypatch):
