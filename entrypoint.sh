@@ -127,6 +127,8 @@ EOF
     mkdir -p /home/agent/.molecule-token-cache
     chown agent:agent /home/agent/.molecule-token-cache
     chmod 700 /home/agent/.molecule-token-cache
+    mkdir -p /home/agent/Downloads
+    chown agent:agent /home/agent/Downloads
 
     exec gosu agent "$0" "$@"
 fi
