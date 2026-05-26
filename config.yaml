@@ -130,7 +130,7 @@ providers:
 
 runtime: claude-code
 runtime_config:
-  model: sonnet
+  model: moonshot/kimi-k2.6
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars based on the selected entry. OAuth and API-key
@@ -138,6 +138,14 @@ runtime_config:
   # the auth path matching the key they have — the claude CLI accepts
   # either and the model id is identical across both.
   models:
+    # --- Molecule platform-managed LLM proxy ---
+    # The platform owns provider keys and billing. Tenants do not bring or
+    # receive vendor API keys for this path.
+    - id: moonshot/kimi-k2.6
+      name: Kimi K2.6 (Molecule platform)
+      provider: platform
+      required_env: []
+
     # --- OAuth (Claude Code subscription) — set CLAUDE_CODE_OAUTH_TOKEN ---
     - id: sonnet
       name: Claude Sonnet (OAuth / Claude Code subscription)
