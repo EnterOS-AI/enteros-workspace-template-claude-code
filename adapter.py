@@ -50,6 +50,54 @@ def _audit_auth_env_presence() -> None:
     logger.info("auth env audit: %s", snapshot)
 
 
+# Harness model-tier env vars (internal#702). The Claude Code harness reads
+# these to pick the model for its NON-main tiers — the background/"small-fast"
+# tier (title-gen, conversation summarization, quota probes), the
+# haiku/sonnet/opus aliases, and the subagent tier. When NONE of them is set
+# the harness falls back to a literal `claude-3-5-haiku`; on a non-Anthropic
+# platform_managed workspace that `claude-*` id inherits ANTHROPIC_BASE_URL
+# (the CP proxy) and the proxy routes any `claude*` slug to real Anthropic →
+# the depleted platform key → "credit balance too low". CP now injects the
+# correct same-provider values for these (see molecule-controlplane
+# tenant_config.go `platformManagedHarnessModelEnv`); the adapter's job is
+# ONLY to make sure they survive to the spawned `claude` process.
+#
+# PASSTHROUGH CONTRACT: the adapter does NOT build the SDK options with an
+# `env=` allow-list — `ClaudeSDKExecutor._build_options` constructs
+# `ClaudeAgentOptions` without an `env` kwarg, so the claude-agent-sdk
+# subprocess transport inherits the full container `os.environ`. These names
+# are therefore forwarded automatically, exactly like ANTHROPIC_API_KEY /
+# ANTHROPIC_BASE_URL. They are listed here so (a) the boot audit reports them
+# and (b) test_harness_model_env_passthrough pins the no-allow-list contract,
+# so a future refactor that adds an `env=` filter cannot silently re-open
+# the internal#702 leak. The adapter NEVER hardcodes model ids — it forwards
+# whatever CP injected.
+_HARNESS_MODEL_ENV = (
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ENABLE_TOOL_SEARCH",
+)
+
+
+def _audit_harness_model_env() -> None:
+    """Log a one-line snapshot of the harness model-tier env (internal#702).
+
+    Logs NAMES + presence ("set"/"unset"), never VALUES — same contract as
+    _audit_auth_env_presence. When every name reads `unset` on a
+    non-Anthropic workspace, the harness's background tier will fall back to
+    `claude-3-5-haiku` and leak to real Anthropic (internal#702); this audit
+    makes that diagnosable from one log line.
+    """
+    snapshot = ", ".join(
+        f"{name}={'set' if os.environ.get(name) else 'unset'}"
+        for name in _HARNESS_MODEL_ENV
+    )
+    logger.info("harness model-tier env audit: %s", snapshot)
+
+
 # Auth-mode constants — provider entries use one of these strings.
 # Drives validation behavior in setup() (third-party requires base_url
 # resolution; oauth/anthropic-api leave base_url=None for CLI defaults).
@@ -806,6 +854,16 @@ class ClaudeCodeAdapter(BaseAdapter):
         # ANTHROPIC_AUTH_TOKEN gap was the cause. This one-line audit
         # closes that gap. See _audit_auth_env_presence above.
         _audit_auth_env_presence()
+
+        # internal#702: also report the harness model-tier env so an
+        # operator can see at a glance whether CP injected the small-fast +
+        # alias models (which it does for non-anthropic platform_managed
+        # workspaces). All-`unset` on a non-anthropic provider is the
+        # fingerprint of the haiku-leak-to-Anthropic bug. These vars are
+        # forwarded to the spawned `claude` process via plain os.environ
+        # inheritance (see _HARNESS_MODEL_ENV passthrough contract); the
+        # adapter does not resolve or rewrite them.
+        _audit_harness_model_env()
 
         # Auth check — any of the provider's accepted env vars satisfies.
         # Warning (not raise) so a workspace can still boot for non-LLM
