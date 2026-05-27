@@ -92,6 +92,15 @@ RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.tx
       pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
+# MOLECULE-HOTFIX (claude-code 2.1.150 / agent-sdk 0.2.84): apply in-place
+# SDK patch so the receive_messages loop treats is_error+subtype=success as
+# end-of-stream rather than raising Exception("... success"). See
+# scripts/patch_claude_sdk_2_1_150.py for the rationale + upstream removal
+# criteria. Idempotent; fails the build if the upstream SDK has been
+# updated so we notice the workaround is stale.
+COPY scripts/patch_claude_sdk_2_1_150.py /tmp/patch_claude_sdk_2_1_150.py
+RUN python3 /tmp/patch_claude_sdk_2_1_150.py && rm /tmp/patch_claude_sdk_2_1_150.py
+
 # Copy adapter code
 COPY adapter.py .
 COPY __init__.py .
