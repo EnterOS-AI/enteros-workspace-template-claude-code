@@ -168,6 +168,16 @@ jobs:
       - if: hashFiles('requirements.txt') == ''
         run: pip install -q molecule-ai-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: entrypoint restore-from-secondary unit test (cp#326)
+        # Container-runnable bash unit test for entrypoint.sh's
+        # restore_from_secondary_volume(). Mocks blkid/mount/mountpoint/
+        # rsync so it runs without a real blockdev or docker daemon —
+        # pure logic coverage (idempotency, device-absent no-op, happy-
+        # path data landing, rsync-failure exit-code handling). The
+        # wire-level contract against real AWS lives in the CP repo's
+        # Stage C smoke (stage-c-workspace-backup-smoke.sh step 6b).
+        if: hashFiles('tests/test_entrypoint_restore.sh') != ''
+        run: bash tests/test_entrypoint_restore.sh
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |

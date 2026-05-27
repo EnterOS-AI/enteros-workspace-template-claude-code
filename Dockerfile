@@ -19,8 +19,23 @@ FROM python:3.11-slim
 #   so `agent` exists. This is ADDITIVE: it does NOT change the agent
 #   uid and does NOT change /configs token ownership (still uid-1000,
 #   enforced by entrypoint.sh + the Layer-3 conformance gate).
+#
+# rsync (added cp#326 2026-05-26):
+#   entrypoint.sh's restore_from_secondary_volume() rsyncs the prior
+#   workspace's /configs, /workspace, and /home/agent/.claude back
+#   into root on first boot from the snapshot-restored secondary
+#   volume CP attaches at /dev/xvdb. Without rsync the restore path
+#   silently no-ops and the workspace boots with empty state.
+#
+# e2fsprogs (added cp#326 2026-05-26):
+#   provides /sbin/blkid + /sbin/e2label so the restore code can
+#   probe the secondary volume's filesystem type before mounting.
+#   Already pulled in indirectly by util-linux on Debian-slim but
+#   pinning it explicit makes the dependency self-documenting and
+#   survives a future base-image change.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl gosu nodejs npm ca-certificates git sudo util-linux docker.io xdotool scrot \
+    rsync e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install claude-code CLI via npm

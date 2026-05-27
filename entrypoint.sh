@@ -39,7 +39,165 @@ log_boot_context() {
 }
 log_boot_context
 
+# ---------------------------------------------------------------------
+# Restore-on-recreate from secondary EBS volume (cp#326 Option D).
+#
+# Contract with CP: when ProvisionWorkspace finds a non-expired backup
+# snapshot for this WorkspaceID, it attaches the snapshot as a SECONDARY
+# EBS volume at /dev/xvdb at launch (DeleteOnTermination=true). This
+# function mounts that volume on first container boot and rsyncs the
+# restore set (/configs, /workspace, /home/agent/.claude) from it back
+# into the root filesystem, then drops a marker so subsequent container
+# restarts (within the same EC2's lifetime) skip the restore.
+#
+# Why cp#326 needs this: AWS rejects ANY SnapshotId on the ROOT device
+# at RunInstances time with "InvalidBlockDeviceMapping: snapshotId
+# cannot be modified on root device". The cp#301 architecture (override
+# the AMI's root snapshot) is impossible per AWS spec. Option D works
+# WITH AWS's model — secondary volumes accept SnapshotId — and rsync
+# bridges the data-plane gap.
+#
+# Operational contract:
+#   - Idempotent: a marker at /configs/.restore-completed gates re-runs.
+#     If the container restarts in the same EC2 (DOT=true so the volume
+#     persists across container restarts but NOT EC2 terminate), the
+#     restore skips. If the EC2 is terminated + replaced, /configs is
+#     fresh and the marker is gone — restore runs on the new EC2.
+#   - Best-effort: any failure (volume absent, fs unreadable, rsync
+#     error) is LOGGED with MOLECULE-RESTORE: prefix but does NOT abort
+#     the boot. The workspace comes up with empty state — the explicit
+#     no-restore branch the user already accepts on first-time provision.
+#   - Read-only mount on the secondary at /mnt/restore so a defective
+#     filesystem can't corrupt our root.
+#   - All log lines prefixed `MOLECULE-RESTORE:` so `docker logs <id>
+#     2>&1 | grep MOLECULE-RESTORE` is the operator's one-liner debug.
+#
+# Path allowlist (NOT a blanket /mnt/restore -> / rsync — that would
+# also restore /etc/passwd, /var/lib/docker, etc. which are container-
+# managed):
+#   - /configs/         (config.yaml, .auth_token, skills/, memory)
+#   - /workspace/       (the shared codebase + agent's working files)
+#   - /home/agent/.claude/  (Claude SDK session state, settings.json)
+#
+# If a future template adds another persistent path (e.g. /home/agent/.cache),
+# add it to RESTORE_PATHS below AND ensure the corresponding source path
+# exists in the snapshot. Keep the list narrow on purpose — the alternative
+# (full / rsync with exclusions) trades blast-radius safety for convenience.
+restore_from_secondary_volume() {
+    local SECONDARY_DEV="/dev/xvdb"
+    local MOUNT_POINT="/mnt/restore"
+    local MARKER="/configs/.restore-completed"
+
+    # Marker present = restore already done for this EC2's lifetime.
+    # Cheapest possible idempotency check; runs before any blockdev probe.
+    if [ -f "$MARKER" ]; then
+        echo "MOLECULE-RESTORE: marker $MARKER present — skipping (already restored on this EC2)"
+        return 0
+    fi
+
+    # No secondary device = nothing to restore (first-time provision or
+    # no backup snapshot existed). NOT an error.
+    if [ ! -b "$SECONDARY_DEV" ]; then
+        echo "MOLECULE-RESTORE: no $SECONDARY_DEV — first-time provision or no backup snapshot, skipping"
+        return 0
+    fi
+
+    echo "MOLECULE-RESTORE: $SECONDARY_DEV detected — attempting restore"
+
+    # Probe filesystem type. If blkid fails (raw/unformatted volume), we
+    # skip; if the fs type is something we can't mount safely, we skip.
+    local FSTYPE
+    FSTYPE=$(blkid -s TYPE -o value "$SECONDARY_DEV" 2>/dev/null || echo "")
+    if [ -z "$FSTYPE" ]; then
+        echo "MOLECULE-RESTORE: WARN no fs detected on $SECONDARY_DEV (raw/unformatted) — skipping"
+        return 0
+    fi
+    echo "MOLECULE-RESTORE: $SECONDARY_DEV fstype=$FSTYPE"
+
+    # Mount read-only. ro prevents a corrupt fs from being modified by
+    # mount-time journal replay AND blocks any rsync mistake from
+    # writing to the source.
+    mkdir -p "$MOUNT_POINT"
+    if ! mount -o ro "$SECONDARY_DEV" "$MOUNT_POINT" 2>&1 | sed 's/^/MOLECULE-RESTORE: mount: /'; then
+        # mount(8) writes to stderr on success too via -v; we don't pass -v
+        # so a non-zero from the pipeline means the mount itself failed.
+        :
+    fi
+    if ! mountpoint -q "$MOUNT_POINT"; then
+        echo "MOLECULE-RESTORE: WARN mount of $SECONDARY_DEV failed — skipping restore"
+        return 0
+    fi
+    echo "MOLECULE-RESTORE: mounted $SECONDARY_DEV at $MOUNT_POINT (ro)"
+
+    # rsync the allowlist. -a preserves perms/owner/times/symlinks;
+    # --delete makes restore authoritative (a file removed from the
+    # prior workspace is also removed from the new one); -x stays on
+    # one filesystem (defensive against bind-mounts on the source).
+    #
+    # Source paths on the snapshot must match prod root layout. The
+    # workspace EC2's root filesystem mirrors a normal Linux root, so
+    # /configs lives at $MOUNT_POINT/configs and so on.
+    local RESTORE_PATHS="configs workspace home/agent/.claude"
+    local rsync_failed=0
+    for rel in $RESTORE_PATHS; do
+        local SRC="$MOUNT_POINT/$rel"
+        local DST="/$rel"
+        if [ ! -d "$SRC" ]; then
+            echo "MOLECULE-RESTORE: source $SRC absent — skipping (likely the prior workspace never wrote it)"
+            continue
+        fi
+        # Ensure dest parent exists. For /home/agent/.claude the parent
+        # is /home/agent which is created by useradd; for /configs and
+        # /workspace they're volume mount points the platform creates.
+        mkdir -p "$(dirname "$DST")"
+
+        echo "MOLECULE-RESTORE: rsync $SRC/ -> $DST/"
+        # Capture rsync's REAL exit code. A naive `rsync ... | sed`
+        # pipeline returns sed's exit code (0), masking rsync failures
+        # — under #!/bin/sh there's no PIPESTATUS, so we route rsync's
+        # output through a tempfile and read $? directly. The
+        # entrypoint-restore unit test caught this: without it,
+        # "MOLECULE-RESTORE: ok" prints even when rsync errors.
+        rsync_log="/tmp/molecule-restore-rsync.$$.log"
+        rsync -aHAX --delete --numeric-ids "$SRC/" "$DST/" >"$rsync_log" 2>&1
+        rsync_rc=$?
+        sed 's/^/MOLECULE-RESTORE:   /' "$rsync_log" 2>/dev/null
+        rm -f "$rsync_log"
+        if [ "$rsync_rc" -eq 0 ]; then
+            echo "MOLECULE-RESTORE: ok $DST"
+        else
+            echo "MOLECULE-RESTORE: WARN rsync to $DST exited $rsync_rc — workspace may be partially restored"
+            rsync_failed=1
+        fi
+    done
+
+    # Leave the mount in place — operator audit evidence, and the
+    # secondary volume costs us nothing more (DOT=true at next
+    # terminate). Unmount would re-introduce an "is the volume
+    # actually attached?" failure mode for no operational gain.
+
+    # Drop marker so subsequent container restarts skip. Even if rsync
+    # had partial failures we drop the marker — re-running rsync would
+    # NOT recover (the source is the same) and would just spend time on
+    # every restart. Operator sees the WARN in docker logs and decides
+    # whether to manually rm the marker + restart for a retry.
+    : > "$MARKER"
+    if [ "$rsync_failed" -eq 0 ]; then
+        echo "MOLECULE-RESTORE: complete — marker $MARKER dropped"
+    else
+        echo "MOLECULE-RESTORE: complete with WARNINGS — marker $MARKER dropped; rm marker + restart for retry"
+    fi
+}
+
 if [ "$(id -u)" = "0" ]; then
+    # Restore-on-recreate runs FIRST in the root branch — before any
+    # chown — so rsync's preserved ownership doesn't immediately get
+    # re-chowned by the agent-ownership step. (The chown is still
+    # needed for the no-restore case + for any subdir rsync didn't
+    # touch.) See restore_from_secondary_volume() above for the
+    # contract.
+    restore_from_secondary_volume
+
     # Configs volume is created by Docker as root; agent needs write access
     # for plugin installs, memory writes, .auth_token rotation, etc.
     #
