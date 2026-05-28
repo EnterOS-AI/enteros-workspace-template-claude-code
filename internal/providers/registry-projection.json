@@ -1,0 +1,63 @@
+{
+  "_provenance": "AUTO-GENERATED - DO NOT EDIT. Regenerated from the synced internal/providers/providers.yaml by `python internal/providers/registry_projection.py generate <runtime>`. Hand-authored config.yaml stays authoritative; this is the registry's informational projection of this runtime.",
+  "in_registry": true,
+  "providers": [
+    {
+      "models": [
+        "anthropic:claude-haiku-4-5",
+        "anthropic:claude-opus-4-7",
+        "anthropic:claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-6",
+        "claude-haiku-4-5",
+        "claude-opus-4-7",
+        "claude-sonnet-4-5",
+        "claude-sonnet-4-6"
+      ],
+      "name": "anthropic-api"
+    },
+    {
+      "models": [
+        "anthropic:haiku",
+        "anthropic:opus",
+        "anthropic:sonnet",
+        "haiku",
+        "opus",
+        "sonnet"
+      ],
+      "name": "anthropic-oauth"
+    },
+    {
+      "models": [
+        "kimi-for-coding",
+        "kimi-k2",
+        "kimi-k2.5",
+        "moonshot:kimi-k2.5",
+        "moonshot:kimi-k2.6"
+      ],
+      "name": "kimi-coding"
+    },
+    {
+      "models": [
+        "MiniMax-M2",
+        "MiniMax-M2.7",
+        "MiniMax-M2.7-highspeed",
+        "minimax:MiniMax-M2",
+        "minimax:MiniMax-M2.7",
+        "minimax:MiniMax-M2.7-highspeed"
+      ],
+      "name": "minimax"
+    },
+    {
+      "models": [
+        "anthropic/claude-opus-4-7",
+        "anthropic/claude-sonnet-4-6",
+        "minimax/MiniMax-M2.7",
+        "minimax/MiniMax-M2.7-highspeed",
+        "moonshot/kimi-k2.5",
+        "moonshot/kimi-k2.6"
+      ],
+      "name": "platform"
+    }
+  ],
+  "runtime": "claude-code"
+}
