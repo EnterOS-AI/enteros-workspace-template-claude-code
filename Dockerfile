@@ -38,8 +38,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rsync e2fsprogs \
     && rm -rf /var/lib/apt/lists/*
 
-# Install claude-code CLI via npm
-RUN npm install -g @anthropic-ai/claude-code 2>/dev/null || true
+# Install claude-code CLI via npm — fail-closed so an npm outage, package
+# rename, auth failure, or Node/npm breakage fails the image build instead
+# of producing a green image without the primary runtime engine (#75).
+RUN npm install -g @anthropic-ai/claude-code
+# Verify the CLI resolved in PATH (catches masked install failures,
+# package renames, or npm prefix misconfig).
+RUN command -v claude >/dev/null 2>&1 || (echo "ERROR: claude CLI not found in PATH" >&2 && exit 1)
 
 # Create agent user — UNCHANGED. The agent runs as uid-1000; the T4
 # escalation leg below is additive and does NOT promote the agent to
