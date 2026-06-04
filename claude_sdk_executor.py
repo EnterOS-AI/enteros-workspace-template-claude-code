@@ -611,6 +611,20 @@ class ClaudeSDKExecutor(AgentExecutor):
                         if isinstance(block, sdk.TextBlock):
                             assistant_chunks.append(block.text)
                         else:
+                            # Handle thinking/reasoning blocks from Anthropic-
+                            # compatible upstreams (MiniMax M2/M2.7, Moonshot
+                            # K2.6) so reasoning-only output doesn't surface as
+                            # empty content. Duck-typing: real SDK objects have
+                            # a `.thinking` attr; dict-shaped blocks have
+                            # `type: "thinking"`.
+                            thinking_text = None
+                            if hasattr(block, "thinking"):
+                                thinking_text = getattr(block, "thinking", None)
+                            elif isinstance(block, dict) and block.get("type") == "thinking":
+                                thinking_text = block.get("thinking")
+                            if thinking_text:
+                                assistant_chunks.append(thinking_text)
+                                continue
                             # ToolUseBlock / ServerToolUseBlock are present
                             # on the real SDK but not on the conftest stub —
                             # check by class name to avoid an isinstance()
