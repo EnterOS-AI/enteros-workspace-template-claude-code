@@ -19,3 +19,6 @@
 # Workspace auth tokens
 .auth-token
 .auth_token
+__pycache__/
+*.pyc
+.pytest_cache/
