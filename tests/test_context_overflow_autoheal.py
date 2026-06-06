@@ -148,6 +148,15 @@ def _script_query(mod, scripts):
     `scripts` is a list of callables; the Nth `query()` invocation runs
     scripts[N]. Each callable either returns an iterable of messages to
     yield, or raises (to simulate a raised SDK exception).
+
+    REAL-SDK SHAPE: a callable may return a `_YieldThenRaise(messages, exc)`
+    sentinel instead of a plain iterable. The generator then yields each
+    message FIRST and THEN raises `exc` — modeling the actual claude CLI /
+    SDK 0.1.72 behavior on a terminal-error result, where `query()` yields
+    the `is_error=True` ResultMessage and immediately afterwards raises
+    `Exception("Command failed with exit code 1")` because the CLI exits
+    non-zero. This is the shape the prior stub could NOT express, and the
+    gap that hid the bug.
     """
     sdk = sys.modules["claude_agent_sdk"]
     calls = {"n": 0}
@@ -156,15 +165,32 @@ def _script_query(mod, scripts):
         idx = calls["n"]
         calls["n"] += 1
         script = scripts[min(idx, len(scripts) - 1)]
+        produced = script()
 
         async def _gen():
-            for msg in script():
+            if isinstance(produced, _YieldThenRaise):
+                for msg in produced.messages:
+                    yield msg
+                raise produced.exc
+            for msg in produced:
                 yield msg
 
         return _gen()
 
     sdk.query = query
     return calls
+
+
+@dataclass
+class _YieldThenRaise:
+    """Sentinel for `_script_query`: yield `messages`, then raise `exc`.
+
+    Models the real claude CLI 2.1.163 / SDK 0.1.72 terminal-error shape —
+    the `is_error=True` ResultMessage is yielded AND THEN `query()` raises
+    `Exception("Command failed with exit code 1")` (the CLI exits non-zero
+    on any terminal error result)."""
+    messages: list
+    exc: BaseException
 
 
 # Anthropic-native and proxy-shaped overflow strings the classifier must catch.
@@ -216,6 +242,43 @@ async def test_is_error_result_message_raises(tmp_path):
     assert "token limit" in str(ei.value).lower()
 
 
+@pytest.mark.asyncio
+async def test_is_error_result_then_cli_raises_preserves_overflow_text(tmp_path):
+    """REAL-SDK SHAPE (the bug). claude CLI 2.1.163 / SDK 0.1.72 yields the
+    `is_error=True` ResultMessage AND THEN raises
+    `Exception("Command failed with exit code 1")` because the CLI process
+    exits non-zero on a terminal error result.
+
+    `_run_query` must re-raise `_ResultError` carrying the captured overflow
+    text IN PREFERENCE to the trailing generic CLI exception — otherwise the
+    overflow text is lost and `_is_context_overflow` (which does NOT match
+    'Command failed with exit code 1') never fires the heal.
+    """
+    mod = _load_executor()
+    sdk = sys.modules["claude_agent_sdk"]
+    ex = _make_executor(mod, tmp_path)
+
+    def _err_then_raise():
+        return _YieldThenRaise(
+            messages=[sdk.ResultMessage(
+                result="token limit 262144 requested 268132",
+                is_error=True,
+                session_id="sess-bloated",
+            )],
+            exc=Exception("Command failed with exit code 1\nCheck stderr output for details"),
+        )
+
+    _script_query(mod, [_err_then_raise])
+
+    with pytest.raises(mod._ResultError) as ei:
+        await ex._run_query(prompt="hi", options=object())
+    # The OVERFLOW text must be preserved, not the generic CLI exception.
+    assert "token limit" in str(ei.value).lower(), (
+        "overflow text was lost — the generic 'Command failed' exception "
+        "pre-empted the captured _ResultError"
+    )
+
+
 # ------------------- (b)(c)(d) reset + retry + loud log ------------------
 
 
@@ -257,6 +320,64 @@ async def test_overflow_heals_resets_and_retries(tmp_path, caplog):
         "auto-heal: session reset on context-overflow" in r.getMessage()
         for r in caplog.records
     ), "missing the loud auto-heal log line"
+
+
+@pytest.mark.asyncio
+async def test_overflow_heals_on_real_sdk_shape(tmp_path, caplog):
+    """REAL-SDK SHAPE end-to-end (the bug, reproduced through the full
+    `_execute_locked` heal path).
+
+    First dispatch: yield the `is_error=True` overflow ResultMessage AND
+    THEN raise `Exception("Command failed with exit code 1")` — exactly what
+    the real claude CLI 2.1.163 / SDK 0.1.72 does on a context overflow.
+    Asserts: the overflow IS detected, the session IS reset, exactly one
+    retry happens on a fresh session, and the loud auto-heal log fires.
+
+    FAILS against the buggy code (the generic CLI exception pre-empts the
+    captured overflow text → `_is_context_overflow` never matches → no heal,
+    the generic error is returned as the reply). PASSES after the fix.
+    """
+    import logging
+    mod = _load_executor()
+    sdk = sys.modules["claude_agent_sdk"]
+    ex = _make_executor(mod, tmp_path)
+    ex._session_id = "sess-bloated"  # a prior turn bloated the session
+
+    def _overflow_then_cli_raise():
+        return _YieldThenRaise(
+            messages=[sdk.ResultMessage(
+                result="token limit 262144 requested 268132",
+                is_error=True,
+                session_id="sess-bloated",
+            )],
+            exc=Exception("Command failed with exit code 1\nCheck stderr output for details"),
+        )
+
+    def _ok():
+        return [sdk.ResultMessage(
+            result="hello from a fresh session",
+            is_error=False,
+            session_id="sess-fresh",
+        )]
+
+    calls = _script_query(mod, [_overflow_then_cli_raise, _ok])
+
+    with caplog.at_level(logging.ERROR):
+        out = await ex._execute_locked("do the thing")
+
+    # (c) exactly one retry: original (overflow) + one fresh-session retry.
+    assert calls["n"] == 2, (
+        f"expected 2 query() calls (overflow + 1 heal retry), got {calls['n']}"
+    )
+    # (a)+(c) overflow detected and the fresh-session retry succeeded.
+    assert out == "hello from a fresh session"
+    # (b) session reset then re-set to the fresh id by the successful retry.
+    assert ex._session_id == "sess-fresh"
+    # (d) loud structured log fired (proves the heal path, not a fluke pass).
+    assert any(
+        "auto-heal: session reset on context-overflow" in r.getMessage()
+        for r in caplog.records
+    ), "missing the loud auto-heal log — overflow was not detected on the real shape"
 
 
 @pytest.mark.asyncio

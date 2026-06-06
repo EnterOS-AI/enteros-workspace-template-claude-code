@@ -759,47 +759,69 @@ class ClaudeSDKExecutor(AgentExecutor):
         result_is_error: bool = False
         self._active_stream = sdk.query(prompt=prompt, options=options)
         try:
-            async for message in self._active_stream:
-                if isinstance(message, sdk.AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, sdk.TextBlock):
-                            assistant_chunks.append(block.text)
-                        else:
-                            # Handle thinking/reasoning blocks from Anthropic-
-                            # compatible upstreams (MiniMax M2/M2.7, Moonshot
-                            # K2.6) so reasoning-only output doesn't surface as
-                            # empty content. Duck-typing: real SDK objects have
-                            # a `.thinking` attr; dict-shaped blocks have
-                            # `type: "thinking"`.
-                            thinking_text = None
-                            if hasattr(block, "thinking"):
-                                thinking_text = getattr(block, "thinking", None)
-                            elif isinstance(block, dict) and block.get("type") == "thinking":
-                                thinking_text = block.get("thinking")
-                            if thinking_text:
-                                assistant_chunks.append(thinking_text)
-                                continue
-                            # ToolUseBlock / ServerToolUseBlock are present
-                            # on the real SDK but not on the conftest stub —
-                            # check by class name to avoid an isinstance()
-                            # against a class the stub doesn't define.
-                            cls = type(block).__name__
-                            if cls in ("ToolUseBlock", "ServerToolUseBlock"):
-                                await _report_tool_use(block)
-                                name = getattr(block, "name", "") or ""
-                                if name:
-                                    tool_uses.append(name)
-                elif isinstance(message, sdk.ResultMessage):
-                    sid = getattr(message, "session_id", None)
-                    if sid:
-                        session_id = sid
-                    result_text = getattr(message, "result", None)
-                    # The SDK reports an upstream-rejected request (e.g. a
-                    # 400 context overflow from the model proxy) as a
-                    # terminal result with is_error=True rather than a
-                    # raised exception. Capture it so the error path below
-                    # can re-raise it into the unified classification.
-                    result_is_error = bool(getattr(message, "is_error", False))
+            try:
+                async for message in self._active_stream:
+                    if isinstance(message, sdk.AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, sdk.TextBlock):
+                                assistant_chunks.append(block.text)
+                            else:
+                                # Handle thinking/reasoning blocks from Anthropic-
+                                # compatible upstreams (MiniMax M2/M2.7, Moonshot
+                                # K2.6) so reasoning-only output doesn't surface as
+                                # empty content. Duck-typing: real SDK objects have
+                                # a `.thinking` attr; dict-shaped blocks have
+                                # `type: "thinking"`.
+                                thinking_text = None
+                                if hasattr(block, "thinking"):
+                                    thinking_text = getattr(block, "thinking", None)
+                                elif isinstance(block, dict) and block.get("type") == "thinking":
+                                    thinking_text = block.get("thinking")
+                                if thinking_text:
+                                    assistant_chunks.append(thinking_text)
+                                    continue
+                                # ToolUseBlock / ServerToolUseBlock are present
+                                # on the real SDK but not on the conftest stub —
+                                # check by class name to avoid an isinstance()
+                                # against a class the stub doesn't define.
+                                cls = type(block).__name__
+                                if cls in ("ToolUseBlock", "ServerToolUseBlock"):
+                                    await _report_tool_use(block)
+                                    name = getattr(block, "name", "") or ""
+                                    if name:
+                                        tool_uses.append(name)
+                    elif isinstance(message, sdk.ResultMessage):
+                        sid = getattr(message, "session_id", None)
+                        if sid:
+                            session_id = sid
+                        result_text = getattr(message, "result", None)
+                        # The SDK reports an upstream-rejected request (e.g. a
+                        # 400 context overflow from the model proxy) as a
+                        # terminal result with is_error=True rather than a
+                        # raised exception. Capture it so the error path below
+                        # can re-raise it into the unified classification.
+                        result_is_error = bool(getattr(message, "is_error", False))
+            except Exception:
+                # REAL-SDK SHAPE (claude CLI 2.1.163 / SDK 0.1.72): on a
+                # terminal error result the SDK yields the is_error=True
+                # ResultMessage AND THEN raises a generic
+                # `Exception("Command failed with exit code 1 / Check stderr
+                # output for details")` because the CLI process exits
+                # non-zero. That trailing raise pre-empts the post-loop
+                # `_ResultError` re-raise below, so the REAL overflow text
+                # ("token limit … requested …" / "Prompt is too long") would
+                # be discarded and `_is_context_overflow` would only ever see
+                # the generic "Command failed" string → the heal never fires.
+                #
+                # If an is_error result was already seen, that captured text
+                # is the authoritative failure reason — re-raise it as a
+                # typed `_ResultError` IN PREFERENCE to the generic CLI
+                # exception so the overflow text reaches `_is_context_overflow`
+                # in `_execute_locked`. Any other stream exception (no
+                # is_error result captured) propagates unchanged.
+                if result_is_error:
+                    raise _ResultError(result_text or "")
+                raise
         finally:
             self._active_stream = None
         # An is_error result is an upstream rejection (e.g. a 400 context
@@ -809,6 +831,10 @@ class ClaudeSDKExecutor(AgentExecutor):
         # _execute_locked as a raised SDK error — detection lives in one
         # place. The session_id (if any) was NOT persisted to self by this
         # method; the caller's heal path clears it regardless.
+        #
+        # This handles the variant where the SDK yields the is_error result
+        # and then completes the iterator cleanly (no trailing raise); the
+        # except-branch above handles the real-SDK variant where it raises.
         if result_is_error:
             raise _ResultError(result_text or "")
         text = result_text if result_text is not None else "".join(assistant_chunks)
