@@ -71,6 +71,35 @@ logger = logging.getLogger(__name__)
 
 _NO_TEXT_MSG = "Error: message contained no text content."
 _NO_RESPONSE_MSG = "(no response generated)"
+
+
+def _apply_extra_mcp_servers(mcp_servers: dict, config: dict) -> dict:
+    """Merge config-declared MCP servers into the base ``mcp_servers`` dict.
+
+    The org-level platform agent declares a second MCP server (the platform-
+    management MCP) in its ``config.yaml`` under ``mcp_servers:`` so it can drive
+    the org alongside the always-on ``a2a`` server. Each entry is
+    ``{name, command, args?, env?}``. Ordinary workspaces declare none, so this
+    is a no-op for them.
+
+    Defensive: entries that are not dicts, are missing ``name``/``command``, or
+    try to redefine the built-in ``a2a`` server are skipped — a malformed config
+    can neither crash the executor nor shadow the A2A mesh.
+
+    (RFC: molecule-core docs/design/rfc-platform-agent.md)
+    """
+    for entry in config.get("mcp_servers") or []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        command = entry.get("command")
+        if not name or not command or name == "a2a":
+            continue
+        server: dict = {"command": command, "args": entry.get("args") or []}
+        if entry.get("env"):
+            server["env"] = entry["env"]
+        mcp_servers[name] = server
+    return mcp_servers
 _MAX_RETRIES = 3
 _BASE_RETRY_DELAY_S = 5
 # Cap for stderr captured from the CLI subprocess in the executor log. Keeps
@@ -667,6 +696,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                 "args": [get_mcp_server_path()],
             }
         }
+        # Merge any config-declared MCP servers (e.g. the platform-management
+        # MCP for the org-level platform agent). No-op for ordinary workspaces.
+        _apply_extra_mcp_servers(mcp_servers, self._load_config_dict())
 
         create_kwargs: dict = dict(
             model=self.model,
