@@ -26,8 +26,10 @@ one active stream at any given moment).
 from __future__ import annotations
 
 import asyncio
+import glob
 import logging
 import os
+import shutil
 import sys
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -315,6 +317,74 @@ _WEDGE_ERROR_PATTERNS = (
 )
 
 
+# Substrings that classify an error as a CONTEXT-WINDOW OVERFLOW — the
+# accumulated session transcript grew past the model's context window, so
+# the next request's input tokens alone exceed the limit and EVERY
+# subsequent dispatch on the same (resumed) session re-overflows and fails.
+# This is the Kimi wedge: claude-code routed at a 262144-token model
+# reported `token limit 262144 requested 268132`; once the session crossed
+# the window, every A2A turn 400'd identically and the agent was stuck.
+#
+# WHY claude-code's own auto-compact didn't save Kimi
+# ---------------------------------------------------
+# claude-code DOES auto-compact, but the compaction threshold is derived
+# from the model's context window via the CLI's internal resolver (`B2`):
+# it returns 1e6 for known long-context Anthropic models, a cached value
+# for `claude-sonnet-4-6`, and otherwise falls through to a hard-coded
+# `pi6 = 200000` default. A non-Anthropic model reached through the
+# molecule LLM proxy (Kimi/MiniMax/GLM/DeepSeek) is NOT in that table, so
+# the resolver returns the 200k fallback. Kimi's REAL window is 262144 —
+# LARGER than the assumed 200k — so claude-code believes it has *more*
+# headroom than it does only when the model is smaller, but the deeper
+# failure is the inverse: the proxy advertises the model's true 262144
+# window to claude-code's token accounting in some paths while the
+# compaction trigger uses the 200k fallback, so the session is allowed to
+# grow into a band (200k–262k) where claude-code thinks compaction already
+# ran "enough" but the upstream still rejects. Net effect for the operator:
+# auto-compact fired against the wrong number and the session wedged. The
+# durable prevention is to tell claude-code the model's real window via
+# `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (see _maybe_set_context_window_env); the
+# auto-heal below is the RECOVERY half that un-sticks an already-wedged
+# agent.
+#
+# Matching mirrors claude-code's own overflow regex
+#   \b(too long|too large|exceeds|token limit|prompt is too long)\b
+# plus the proxy-shaped `token limit <N> requested <M>` body and the
+# Anthropic-native phrasings, so we catch the error whether it surfaces as
+# a raised ProcessError/Exception OR as an `is_error` ResultMessage.
+# Case-insensitive substring match on the formatted error text.
+#
+# Adding a pattern here MUST come with a test in
+# tests/test_context_overflow_autoheal.py — a false positive throws away a
+# healthy session and forces a (recoverable but wasteful) re-summarization.
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "prompt is too long",
+    "token limit",            # proxy: "token limit 262144 requested 268132"
+    "context window",
+    "context_length_exceeded",
+    "maximum context length",
+    "exceeds the context",
+    "input length and `max_tokens`",
+    "too many tokens",
+)
+
+
+def _is_context_overflow(text: str) -> bool:
+    """True if `text` looks like a context-window overflow (vs. a generic
+    rate-limit or subprocess crash). Case-insensitive substring match
+    against `_CONTEXT_OVERFLOW_PATTERNS`.
+
+    Deliberately NARROW: `_RETRYABLE_PATTERNS` already contains the broad
+    word "limit", which would match almost any rate-limit string; this
+    classifier exists to distinguish the *context* overflow (heal by
+    resetting the session) from a *rate* limit (heal by backing off and
+    retrying the SAME session). The two need opposite remedies — resetting
+    the session on a rate-limit would needlessly discard good context.
+    """
+    low = (text or "").lower()
+    return any(p in low for p in _CONTEXT_OVERFLOW_PATTERNS)
+
+
 _SWALLOWED_STDERR_MARKER = "Check stderr output for details"
 
 
@@ -397,6 +467,29 @@ def _format_process_error(exc: BaseException) -> str:
         if probed:
             parts.append(f"probed_cli_error={probed!r}")
     return " | ".join(parts)
+
+
+class _ResultError(Exception):
+    """Raised by `_run_query` when the SDK completes the stream but the
+    terminal `ResultMessage` carries `is_error=True`.
+
+    A context overflow does NOT always surface as a raised SDK exception:
+    when the CLI subprocess reaches the model proxy and the upstream
+    rejects the request body with a 400 (`token limit … requested …`), the
+    CLI can emit a normal `result` message with `is_error=True` and the
+    error text in `.result` instead of crashing. Without this, that path
+    returned the error string as if it were a successful agent reply — the
+    overflow looked like a (broken) answer and the heal never triggered.
+    Re-raising as a typed exception routes the `is_error` result through
+    the exact same retry/heal/wedge classification the raised-exception
+    path uses, so detection lives in ONE place (`_execute_locked`).
+
+    Carries the rendered error text so the classifier can match on it.
+    """
+
+    def __init__(self, text: str) -> None:
+        self.text = text or ""
+        super().__init__(self.text)
 
 
 @dataclass
@@ -485,6 +578,59 @@ class ClaudeSDKExecutor(AgentExecutor):
         except Exception:
             return {}
 
+    def _maybe_set_context_window_env(self) -> None:
+        """Tell claude-code the model's REAL context window (deeper fix).
+
+        Root cause of the Kimi wedge: claude-code's auto-compact threshold
+        is derived from its internal context-window resolver, which only
+        knows Anthropic models and falls back to a hard-coded 200000 for
+        anything reached through the molecule LLM proxy (Kimi/MiniMax/GLM/
+        DeepSeek). With the wrong window, compaction fires against the
+        wrong number and the session is allowed to drift into a band the
+        upstream still rejects.
+
+        claude-code honors ``CLAUDE_CODE_MAX_CONTEXT_TOKENS`` as an
+        explicit override of that resolver (see the bundled CLI's `B2`
+        function). Setting it to the model's true window makes auto-compact
+        trigger at the correct point — PREVENTING the overflow rather than
+        only recovering from it. The auto-heal stays as the safety net for
+        any window we don't have configured.
+
+        Source of the window (first hit wins):
+          1. ``MODEL_CONTEXT_WINDOW`` env (persona/operator override).
+          2. ``context_window`` in config.yaml.
+        Absent/invalid → leave the env untouched so claude-code keeps its
+        own default behavior (no regression for Anthropic models, whose
+        resolver is already correct).
+
+        Idempotent + non-destructive: if the env is already set (operator
+        pinned it, or a prior call set it) we don't overwrite it.
+        """
+        if os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS"):
+            return
+        raw = os.environ.get("MODEL_CONTEXT_WINDOW")
+        if not raw:
+            raw = self._load_config_dict().get("context_window")
+        if raw in (None, ""):
+            return
+        try:
+            window = int(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "context_window=%r is not an integer — leaving claude-code's "
+                "default window resolver in place", raw,
+            )
+            return
+        if window <= 0:
+            return
+        os.environ["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(window)
+        logger.info(
+            "set CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d so auto-compact triggers "
+            "against the model's real context window (model=%s) — prevents "
+            "the proxy-routed-model context-overflow wedge",
+            window, self.model,
+        )
+
     def _build_options(self) -> Any:
         """Build ClaudeAgentOptions.
 
@@ -508,6 +654,13 @@ class ClaudeSDKExecutor(AgentExecutor):
           When set, the ``task-budgets-2026-03-13`` beta header is added so
           the API accepts the field.
         """
+        # Deeper fix for the context-overflow wedge: pin the model's real
+        # context window so claude-code's auto-compact triggers against the
+        # right number instead of its 200k fallback for proxy-routed
+        # models. No-op when unconfigured (Anthropic models keep their
+        # correct built-in resolver).
+        self._maybe_set_context_window_env()
+
         mcp_servers = {
             "a2a": {
                 "command": sys.executable,
@@ -603,6 +756,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         tool_uses: list[str] = []
         result_text: str | None = None
         session_id: str | None = None
+        result_is_error: bool = False
         self._active_stream = sdk.query(prompt=prompt, options=options)
         try:
             async for message in self._active_stream:
@@ -640,8 +794,23 @@ class ClaudeSDKExecutor(AgentExecutor):
                     if sid:
                         session_id = sid
                     result_text = getattr(message, "result", None)
+                    # The SDK reports an upstream-rejected request (e.g. a
+                    # 400 context overflow from the model proxy) as a
+                    # terminal result with is_error=True rather than a
+                    # raised exception. Capture it so the error path below
+                    # can re-raise it into the unified classification.
+                    result_is_error = bool(getattr(message, "is_error", False))
         finally:
             self._active_stream = None
+        # An is_error result is an upstream rejection (e.g. a 400 context
+        # overflow from the model proxy) that the SDK surfaced as a normal
+        # terminal message instead of a raised exception. Re-raise it so it
+        # flows through the same retry/heal/wedge classification in
+        # _execute_locked as a raised SDK error — detection lives in one
+        # place. The session_id (if any) was NOT persisted to self by this
+        # method; the caller's heal path clears it regardless.
+        if result_is_error:
+            raise _ResultError(result_text or "")
         text = result_text if result_text is not None else "".join(assistant_chunks)
         # Auto-recover the wedge flag — if a previous query() left this
         # process in `_sdk_wedged` and THIS query just completed
@@ -759,6 +928,102 @@ class ClaudeSDKExecutor(AgentExecutor):
         )
         self._session_id = None
 
+    def _reset_session_for_context_overflow(self) -> None:
+        """Hard session reset for a context-window overflow auto-heal.
+
+        Stronger than `_reset_session_after_error`: the bloated transcript
+        on disk is the *cause* of the overflow, so we both (a) clear
+        `self._session_id` (next `_build_options()` passes `resume=None`,
+        so the SDK boots a brand-new, empty session) AND (b) best-effort
+        purge the stale on-disk session transcripts so the oversized
+        history can never be accidentally resumed by a later boot.
+
+        The SDK stores per-session transcripts as
+        ``~/.claude/projects/<project_key>/<session>.jsonl`` (honoring
+        ``CLAUDE_CONFIG_DIR`` when set). We don't have a cheap
+        project_key→path mapping here, so we purge ALL ``*.jsonl`` session
+        files under the projects tree — this workspace runs exactly one
+        agent, so there is no other agent's session to protect, and a
+        fresh boot simply re-creates the dir. Bounded + best-effort: any
+        filesystem error is swallowed (the in-memory `resume=None` reset
+        alone is sufficient to recover; the disk purge is belt-and-braces
+        so a future explicit-resume path can't reach the bloated file).
+        """
+        self._session_id = None
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.join(
+            os.path.expanduser("~"), ".claude"
+        )
+        projects_root = os.path.join(config_dir, "projects")
+        if not os.path.isdir(projects_root):
+            return
+        purged = 0
+        try:
+            for jsonl in glob.glob(
+                os.path.join(projects_root, "**", "*.jsonl"), recursive=True
+            ):
+                try:
+                    os.remove(jsonl)
+                    purged += 1
+                except OSError:
+                    # A single un-removable file (perm drift, race) must
+                    # not abort the heal — the resume=None reset already
+                    # guarantees a fresh session next turn.
+                    continue
+        except Exception:
+            logger.exception(
+                "context-overflow heal: session-transcript purge raised "
+                "(resume=None reset still in effect — recovery proceeds)"
+            )
+            return
+        if purged:
+            logger.info(
+                "context-overflow heal: purged %d stale session transcript(s) "
+                "under %s",
+                purged,
+                projects_root,
+            )
+
+    async def _notify_context_overflow_heal(self, detail: str) -> None:
+        """Best-effort operator-visible signal that an auto-heal fired.
+
+        The ERROR log is the durable record; this posts a one-line
+        agent_log activity row so the canvas's live feed shows the heal in
+        real time instead of only surfacing it in container logs. Mirrors
+        `_report_tool_use`: lazy imports, short timeout, every failure
+        swallowed — telemetry must never break (or block) the heal+retry.
+
+        Deliberately a chat-feed signal, NOT a runtime wedge: the workspace
+        self-recovers on the very next (retried) turn, so flipping it to
+        `degraded` would be a false alarm the operator can't action.
+        """
+        try:
+            import httpx
+            from molecule_runtime.a2a_client import PLATFORM_URL, WORKSPACE_ID
+            from molecule_runtime.platform_auth import auth_headers
+        except Exception:
+            return
+        try:
+            summary = (
+                "♻️ Auto-heal: context window overflowed — reset session and "
+                "retried on a fresh session. "
+                f"({detail[:120]})"
+            )
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                    json={
+                        "activity_type": "agent_log",
+                        "source_id": WORKSPACE_ID,
+                        "target_id": WORKSPACE_ID,
+                        "summary": summary[:300],
+                        "status": "warning",
+                        "method": "context_overflow_autoheal",
+                    },
+                    headers=auth_headers(),
+                )
+        except Exception:
+            return
+
     async def _execute_locked(self, user_input: str) -> str:
         """Body of execute() that runs under the run lock.
 
@@ -782,6 +1047,13 @@ class ClaudeSDKExecutor(AgentExecutor):
             # stuck at 1 forever, permanently blocking queue drain. (#2026)
             await set_current_task(self.heartbeat, brief_summary(user_input))
             prompt = await self._inject_memories_if_first_turn(prompt)
+            # Bound the context-overflow auto-heal to ONE reset per
+            # dispatch. The first overflow resets the session and retries
+            # on a fresh (empty) session; if THAT immediately overflows
+            # again, the prompt itself — not accumulated history — exceeds
+            # the window, which a reset cannot fix. Surface a hard error
+            # instead of looping the reset forever.
+            overflow_healed = False
             for attempt in range(_MAX_RETRIES):
                 options = self._build_options()
                 try:
@@ -802,7 +1074,60 @@ class ClaudeSDKExecutor(AgentExecutor):
                     # the session_id so the next attempt (retry or
                     # next user turn) starts fresh.
                     self._reset_session_after_error(exc)
-                    if attempt < _MAX_RETRIES - 1 and self._is_retryable(exc):
+
+                    # --- Context-overflow auto-heal (the Kimi wedge) ---
+                    # If the error is a context-window overflow, the
+                    # accumulated session transcript has grown past the
+                    # model's window: resuming it makes EVERY future
+                    # dispatch overflow identically (agent stuck forever
+                    # until a manual restart). Heal it in-band: reset the
+                    # session (resume=None + purge the bloated transcript)
+                    # and retry ONCE on a fresh, empty session.
+                    #
+                    # Bounded by `overflow_healed`: at most one reset per
+                    # dispatch. A second overflow after a fresh-session
+                    # reset means the single prompt is itself too large
+                    # (not history) — a reset can't fix that, so we fall
+                    # through to the terminal error path below.
+                    #
+                    # Loud + observable per the fail-loud SOP: ERROR-level
+                    # structured log on detect, plus a best-effort
+                    # operator notification. NOT a runtime wedge — a wedge
+                    # means "only a restart recovers"; this self-recovers,
+                    # so flipping the workspace to degraded would be a
+                    # false alarm.
+                    if not overflow_healed and _is_context_overflow(formatted):
+                        overflow_healed = True
+                        logger.error(
+                            "auto-heal: session reset on context-overflow "
+                            "[claude-code] (attempt %d/%d) — model=%s, "
+                            "resetting session + retrying once on a fresh "
+                            "session: %s",
+                            attempt + 1, _MAX_RETRIES, self.model,
+                            formatted[:200],
+                        )
+                        self._reset_session_for_context_overflow()
+                        await self._notify_context_overflow_heal(formatted)
+                        # No backoff: the fresh session is independent of
+                        # any upstream rate state; retry immediately.
+                        continue
+
+                    # A context overflow that survives a heal (overflow_healed
+                    # already True) must go straight to the terminal error
+                    # path — NOT the transient-retry branch below. The
+                    # overflow text ("token limit …") also matches the broad
+                    # `_RETRYABLE_PATTERNS` ("limit"), so without this guard
+                    # the loop would back-off-and-retry a third time, which
+                    # (a) re-overflows identically and (b) defeats the
+                    # one-reset-per-dispatch cap. The single prompt is too
+                    # big; backoff cannot shrink it.
+                    is_unhealable_overflow = _is_context_overflow(formatted)
+
+                    if (
+                        not is_unhealable_overflow
+                        and attempt < _MAX_RETRIES - 1
+                        and self._is_retryable(exc)
+                    ):
                         delay = _BASE_RETRY_DELAY_S * (2 ** attempt)
                         logger.warning(
                             "SDK agent [claude-code] transient error (attempt %d/%d), "
@@ -815,6 +1140,22 @@ class ClaudeSDKExecutor(AgentExecutor):
                     # stderr explicitly (fixes #66) so operators don't have
                     # to reproduce the crash manually to find out why the
                     # subprocess died.
+                    if overflow_healed and _is_context_overflow(formatted):
+                        # A context overflow that survived a fresh-session
+                        # reset: the single prompt (this one message + its
+                        # injected memory/delegation context) is itself
+                        # larger than the model's window. A session reset
+                        # cannot shrink one oversized request — surface a
+                        # hard, operator-actionable error rather than
+                        # looping the reset.
+                        logger.error(
+                            "context-overflow auto-heal exhausted [claude-code]: "
+                            "the request still overflows on a FRESH session, so "
+                            "the single prompt exceeds the model window "
+                            "(model=%s) — not a stale-history problem; shrink the "
+                            "input or raise the model's context window: %s",
+                            self.model, formatted[:200],
+                        )
                     logger.error("SDK agent error [claude-code]: %s", formatted)
                     logger.exception("SDK agent error [claude-code] — full traceback follows")
                     # Detect the specific claude_agent_sdk init-wedge case
