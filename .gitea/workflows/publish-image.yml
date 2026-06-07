@@ -423,6 +423,15 @@ jobs:
           file: ./Dockerfile.platform-agent
           platforms: linux/amd64
           push: true
+          # provenance/sbom OFF: with attestations on, buildx pushes an OCI
+          # image *index* (vnd.oci.image.index.v1+json) instead of a plain
+          # image manifest. ECR stores the index but `list-images` /the docker
+          # pull path on a FRESH repo don't surface it — the first publish went
+          # green (buildx logged a digest) yet the repo stayed empty. A plain
+          # single-platform manifest pushes + lists normally. (The base image
+          # masked this because its manifest already existed in ECR.)
+          provenance: false
+          sbom: false
           tags: |
             ${{ env.PA_IMAGE_NAME }}:latest
             ${{ env.PA_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
