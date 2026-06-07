@@ -372,8 +372,12 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
+          # Strip ONLY the registry host → molecule-ai/molecule-platform-agent.
+          # (The base job's double-strip drops the molecule-ai/ namespace and only
+          # works because its repo pre-exists from the migration sweep; this repo
+          # does NOT, so the namespace must be kept or describe/create + push
+          # disagree — the push targets the full molecule-ai/... path.)
           repo_path="${PA_IMAGE_NAME#*/}"
-          repo_path="${repo_path#*/}"  # → molecule-ai/molecule-platform-agent
           if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
             aws ecr create-repository --repository-name "${repo_path}" \
               --image-scanning-configuration scanOnPush=true --region us-east-2 >/dev/null
