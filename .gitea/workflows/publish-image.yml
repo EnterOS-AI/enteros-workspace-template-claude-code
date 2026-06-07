@@ -334,3 +334,98 @@ jobs:
           fi
           echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
 
+  publish-platform-agent:
+    # RFC platform-agent §5.7 — build the dedicated molecule-platform-agent image
+    # HERE (not molecule-ci) so it reuses this repo's ECR creds + publish runners,
+    # with NO new secret. It is FROM the workspace-template-claude-code image the
+    # `publish` job just pushed, and bakes @molecule-ai/mcp-server from the org's
+    # Gitea npm registry (anonymous read — no token / no cross-repo checkout).
+    #
+    # Deliberately NO auto pin-promote: publishing the image is decoupled from
+    # ACTIVATING the feature. The image stays available in ECR; an operator
+    # activates it by promoting the `platform-agent` runtime_image_pins entry
+    # (POST /cp/admin/runtime-image/promote) when ready, which the merged
+    # control-plane Phase 3c then consumes.
+    name: Build & push molecule-platform-agent image
+    runs-on: [publish, release]
+    timeout-minutes: 30
+    needs: [resolve-version, publish]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    env:
+      PA_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/molecule-platform-agent
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Log in to ECR
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region us-east-2 | \
+            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Ensure ECR repository exists
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          repo_path="${PA_IMAGE_NAME#*/}"
+          repo_path="${repo_path#*/}"  # → molecule-ai/molecule-platform-agent
+          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "${repo_path}" \
+              --image-scanning-configuration scanOnPush=true --region us-east-2 >/dev/null
+            echo "::notice::created ECR repository ${repo_path}"
+          else
+            echo "ECR repository ${repo_path} already exists"
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Build image (load for smoke test, do not push yet)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile.platform-agent
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.PA_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI org-level platform agent (claude-code + org-management MCP)
+
+      - name: Smoke test — Node 20 + baked molecule-mcp on PATH
+        env:
+          IMAGE: ${{ env.PA_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -eu
+          docker run --rm --entrypoint sh "${IMAGE}" -c '
+            node --version | grep -E "^v20\." || { echo "::error::node is not v20"; exit 1; }
+            command -v molecule-mcp >/dev/null || { echo "::error::molecule-mcp not on PATH"; exit 1; }
+            echo "platform-agent image smoke OK: node20 + molecule-mcp baked"
+          '
+
+      - name: Push image to ECR (post-smoke)
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: ./Dockerfile.platform-agent
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.PA_IMAGE_NAME }}:latest
+            ${{ env.PA_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          build-args: |
+            BASE_IMAGE=${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.description=Molecule AI org-level platform agent (claude-code + org-management MCP)
+

@@ -1,0 +1,58 @@
+# molecule-platform-agent image
+# RFC: molecule-core docs/design/rfc-platform-agent.md §5.7
+#
+# A dedicated image, FROM this repo's workspace-template-claude-code image, that
+# bakes in the org-management MCP (@molecule-ai/mcp-server) so the org-level
+# platform agent can drive the org alongside the always-on a2a MCP.
+#
+# Built in THIS repo (not molecule-ci) so it reuses the existing publish
+# pipeline's ECR credentials, publish runners, and pin-promote — NO new secret.
+# The MCP is pulled from the org's Gitea npm registry, which serves the package
+# anonymously, so the build needs no token or cross-repo checkout either.
+#
+# Keeps the org-admin MCP OUT of ordinary workspace images (security hygiene):
+# only this image installs it; ordinary workspaces declare no extra mcp_servers.
+
+# Pin to a specific workspace-template-claude-code tag at build time via
+# --build-arg BASE_IMAGE=...:sha-<7> (the publish workflow passes the sha it just
+# pushed). Defaults to :latest for local builds.
+ARG BASE_IMAGE=153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-claude-code:latest
+FROM ${BASE_IMAGE}
+
+# Version of @molecule-ai/mcp-server to bake (pin for reproducible builds).
+ARG MCP_VERSION=1.4.1
+
+USER root
+
+# Pin Node 20. The debian-slim base apt-installs `nodejs` (Node 18); the org
+# MCP's @modelcontextprotocol/sdk requires >=20. Install Node 20 from NodeSource,
+# replacing the apt nodejs so `node` resolves to 20 for both claude-code and the
+# baked MCP.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    mkdir -p /etc/apt/keyrings; \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
+      > /etc/apt/sources.list.d/nodesource.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs; \
+    node --version | grep -E '^v20\.'; \
+    rm -rf /var/lib/apt/lists/*
+
+# Install the org-management MCP globally from the org Gitea npm registry
+# (anonymous read — no auth). Exposes the `molecule-mcp` bin on PATH, which the
+# platform agent's config.yaml references as
+# `mcp_servers: [{name: platform, command: molecule-mcp}]`.
+RUN set -eux; \
+    printf '@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n' > /etc/npmrc; \
+    npm install -g --userconfig /etc/npmrc "@molecule-ai/mcp-server@${MCP_VERSION}"; \
+    command -v molecule-mcp
+
+# Marker so the runtime/provisioner can assert it is on the platform-agent image
+# (and not an ordinary workspace image) before declaring the platform MCP.
+ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1
+
+# Return to the agent uid the base image runs as.
+USER agent
