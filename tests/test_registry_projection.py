@@ -174,3 +174,33 @@ def test_subset_rejects_injected_unservable_model_on_real_provider():
         prov == real_provider and model == bogus_model
         for prov, model, _ in violations
     ), f"injected bogus model must appear in violations; got {violations}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Canonical form audit (Researcher provider-grammar fix)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_claude_code_projection_excludes_moonshot_colon_forms():
+    """moonshot:kimi-k2.* colon forms are openclaw-canonical; claude-code
+    must offer only bare BYOK ids + slash-namespaced platform ids.
+    Researcher canonical audit + cp#568 controlplane sync."""
+    proj = _projection()
+    for prov in proj.get("providers", []):
+        for model in prov.get("models", []):
+            assert not model.startswith("moonshot:"), (
+                f"claude-code projection must not contain moonshot: colon forms "
+                f"(openclaw-only). Found {model!r} under provider {prov['name']!r}"
+            )
+
+
+def test_claude_code_projection_excludes_minimax_colon_forms():
+    """minimax:MiniMax-* colon forms are openclaw-canonical; claude-code
+    must offer only bare BYOK ids + slash-namespaced platform ids.
+    Researcher canonical audit + cp#568 controlplane sync."""
+    proj = _projection()
+    for prov in proj.get("providers", []):
+        for model in prov.get("models", []):
+            assert not model.startswith("minimax:"), (
+                f"claude-code projection must not contain minimax: colon forms "
+                f"(openclaw-only). Found {model!r} under provider {prov['name']!r}"
+            )

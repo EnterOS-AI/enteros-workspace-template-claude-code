@@ -27,12 +27,14 @@
       "name": "anthropic-oauth"
     },
     {
+      "models": [],
+      "name": "deepseek"
+    },
+    {
       "models": [
         "kimi-for-coding",
         "kimi-k2",
-        "kimi-k2.5",
-        "moonshot:kimi-k2.5",
-        "moonshot:kimi-k2.6"
+        "kimi-k2.5"
       ],
       "name": "kimi-coding"
     },
@@ -41,9 +43,7 @@
         "MiniMax-M2",
         "MiniMax-M2.7",
         "MiniMax-M2.7-highspeed",
-        "minimax:MiniMax-M2",
-        "minimax:MiniMax-M2.7",
-        "minimax:MiniMax-M2.7-highspeed"
+        "MiniMax-M3"
       ],
       "name": "minimax"
     },
@@ -53,10 +53,19 @@
         "anthropic/claude-sonnet-4-6",
         "minimax/MiniMax-M2.7",
         "minimax/MiniMax-M2.7-highspeed",
+        "minimax/MiniMax-M3",
         "moonshot/kimi-k2.5",
         "moonshot/kimi-k2.6"
       ],
       "name": "platform"
+    },
+    {
+      "models": [],
+      "name": "xiaomi-mimo"
+    },
+    {
+      "models": [],
+      "name": "zai"
     }
   ],
   "runtime": "claude-code"
