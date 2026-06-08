@@ -50,18 +50,16 @@ RUN set -eux; \
     npm install -g --userconfig /etc/npmrc "@molecule-ai/mcp-server@${MCP_VERSION}"; \
     command -v molecule-mcp
 
-# Self-contain the adapter import path. The runtime boots via the
-# `molecule-runtime` console-script (entrypoint.sh: `exec molecule-runtime`),
-# which does NOT put the working dir on sys.path — so `ADAPTER_MODULE=adapter`
-# (adapter.py at WORKDIR /app) is unimportable unless /app is on PYTHONPATH.
-# Ordinary workspace images get this from the core provisioner's
-# BuildContainerEnv (PYTHONPATH=/app, "fixes every adapter image"). THIS image is
-# launched by the control-plane's own `docker run` (ec2.go), which is NOT that
-# provisioner and does not inject it — so the dedicated platform-agent image must
-# set it itself, or the concierge crash-loops on
-# `ModuleNotFoundError: No module named 'adapter'`. Putting /app first also keeps
-# the local /app/adapter.py + /app/claude_sdk_executor.py ahead of any older
-# same-named modules under site-packages (see the base Dockerfile's COPY notes).
+# Self-contain the adapter-module import path. The runtime boots via its console-script
+# entrypoint, which does NOT put the working dir on sys.path — so the adapter
+# module at the image's working directory is unimportable unless the working
+# directory is on PYTHONPATH. Ordinary workspace images get this from the
+# platform's container environment; THIS image is launched by a different
+# runner that does not inject it, so the dedicated platform-agent image must
+# set PYTHONPATH itself, or the runtime fails to start when the import fails.
+# Putting the working directory first on PYTHONPATH also keeps the local
+# modules ahead of any same-named modules under site-packages (see the base
+# Dockerfile's COPY notes).
 ENV PYTHONPATH=/app
 
 # Marker so the runtime/provisioner can assert it is on the platform-agent image
