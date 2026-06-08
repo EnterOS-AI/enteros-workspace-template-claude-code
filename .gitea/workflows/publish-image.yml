@@ -418,8 +418,8 @@ jobs:
             # does not inject PYTHONPATH, so the image must self-set it or the
             # concierge crash-loops when the import fails. Assert it from a
             # fresh cwd so a regression is caught at build time.
-            [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH is not /app (got: ${PYTHONPATH:-unset})"; exit 1; }
-            cd / && python3 -c "import adapter" || { echo "::error::ADAPTER_MODULE=adapter not importable — concierge would crash-loop"; exit 1; }
+            [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH does not match the expected runtime value (got: ${PYTHONPATH:-unset})"; exit 1; }
+            cd / && python3 -c "import adapter" || { echo "::error::adapter module import check failed"; exit 1; }
             echo "platform-agent image smoke OK: node20 + molecule-mcp baked + adapter importable"
           '
 
