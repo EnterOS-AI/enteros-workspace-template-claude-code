@@ -413,12 +413,11 @@ jobs:
           docker run --rm --entrypoint sh "${IMAGE}" -c '
             node --version | grep -E "^v20\." || { echo "::error::node is not v20"; exit 1; }
             command -v molecule-mcp >/dev/null || { echo "::error::molecule-mcp not on PATH"; exit 1; }
-            # The runtime boots via the molecule-runtime console-script, which does
-            # not add the CWD to sys.path. This image is run by the control-plane
-            # docker run (NOT the core provisioner that injects PYTHONPATH=/app),
-            # so the image must self-set PYTHONPATH=/app or the concierge
-            # crash-loops on ModuleNotFoundError: No module named "adapter". Assert
-            # it from a non-/app cwd so a regression is caught at build time.
+            # The runtime boots via its console-script entrypoint, which does
+            # not add the CWD to sys.path. This image is run by a runner that
+            # does not inject PYTHONPATH, so the image must self-set it or the
+            # concierge crash-loops on ModuleNotFoundError. Assert it from a
+            # non-module cwd so a regression is caught at build time.
             [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH is not /app (got: ${PYTHONPATH:-unset})"; exit 1; }
             cd / && python3 -c "import adapter" || { echo "::error::ADAPTER_MODULE=adapter not importable — concierge would crash-loop"; exit 1; }
             echo "platform-agent image smoke OK: node20 + molecule-mcp baked + adapter importable"
