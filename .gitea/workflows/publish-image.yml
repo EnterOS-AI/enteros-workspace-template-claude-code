@@ -112,8 +112,8 @@ jobs:
         # the monorepo layout but explode at startup in the published container
         # (a failed import). Runs before Docker login so a bad import
         # returns red in seconds.
-        # Fallback module list mirrors scripts/build_runtime_package.py:
-        # TOP_LEVEL_MODULES as of 2026-04-27.
+        # Fallback module list mirrors the runtime build script's published
+        # top-level module list as of 2026-04-27.
         shell: bash
         run: |
           set -eu
@@ -181,7 +181,7 @@ jobs:
 
       - name: Build image (load for smoke test, do not push yet)
         # Build into runner-local docker first. Smoke test runs before push so
-        # a broken adapter.py never poisons :latest.
+        # a broken adapter module never poisons :latest.
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
@@ -416,7 +416,7 @@ jobs:
             # The runtime boots via its console-script entrypoint, which does
             # not add the CWD to sys.path. This image is run by a runner that
             # does not inject PYTHONPATH, so the image must self-set it or the
-            # concierge crash-loops when the import fails. Assert it from a
+            # runtime fails to start when the import fails. Assert it from a
             # fresh cwd so a regression is caught at build time.
             [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH does not match the expected runtime value (got: ${PYTHONPATH:-unset})"; exit 1; }
             cd / && python3 -c "import adapter" || { echo "::error::adapter module import check failed"; exit 1; }

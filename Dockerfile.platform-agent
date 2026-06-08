@@ -50,13 +50,13 @@ RUN set -eux; \
     npm install -g --userconfig /etc/npmrc "@molecule-ai/mcp-server@${MCP_VERSION}"; \
     command -v molecule-mcp
 
-# Self-contain the adapter import path. The runtime boots via its console-script
+# Self-contain the adapter-module import path. The runtime boots via its console-script
 # entrypoint, which does NOT put the working dir on sys.path — so the adapter
 # module at the image's working directory is unimportable unless the working
 # directory is on PYTHONPATH. Ordinary workspace images get this from the
 # platform's container environment; THIS image is launched by a different
 # runner that does not inject it, so the dedicated platform-agent image must
-# set PYTHONPATH itself, or the concierge crash-loops when the import fails.
+# set PYTHONPATH itself, or the runtime fails to start when the import fails.
 # Putting the working directory first on PYTHONPATH also keeps the local
 # modules ahead of any same-named modules under site-packages (see the base
 # Dockerfile's COPY notes).
