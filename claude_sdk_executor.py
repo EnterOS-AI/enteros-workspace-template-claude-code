@@ -498,6 +498,85 @@ def _format_process_error(exc: BaseException) -> str:
     return " | ".join(parts)
 
 
+# --- Stuck-MCP readiness gate (the concierge "lost its platform tools" bug) ---
+#
+# The org-level platform agent declares a second MCP server (`platform`, the
+# molecule-mcp-server with ~88 org-admin tools like create_workspace) in its
+# config.yaml. That server is a `node` stdio subprocess that takes ~5-8s to
+# finish its MCP handshake. The one-shot `claude_agent_sdk.query()` API spawns
+# a COLD CLI subprocess per turn and ships its `init` system message — which
+# carries the tool list the LLM will see — the instant the CLI boots, while the
+# `node` server is still `status: pending`. Result: the 88 `mcp__platform__*`
+# tools are absent from that turn's tool list, so the concierge "loses"
+# create_workspace etc. A fresh `query()` doesn't reliably fix it because each
+# query is a cold subprocess that re-races the same handshake (confirmed live:
+# 3/3 fresh `query()` sessions showed `platform: pending` / 0 platform tools at
+# init, while a persistent client that POLLS `get_mcp_status()` settles to
+# `connected` / 88 tools after ~5s).
+#
+# Fix: when the config declares extra (non-`a2a`) MCP servers, route the turn
+# through a persistent `ClaudeSDKClient` and GATE on `get_mcp_status()` until
+# every declared server reports `connected` (bounded poll) BEFORE sending the
+# prompt — so the LLM's tool list includes the platform tools. Ordinary
+# workspaces declare no extra servers and keep the fast `query()` path
+# untouched. If the gate times out with a server still not connected, we raise
+# `_McpNotReadyError` so `_execute_locked` can self-heal (reset session + retry
+# once), mirroring the context-overflow auto-heal.
+#
+# Connection-status classification for the readiness gate.
+#   `connected` — the only success; the server's tools are live.
+#   `pending`   — still handshaking; keep polling within the budget.
+#   `failed`    — the CLI's own MCP-connect timeout (MCP_TIMEOUT, default 30s)
+#                 elapsed before the slow `node` server finished. Observed
+#                 live to be INTERMITTENT under load (the same server connects
+#                 fine on a fresh subprocess), so it is treated as RETRYABLE,
+#                 not hard-terminal: the gate surfaces it as _McpNotReadyError
+#                 which the executor heals by resetting the session and
+#                 retrying on a fresh subprocess (a new MCP-connect attempt).
+#   `disabled` / `needs-auth` — genuinely terminal: a config/auth problem no
+#                 retry can fix, so the gate raises immediately and the heal's
+#                 retry is wasted but bounded (one reset, then a hard error).
+_MCP_READY_STATUS = "connected"
+# Hard-terminal: retrying cannot help (misconfiguration / auth).
+_MCP_TERMINAL_FAIL_STATUSES = ("disabled", "needs-auth")
+# Bound on the readiness poll. The platform `node` MCP was observed to connect
+# in ~6-13s; budget 50 × 0.5s = 25s gives ample headroom under load while
+# staying under the SDK's 60s initialize timeout so the gate can't itself trip
+# an init wedge.
+_MCP_READY_MAX_POLLS = 50
+_MCP_READY_POLL_INTERVAL_S = 0.5
+# How many times the stuck-MCP heal may reset+retry within a single dispatch.
+# Each retry is a FRESH subprocess with an independent MCP-connect attempt, so
+# a transient `failed`/timeout on one attempt usually clears on the next. Two
+# retries (three total attempts) makes an intermittent connect failure
+# vanishingly unlikely to surface to the user, while staying bounded so a
+# genuinely-broken server still terminates loudly.
+_MCP_HEAL_MAX_RETRIES = 2
+# CLI MCP-connection timeout (ms) the executor pins for the platform agent so
+# the slow `node` handshake isn't marked `failed` prematurely under load. The
+# CLI default is 30000; 60000 doubles the headroom. Never clobbers an operator
+# pin. (Preventive half of the stuck-MCP fix — the readiness gate is recovery.)
+_MCP_CONNECT_TIMEOUT_MS = "60000"
+
+
+class _McpNotReadyError(Exception):
+    """Raised by the readiness-gated query path when a config-declared MCP
+    server (e.g. `platform`) never reached `connected` within the bounded
+    poll window, so its tools would be absent from the LLM's tool list.
+
+    Routed through `_execute_locked`'s heal classifier (analogous to
+    `_ResultError` for overflow): the first occurrence resets the session
+    and retries ONCE; a second occurrence on the retry is a hard, loud
+    error (the server is genuinely broken, not just slow). Carries the
+    offending server name + last-seen status for the log + activity row.
+    """
+
+    def __init__(self, server: str, status: str) -> None:
+        self.server = server
+        self.status = status
+        super().__init__(f"MCP server {server!r} not ready (status={status!r})")
+
+
 class _ResultError(Exception):
     """Raised by `_run_query` when the SDK completes the stream but the
     terminal `ResultMessage` carries `is_error=True`.
@@ -607,6 +686,33 @@ class ClaudeSDKExecutor(AgentExecutor):
         except Exception:
             return {}
 
+    def _declared_extra_mcp_names(self) -> list[str]:
+        """Names of config-declared MCP servers other than the built-in
+        ``a2a`` server.
+
+        These are the servers the readiness gate must wait for before the
+        turn's prompt is sent — ``a2a`` is an in-process stdio MCP that the
+        executor controls and that connects immediately, but extra servers
+        (the platform agent's ``platform`` / molecule-mcp-server) are slow
+        external ``node``/binary subprocesses whose handshake races the CLI's
+        init message. Empty for ordinary workspaces → the fast `query()` path
+        stays in effect.
+
+        Filtering mirrors `_apply_extra_mcp_servers`: skip non-dict entries,
+        entries missing ``name``/``command``, and any attempt to redefine
+        ``a2a``.
+        """
+        names: list[str] = []
+        for entry in self._load_config_dict().get("mcp_servers") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            command = entry.get("command")
+            if not name or not command or name == "a2a":
+                continue
+            names.append(name)
+        return names
+
     def _maybe_set_context_window_env(self) -> None:
         """Tell claude-code the model's REAL context window (deeper fix).
 
@@ -660,6 +766,34 @@ class ClaudeSDKExecutor(AgentExecutor):
             window, self.model,
         )
 
+    def _maybe_set_mcp_connect_timeout_env(self) -> None:
+        """Give slow stdio MCP servers more time to connect (preventive half
+        of the stuck-MCP fix).
+
+        The platform agent's `platform` MCP is a `node` subprocess whose
+        handshake was observed to take ~6-13s and, under load, occasionally
+        exceed the claude CLI's default 30s MCP-connect timeout — at which
+        point the CLI marks the server `failed` and its tools never reach the
+        LLM. The CLI honors ``MCP_TIMEOUT`` (ms) as an override of that
+        connect timeout; pinning it higher makes premature `failed` far less
+        likely, complementing the readiness gate (which RECOVERS) with
+        PREVENTION.
+
+        Only applied when the config declares extra (non-`a2a`) MCP servers —
+        ordinary workspaces keep the CLI default. Idempotent + non-destructive:
+        never clobbers an operator pin.
+        """
+        if os.environ.get("MCP_TIMEOUT"):
+            return
+        if not self._declared_extra_mcp_names():
+            return
+        os.environ["MCP_TIMEOUT"] = _MCP_CONNECT_TIMEOUT_MS
+        logger.info(
+            "set MCP_TIMEOUT=%s so the slow platform MCP isn't marked failed "
+            "before its handshake completes (prevents the stuck-MCP tool-loss)",
+            _MCP_CONNECT_TIMEOUT_MS,
+        )
+
     def _build_options(self) -> Any:
         """Build ClaudeAgentOptions.
 
@@ -689,6 +823,10 @@ class ClaudeSDKExecutor(AgentExecutor):
         # models. No-op when unconfigured (Anthropic models keep their
         # correct built-in resolver).
         self._maybe_set_context_window_env()
+        # Preventive half of the stuck-MCP fix: give the slow platform MCP
+        # more connect headroom so it isn't marked `failed` before its
+        # handshake completes (no-op for ordinary workspaces).
+        self._maybe_set_mcp_connect_timeout_env()
 
         mcp_servers = {
             "a2a": {
@@ -772,6 +910,186 @@ class ClaudeSDKExecutor(AgentExecutor):
     # Query streaming
     # ------------------------------------------------------------------
 
+    class _StreamAccumulator:
+        """Mutable scratch state shared by the plain and gated query paths.
+
+        Both `_run_query` (one-shot `sdk.query()`) and `_run_query_gated`
+        (persistent `ClaudeSDKClient`) consume the SAME message stream shape
+        (AssistantMessage / ResultMessage). This holds the per-turn
+        accumulators so the message-handling logic lives in exactly one place
+        (`_accumulate_message`) and can't drift between the two paths.
+        """
+
+        def __init__(self) -> None:
+            self.assistant_chunks: list[str] = []
+            self.tool_uses: list[str] = []
+            self.result_text: str | None = None
+            self.session_id: str | None = None
+            self.result_is_error: bool = False
+
+    async def _accumulate_message(self, message: Any, acc: "ClaudeSDKExecutor._StreamAccumulator") -> None:
+        """Fold one SDK stream message into `acc`.
+
+        Extracted verbatim from the original `_run_query` loop so the gated
+        path (`_run_query_gated`) reuses identical text / tool-use / session-id
+        / is_error handling. Keep this the ONLY place that reads message
+        blocks.
+        """
+        if isinstance(message, sdk.AssistantMessage):
+            for block in message.content:
+                if isinstance(block, sdk.TextBlock):
+                    acc.assistant_chunks.append(block.text)
+                else:
+                    # Handle thinking/reasoning blocks from Anthropic-
+                    # compatible upstreams (MiniMax M2/M2.7, Moonshot
+                    # K2.6) so reasoning-only output doesn't surface as
+                    # empty content. Duck-typing: real SDK objects have
+                    # a `.thinking` attr; dict-shaped blocks have
+                    # `type: "thinking"`.
+                    thinking_text = None
+                    if hasattr(block, "thinking"):
+                        thinking_text = getattr(block, "thinking", None)
+                    elif isinstance(block, dict) and block.get("type") == "thinking":
+                        thinking_text = block.get("thinking")
+                    if thinking_text:
+                        acc.assistant_chunks.append(thinking_text)
+                        return
+                    # ToolUseBlock / ServerToolUseBlock are present
+                    # on the real SDK but not on the conftest stub —
+                    # check by class name to avoid an isinstance()
+                    # against a class the stub doesn't define.
+                    cls = type(block).__name__
+                    if cls in ("ToolUseBlock", "ServerToolUseBlock"):
+                        await _report_tool_use(block)
+                        name = getattr(block, "name", "") or ""
+                        if name:
+                            acc.tool_uses.append(name)
+        elif isinstance(message, sdk.ResultMessage):
+            sid = getattr(message, "session_id", None)
+            if sid:
+                acc.session_id = sid
+            acc.result_text = getattr(message, "result", None)
+            # The SDK reports an upstream-rejected request (e.g. a 400
+            # context overflow from the model proxy) as a terminal result
+            # with is_error=True rather than a raised exception. Capture it
+            # so the error path can re-raise it into the unified
+            # classification.
+            acc.result_is_error = bool(getattr(message, "is_error", False))
+
+    @staticmethod
+    def _mcp_servers_from_status(status: Any) -> list[dict]:
+        """Normalize a `get_mcp_status()` response to a list of server dicts.
+
+        The SDK returns ``{"mcpServers": [...]}`` (wire shape); be tolerant of
+        a bare list too so a future SDK shape-change degrades gracefully.
+        """
+        if isinstance(status, dict):
+            servers = status.get("mcpServers")
+        else:
+            servers = status
+        return [s for s in (servers or []) if isinstance(s, dict)]
+
+    async def _await_mcp_ready(self, client: Any, declared: list[str]) -> None:
+        """Block (bounded) until every declared MCP server is `connected`.
+
+        Polls `client.get_mcp_status()` up to `_MCP_READY_MAX_POLLS` times.
+        Returns as soon as all `declared` servers report `connected`. Raises
+        `_McpNotReadyError` if any declared server hits a TERMINAL failure
+        status (no wait helps) or is still not connected when the poll budget
+        is exhausted — the caller turns that into a session-reset + one retry.
+
+        This is THE fix for the stuck-`platform`-MCP bug: it holds the CLI
+        subprocess open through the `node` server's slow handshake so the
+        prompt is only sent once the 88 `mcp__platform__*` tools are live and
+        will appear in the model's tool list.
+        """
+        declared_set = set(declared)
+        last_status: dict[str, str] = {}
+        for _poll in range(_MCP_READY_MAX_POLLS):
+            try:
+                status = await client.get_mcp_status()
+            except Exception:
+                # A transient status-probe failure shouldn't abort the gate;
+                # keep polling. If it's genuinely broken we'll exhaust the
+                # budget and raise below with the last-seen status.
+                await asyncio.sleep(_MCP_READY_POLL_INTERVAL_S)
+                continue
+            servers = self._mcp_servers_from_status(status)
+            last_status = {
+                s.get("name", ""): s.get("status", "") for s in servers
+            }
+            # Terminal failure on any declared server → stop early, heal/retry.
+            for name in declared_set:
+                st = last_status.get(name, "pending")
+                if st in _MCP_TERMINAL_FAIL_STATUSES:
+                    raise _McpNotReadyError(name, st)
+            if all(
+                last_status.get(name) == _MCP_READY_STATUS for name in declared_set
+            ):
+                logger.debug(
+                    "MCP readiness gate: all declared servers connected (%s)",
+                    declared,
+                )
+                return
+            await asyncio.sleep(_MCP_READY_POLL_INTERVAL_S)
+        # Budget exhausted — surface the first still-unconnected server so the
+        # heal path can reset + retry once.
+        for name in declared:
+            if last_status.get(name) != _MCP_READY_STATUS:
+                raise _McpNotReadyError(name, last_status.get(name, "pending"))
+        # Defensive: loop exited without all-connected yet no name flagged
+        # (e.g. empty status). Treat as not-ready on the first declared name.
+        raise _McpNotReadyError(declared[0], last_status.get(declared[0], "unknown"))
+
+    async def _run_query_gated(self, prompt: str, options: Any, declared: list[str]) -> QueryResult:
+        """Readiness-gated variant of `_run_query` for the platform agent.
+
+        Uses a persistent `ClaudeSDKClient` so we can poll `get_mcp_status()`
+        and WAIT for the slow `platform` MCP to connect BEFORE the prompt is
+        sent — otherwise the one-shot `query()` ships its init (and the tool
+        list the LLM sees) while the server is still `pending`, hiding the 88
+        org-admin tools. Only used when `declared` is non-empty (extra MCP
+        servers configured); ordinary workspaces never reach here.
+
+        Same message handling + wedge-clear + is_error re-raise semantics as
+        `_run_query` (via the shared `_accumulate_message`), and the same
+        `self._active_stream` contract so `cancel()` can reach in.
+        """
+        acc = self._StreamAccumulator()
+        client = sdk.ClaudeSDKClient(options=options)
+        await client.connect()
+        try:
+            # Gate: hold the subprocess open until the platform MCP's tools
+            # are live. Raises _McpNotReadyError → reset+retry in _execute_locked.
+            await self._await_mcp_ready(client, declared)
+            await client.query(prompt)
+            self._active_stream = client.receive_response()
+            try:
+                async for message in self._active_stream:
+                    await self._accumulate_message(message, acc)
+            except Exception:
+                # Mirror _run_query: prefer the captured is_error text over a
+                # trailing generic CLI exception so overflow detection works.
+                if acc.result_is_error:
+                    raise _ResultError(acc.result_text or "")
+                raise
+            finally:
+                self._active_stream = None
+        finally:
+            # Always tear down the persistent subprocess — one client per turn
+            # (matches the one-shot query() lifecycle; no cross-turn warm cache
+            # exists for stdio MCP subprocesses anyway).
+            try:
+                await client.disconnect()
+            except Exception:
+                logger.debug("MCP-gated client disconnect raised (ignored)")
+        if acc.result_is_error:
+            raise _ResultError(acc.result_text or "")
+        text = acc.result_text if acc.result_text is not None else "".join(acc.assistant_chunks)
+        if acc.result_text is not None or acc.assistant_chunks:
+            _clear_sdk_wedge_on_success()
+        return QueryResult(text=text, session_id=acc.session_id, tool_uses=acc.tool_uses)
+
     async def _run_query(self, prompt: str, options: Any) -> QueryResult:
         """Drive the SDK query stream and return a QueryResult.
 
@@ -783,7 +1101,17 @@ class ClaudeSDKExecutor(AgentExecutor):
         Pure: does not mutate executor state other than setting / clearing
         `self._active_stream` so cancel() can reach in. The caller decides
         whether to persist the returned session_id.
+
+        Dispatch: when the config declares extra (non-`a2a`) MCP servers (the
+        platform agent), delegate to the readiness-gated path so the slow
+        `platform` MCP is `connected` BEFORE the prompt is sent — otherwise its
+        88 org-admin tools are hidden from the turn's tool list. Ordinary
+        workspaces declare none and keep this fast one-shot `query()` path.
         """
+        declared_extra = self._declared_extra_mcp_names()
+        if declared_extra:
+            return await self._run_query_gated(prompt, options, declared_extra)
+
         assistant_chunks: list[str] = []
         tool_uses: list[str] = []
         result_text: str | None = None
@@ -1082,6 +1410,62 @@ class ClaudeSDKExecutor(AgentExecutor):
         except Exception:
             return
 
+    def _reset_session_for_stuck_mcp(self) -> None:
+        """Session reset for a stuck-MCP auto-heal.
+
+        Unlike the context-overflow reset, the bloated on-disk transcript is
+        NOT the cause here — the cause is a slow/failed MCP handshake on this
+        turn's subprocess. So we only clear `self._session_id` (next turn boots
+        a fresh, non-resumed session) and DON'T purge transcripts: a resumed
+        session can re-poison the tool list (the platform server connects
+        after init either way), but the durable fix is the readiness gate in
+        `_run_query_gated`; clearing the session id just guarantees the retry
+        starts from a clean, un-resumed state so nothing about a stale session
+        interferes with the gate.
+        """
+        if self._session_id is not None:
+            logger.info(
+                "stuck-MCP heal: clearing session_id so the retry starts on a "
+                "fresh, un-resumed session"
+            )
+            self._session_id = None
+
+    async def _notify_stuck_mcp_heal(self, server: str, status: str) -> None:
+        """Best-effort operator-visible signal that a stuck-MCP heal fired.
+
+        Mirrors `_notify_context_overflow_heal`: lazy imports, short timeout,
+        every failure swallowed. NOT a runtime wedge — the workspace recovers
+        on the retried (readiness-gated) turn, so `degraded` would be a false
+        alarm.
+        """
+        try:
+            import httpx
+            from molecule_runtime.a2a_client import PLATFORM_URL, WORKSPACE_ID
+            from molecule_runtime.platform_auth import auth_headers
+        except Exception:
+            return
+        try:
+            summary = (
+                f"♻️ Auto-heal: MCP server '{server}' was not ready "
+                f"(status={status}) — reset session and retried with a "
+                "readiness gate so its tools are live."
+            )
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.post(
+                    f"{PLATFORM_URL}/workspaces/{WORKSPACE_ID}/activity",
+                    json={
+                        "activity_type": "agent_log",
+                        "source_id": WORKSPACE_ID,
+                        "target_id": WORKSPACE_ID,
+                        "summary": summary[:300],
+                        "status": "warning",
+                        "method": "stuck_mcp_autoheal",
+                    },
+                    headers=auth_headers(),
+                )
+        except Exception:
+            return
+
     async def _execute_locked(self, user_input: str) -> str:
         """Body of execute() that runs under the run lock.
 
@@ -1112,6 +1496,16 @@ class ClaudeSDKExecutor(AgentExecutor):
             # the window, which a reset cannot fix. Surface a hard error
             # instead of looping the reset forever.
             overflow_healed = False
+            # Bound the stuck-MCP auto-heal to `_MCP_HEAL_MAX_RETRIES` resets
+            # per dispatch. Each _McpNotReadyError resets the session and
+            # retries on a fresh subprocess (an independent MCP-connect
+            # attempt), so an INTERMITTENT connect failure usually clears on
+            # the next try; only after exhausting the retries do we treat the
+            # server as genuinely broken and surface a hard error. (Unlike the
+            # overflow heal, where one reset is definitive, MCP connects are
+            # probabilistic under load, so a couple of fresh attempts is the
+            # right bound.)
+            mcp_heals = 0
             for attempt in range(_MAX_RETRIES):
                 options = self._build_options()
                 try:
@@ -1169,6 +1563,49 @@ class ClaudeSDKExecutor(AgentExecutor):
                         # No backoff: the fresh session is independent of
                         # any upstream rate state; retry immediately.
                         continue
+
+                    # --- Stuck-MCP auto-heal (the concierge "lost its
+                    # platform tools" bug) ---
+                    # The readiness-gated query path raises _McpNotReadyError
+                    # when a config-declared MCP server (e.g. `platform`) never
+                    # reached `connected` within the bounded poll window — its
+                    # tools would be hidden from the LLM. Heal in-band: reset
+                    # the session and retry ONCE (the retry re-runs the gate,
+                    # which gives the slow `node` handshake another, full poll
+                    # window from a clean subprocess). Bounded by `mcp_healed`:
+                    # a second not-ready after a reset means the server is
+                    # genuinely broken, not just slow → fall through to the
+                    # terminal error path. Loud + observable, NOT a wedge.
+                    if isinstance(exc, _McpNotReadyError) and mcp_heals < _MCP_HEAL_MAX_RETRIES:
+                        mcp_heals += 1
+                        logger.error(
+                            "auto-heal: MCP server %r not ready (status=%s) "
+                            "[claude-code] (heal %d/%d) — resetting session "
+                            "+ retrying on a fresh subprocess with the "
+                            "readiness gate",
+                            exc.server, exc.status, mcp_heals,
+                            _MCP_HEAL_MAX_RETRIES,
+                        )
+                        self._reset_session_for_stuck_mcp()
+                        await self._notify_stuck_mcp_heal(exc.server, exc.status)
+                        # No backoff: the retry's readiness gate handles the
+                        # wait; retry immediately.
+                        continue
+                    if isinstance(exc, _McpNotReadyError):
+                        # Exhausted the heal retries: every fresh subprocess
+                        # failed to connect the server. It's broken, not just
+                        # slow — hard, loud, operator-actionable error. Do NOT
+                        # fall into the transient-retry branch.
+                        logger.error(
+                            "stuck-MCP auto-heal exhausted [claude-code]: MCP "
+                            "server %r still not ready (status=%s) after %d "
+                            "fresh-session attempts — the server is failing to "
+                            "connect, not merely slow; check the MCP server "
+                            "command/env",
+                            exc.server, exc.status, _MCP_HEAL_MAX_RETRIES + 1,
+                        )
+                        response_text = sanitize_agent_error(exc)
+                        break
 
                     # A context overflow that survives a heal (overflow_healed
                     # already True) must go straight to the terminal error
