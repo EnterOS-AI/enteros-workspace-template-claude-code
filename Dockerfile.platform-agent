@@ -52,11 +52,12 @@ RUN set -eux; \
 
 # Self-contain the adapter import path. The runtime boots via its console-script
 # entrypoint, which does NOT put the working dir on sys.path — so the adapter
-# module at WORKDIR /app is unimportable unless /app is on PYTHONPATH.
-# Ordinary workspace images get this from the platform's container environment;
-# THIS image is launched by a different runner that does not inject it, so the
-# dedicated platform-agent image must set PYTHONPATH itself, or the concierge
-# crash-loops on ModuleNotFoundError. Putting /app first also keeps the local
+# module at the image's working directory is unimportable unless the working
+# directory is on PYTHONPATH. Ordinary workspace images get this from the
+# platform's container environment; THIS image is launched by a different
+# runner that does not inject it, so the dedicated platform-agent image must
+# set PYTHONPATH itself, or the concierge crash-loops when the import fails.
+# Putting the working directory first on PYTHONPATH also keeps the local
 # modules ahead of any same-named modules under site-packages (see the base
 # Dockerfile's COPY notes).
 ENV PYTHONPATH=/app
