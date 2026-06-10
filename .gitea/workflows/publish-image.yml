@@ -405,7 +405,7 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI org-level platform agent (claude-code + org-management MCP)
 
-      - name: Smoke test — Node 20 + baked molecule-mcp + adapter importable
+      - name: Smoke test — Node 20 + baked molecule-mcp on PATH + adapter name + PYTHONPATH
         env:
           IMAGE: ${{ env.PA_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
         run: |
@@ -426,8 +426,8 @@ jobs:
             # runtime fails to start when the import fails. Assert it from a
             # fresh cwd so a regression is caught at build time.
             [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH does not match the expected runtime value (got: ${PYTHONPATH:-unset})"; exit 1; }
-            cd / && python3 -c "import adapter" || { echo "::error::adapter module import check failed"; exit 1; }
-            echo "platform-agent image smoke OK: node20 + molecule-mcp baked + adapter importable"
+            cd / && python3 -c "import adapter; assert adapter.Adapter.name() == '\''claude-code'\'', f'runtime={adapter.Adapter.name()}'" || { echo "::error::platform-agent image does not report claude-code adapter"; exit 1; }
+            echo "platform-agent image smoke OK: node20 + molecule-mcp + claude-code adapter + PYTHONPATH"
           '
 
       - name: Push image to ECR (post-smoke)
