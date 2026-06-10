@@ -134,3 +134,54 @@ def test_malformed_skipped_and_a2a_protected():
     assert out["platform"] == {"command": "node", "args": []}
     assert "no_command" not in out
     assert "no_name" not in out
+
+
+# ---- /configs/mcp_servers.yaml overlay fragment (core#2522) ----
+#
+# The provisioner ships the concierge's platform-MCP declaration as a
+# standalone fragment because the SaaS restart-provision path cannot resolve
+# a base config.yaml to append onto. The executor must read it with the same
+# defensive posture as config.yaml: absent → {}, malformed → {}.
+
+
+def _executor_with_config_path(mod, tmp_path):
+    ex = object.__new__(mod.ClaudeSDKExecutor)
+    ex.config_path = str(tmp_path)
+    return ex
+
+
+def test_load_mcp_fragment_reads_fragment(tmp_path):
+    mod = _load_executor()
+    (tmp_path / "mcp_servers.yaml").write_text(
+        "mcp_servers:\n  - name: platform\n    command: molecule-mcp\n    env:\n      MOLECULE_MCP_MODE: management\n"
+    )
+    ex = _executor_with_config_path(mod, tmp_path)
+    frag = ex._load_mcp_fragment()
+    assert frag["mcp_servers"][0]["name"] == "platform"
+    merged = mod._apply_extra_mcp_servers(_base(), frag)
+    assert merged["platform"]["command"] == "molecule-mcp"
+    assert merged["platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
+    assert "a2a" in merged  # built-in never displaced
+
+
+def test_load_mcp_fragment_absent_is_empty(tmp_path):
+    mod = _load_executor()
+    ex = _executor_with_config_path(mod, tmp_path)
+    assert ex._load_mcp_fragment() == {}
+
+
+def test_load_mcp_fragment_malformed_is_empty(tmp_path):
+    mod = _load_executor()
+    (tmp_path / "mcp_servers.yaml").write_text(": not [ yaml ::")
+    ex = _executor_with_config_path(mod, tmp_path)
+    assert ex._load_mcp_fragment() == {}
+
+
+def test_fragment_wins_over_config_yaml_same_name():
+    """Applied after config.yaml, a same-name fragment entry overrides it —
+    the platform-authored declaration is authoritative."""
+    mod = _load_executor()
+    base = _base()
+    mod._apply_extra_mcp_servers(base, {"mcp_servers": [{"name": "platform", "command": "stale-path"}]})
+    mod._apply_extra_mcp_servers(base, {"mcp_servers": [{"name": "platform", "command": "molecule-mcp"}]})
+    assert base["platform"]["command"] == "molecule-mcp"

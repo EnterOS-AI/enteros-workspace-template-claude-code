@@ -20,7 +20,7 @@ ARG BASE_IMAGE=153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspac
 FROM ${BASE_IMAGE}
 
 # Version of @molecule-ai/mcp-server to bake (pin for reproducible builds).
-ARG MCP_VERSION=1.4.1
+ARG MCP_VERSION=1.5.0
 
 USER root
 
