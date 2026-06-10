@@ -412,7 +412,14 @@ jobs:
           set -eu
           docker run --rm --entrypoint sh "${IMAGE}" -c '
             node --version | grep -E "^v20\." || { echo "::error::node is not v20"; exit 1; }
-            command -v molecule-mcp >/dev/null || { echo "::error::molecule-mcp not on PATH"; exit 1; }
+            command -v molecule-platform-mcp >/dev/null || { echo "::error::molecule-platform-mcp not on PATH"; exit 1; }
+            # The symlink must resolve to the npm package, NOT the runtime
+            # wheel'"'"'s Python a2a bridge (the molecule-mcp PATH collision,
+            # pilot RCA 2026-06-10) — and management mode must serve the
+            # org-admin registry (serverInfo molecule-platform), proving the
+            # baked version postdates the registry split.
+            SERVER_NAME=$(printf "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"smoke\",\"version\":\"0\"}}}\n" | MOLECULE_MCP_MODE=management timeout 15 molecule-platform-mcp 2>/dev/null | head -1 | grep -o "\"name\": *\"[a-z-]*\"" | head -1) || true
+            echo "$SERVER_NAME" | grep -q "molecule-platform" || { echo "::error::management mode did not serve the org-admin registry (got: $SERVER_NAME)"; exit 1; }
             # The runtime boots via its console-script entrypoint, which does
             # not add the CWD to sys.path. This image is run by a runner that
             # does not inject PYTHONPATH, so the image must self-set it or the
