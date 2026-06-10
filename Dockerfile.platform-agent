@@ -42,13 +42,20 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # Install the org-management MCP globally from the org Gitea npm registry
-# (anonymous read — no auth). Exposes the `molecule-mcp` bin on PATH, which the
-# platform agent's config.yaml references as
-# `mcp_servers: [{name: platform, command: molecule-mcp}]`.
+# (anonymous read — no auth). The package's OWN bin name (molecule-mcp)
+# COLLIDES with the runtime wheel's Python a2a inbox bridge at
+# /usr/local/bin/molecule-mcp, which wins on PATH — so the concierge config
+# references the UNAMBIGUOUS `molecule-platform-mcp` symlink instead:
+# `mcp_servers: [{name: platform, command: molecule-platform-mcp,
+#                 env: {MOLECULE_MCP_MODE: management}}]`
+# (core: conciergeMCPServersBlock). The symlink targets the package entry
+# directly so it cannot be shadowed by any future bin-name squatter.
 RUN set -eux; \
     printf '@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n' > /etc/npmrc; \
     npm install -g --userconfig /etc/npmrc "@molecule-ai/mcp-server@${MCP_VERSION}"; \
-    command -v molecule-mcp
+    chmod +x /usr/lib/node_modules/@molecule-ai/mcp-server/dist/index.js; \
+    ln -sf /usr/lib/node_modules/@molecule-ai/mcp-server/dist/index.js /usr/local/bin/molecule-platform-mcp; \
+    command -v molecule-platform-mcp
 
 # Self-contain the adapter-module import path. The runtime boots via its console-script
 # entrypoint, which does NOT put the working dir on sys.path — so the adapter
