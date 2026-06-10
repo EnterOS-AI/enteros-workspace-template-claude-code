@@ -673,6 +673,19 @@ class ClaudeSDKExecutor(AgentExecutor):
             return prompt
         return f"[Prior context from memory]\n{memories}\n\n{prompt}"
 
+    def _load_mcp_fragment(self) -> dict:
+        """Read the standalone mcp_servers.yaml overlay fragment, if present.
+
+        Same defensive posture as _load_config_dict: any I/O or parse error
+        returns {} so a malformed fragment can never crash the executor.
+        """
+        try:
+            fragment_file = os.path.join(self.config_path, "mcp_servers.yaml")
+            with open(fragment_file) as f:
+                return yaml.safe_load(f) or {}
+        except Exception:
+            return {}
+
     def _load_config_dict(self) -> dict:
         """Read config.yaml as a raw dict for field-level inspection.
 
@@ -837,6 +850,14 @@ class ClaudeSDKExecutor(AgentExecutor):
         # Merge any config-declared MCP servers (e.g. the platform-management
         # MCP for the org-level platform agent). No-op for ordinary workspaces.
         _apply_extra_mcp_servers(mcp_servers, self._load_config_dict())
+        # Overlay fragment (core#2522): the provisioner ships the concierge's
+        # platform-MCP declaration as a standalone /configs/mcp_servers.yaml,
+        # because on the SaaS restart-provision path no base config.yaml is
+        # resolvable to append onto (the pilot's TOOLS-FAIL RCA, 2026-06-10).
+        # Applied AFTER config.yaml so the platform-authored fragment wins on
+        # a same-name entry. Absent file -> {} -> no-op for every ordinary
+        # workspace.
+        _apply_extra_mcp_servers(mcp_servers, self._load_mcp_fragment())
 
         create_kwargs: dict = dict(
             model=self.model,
