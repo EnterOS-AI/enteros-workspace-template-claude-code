@@ -426,7 +426,7 @@ jobs:
             # runtime fails to start when the import fails. Assert it from a
             # fresh cwd so a regression is caught at build time.
             [ "${PYTHONPATH:-}" = "/app" ] || { echo "::error::PYTHONPATH does not match the expected runtime value (got: ${PYTHONPATH:-unset})"; exit 1; }
-            cd / && python3 -c "import adapter; assert adapter.Adapter.name() == '\''claude-code'\'', f'runtime={adapter.Adapter.name()}'" || { echo "::error::platform-agent image does not report claude-code adapter"; exit 1; }
+            cd / && python3 -c "import adapter; assert adapter.Adapter.name() == '\''claude-code'\'', adapter.Adapter.name()" || { echo "::error::platform-agent image does not report claude-code adapter"; exit 1; }
             echo "platform-agent image smoke OK: node20 + molecule-mcp + claude-code adapter + PYTHONPATH"
           '
 
