@@ -514,3 +514,34 @@ def test_context_window_env_does_not_clobber_operator_pin(tmp_path, monkeypatch)
     ex._maybe_set_context_window_env()
 
     assert os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == "500000"
+
+
+def test_context_window_env_falls_back_to_known_kimi_window(tmp_path, monkeypatch):
+    """The gap that wedged JRS: a proxy-routed Kimi agent with NO
+    MODEL_CONTEXT_WINDOW env and NO config context_window must still get
+    CLAUDE_CODE_MAX_CONTEXT_TOKENS pinned to Kimi's real 262144 via the
+    known-model fallback — so claude-code's native compaction fires correctly
+    and the session never overflows into the wipe-reset auto-heal."""
+    mod = _load_executor()
+    monkeypatch.delenv("CLAUDE_CODE_MAX_CONTEXT_TOKENS", raising=False)
+    monkeypatch.delenv("MODEL_CONTEXT_WINDOW", raising=False)
+    (tmp_path / "config.yaml").write_text("name: test\n")  # no context_window
+
+    ex = _make_executor(mod, tmp_path, model="kimi-for-coding")
+    ex._maybe_set_context_window_env()
+
+    assert os.environ.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == "262144"
+
+
+def test_known_model_context_window_lookup():
+    """Pure lookup: kimi/moonshot variants resolve; Anthropic + unknown
+    return None (so claude-code's own resolver stays in place — no regression)."""
+    mod = _load_executor()
+    f = mod._known_model_context_window
+    assert f("kimi-for-coding") == 262144
+    assert f("moonshot/kimi-k2.6") == 262144
+    assert f("kimi-k2.6") == 262144
+    assert f("anthropic/claude-opus-4-8") is None
+    assert f("sonnet") is None
+    assert f(None) is None
+    assert f("") is None
