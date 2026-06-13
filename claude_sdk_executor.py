@@ -51,6 +51,7 @@ from molecule_runtime.executor_helpers import (
     brief_summary,
     collect_outbound_files,
     commit_memory,
+    error_detail_for_external,
     extract_attached_files,
     extract_message_text,
     get_a2a_instructions,
@@ -1723,7 +1724,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                             "command/env",
                             exc.server, exc.status, _MCP_HEAL_MAX_RETRIES + 1,
                         )
-                        response_text = sanitize_agent_error(exc)
+                        response_text = sanitize_agent_error(
+                            exc=exc, stderr=error_detail_for_external(exc)
+                        )
                         break
 
                     # A context overflow that survives a heal (overflow_healed
@@ -1785,7 +1788,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                                 f"claude_agent_sdk wedge: {formatted[:200]} — restart workspace to recover"
                             )
                             break
-                    response_text = sanitize_agent_error(exc)
+                    response_text = sanitize_agent_error(
+                        exc=exc, stderr=error_detail_for_external(exc)
+                    )
                     break
         finally:
             await set_current_task(self.heartbeat, "")
