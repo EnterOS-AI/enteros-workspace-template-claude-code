@@ -51,6 +51,7 @@ from molecule_runtime.executor_helpers import (
     brief_summary,
     collect_outbound_files,
     commit_memory,
+    error_detail_for_external,
     extract_attached_files,
     extract_message_text,
     get_a2a_instructions,
@@ -600,6 +601,63 @@ class _ResultError(Exception):
         super().__init__(self.text)
 
 
+def _result_error_detail(
+    result_text,
+    subtype=None,
+    api_error_status=None,
+    errors=None,
+):
+    """Build the text carried by a `_ResultError`.
+
+    When the SDK ResultMessage actually carried a `result` string (the
+    common context-overflow case -- `token limit ... requested ...`), use
+    it verbatim so the existing overflow classifier keeps matching.
+
+    When `result` is EMPTY (the opaque agents-team-engine case: the SDK
+    yields `is_error=True` with `result=None`), synthesize a concise,
+    NON-SECRET detail from the diagnostic fields the ResultMessage DID
+    carry -- `subtype` (e.g. "error_during_execution", "error_max_turns")
+    and `api_error_status` (the upstream HTTP status, e.g. 401/429/404/500;
+    the SDK documents this field as "Safe to log -- no message content").
+    A short summary of `errors[]` is appended when present. This turns the
+    previously opaque `_ResultError("")` -- which rendered as the useless
+    "Agent error (_ResultError) -- see workspace logs for details" -- into
+    a self-diagnosing string like
+    `error_during_execution (api_error_status=401)`.
+
+    Safety: subtype + status code are categorical/non-secret. Any
+    `errors[]` text still flows through the runtime `sanitize_agent_error`,
+    which truncates to ~1KB and scrubs token/key-shaped substrings before
+    the string reaches the A2A response -- so this never leaks credentials
+    or request bodies. We additionally cap the errors summary here so a
+    pathological list can't dominate the message.
+    """
+    text = (result_text or "").strip()
+    if text:
+        return text
+    parts = []
+    if subtype:
+        parts.append(str(subtype))
+    if api_error_status is not None:
+        parts.append("(api_error_status=%s)" % api_error_status)
+    if errors:
+        try:
+            summary = "; ".join(str(e) for e in errors if e)
+        except Exception:
+            summary = ""
+        summary = summary.strip()
+        if summary:
+            # Cap so a long errors list can't bloat the message; the
+            # runtime sanitizer is the authoritative token/length scrubber.
+            if len(summary) > 300:
+                summary = summary[:300] + "…"
+            parts.append("errors: " + summary)
+    detail = " ".join(parts).strip()
+    # Last-resort: never return "" (that is exactly the opaque case we are
+    # fixing). A generic-but-honest marker still beats an empty string.
+    return detail or "engine error with no detail (is_error result, empty result/subtype)"
+
+
 @dataclass
 class QueryResult:
     """Outcome of a single `query()` stream.
@@ -947,6 +1005,12 @@ class ClaudeSDKExecutor(AgentExecutor):
             self.result_text: str | None = None
             self.session_id: str | None = None
             self.result_is_error: bool = False
+            # Diagnostic fields off the terminal ResultMessage, kept so an
+            # opaque is_error result (result=None) still yields a useful,
+            # non-secret _ResultError detail (subtype + upstream HTTP status).
+            self.result_subtype: str | None = None
+            self.result_api_error_status: int | None = None
+            self.result_errors: list | None = None
 
     async def _accumulate_message(self, message: Any, acc: "ClaudeSDKExecutor._StreamAccumulator") -> None:
         """Fold one SDK stream message into `acc`.
@@ -996,6 +1060,13 @@ class ClaudeSDKExecutor(AgentExecutor):
             # so the error path can re-raise it into the unified
             # classification.
             acc.result_is_error = bool(getattr(message, "is_error", False))
+            # Diagnostic fields the SDK ResultMessage carries on a terminal
+            # error (verified against claude-agent-sdk ResultMessage: .subtype,
+            # .api_error_status:int|None, .errors:list[str]|None). Captured so
+            # an opaque is_error result (result=None) still self-diagnoses.
+            acc.result_subtype = getattr(message, "subtype", None)
+            acc.result_api_error_status = getattr(message, "api_error_status", None)
+            acc.result_errors = getattr(message, "errors", None)
 
     @staticmethod
     def _mcp_servers_from_status(status: Any) -> list[dict]:
@@ -1092,7 +1163,12 @@ class ClaudeSDKExecutor(AgentExecutor):
                 # Mirror _run_query: prefer the captured is_error text over a
                 # trailing generic CLI exception so overflow detection works.
                 if acc.result_is_error:
-                    raise _ResultError(acc.result_text or "")
+                    raise _ResultError(_result_error_detail(
+                        acc.result_text,
+                        acc.result_subtype,
+                        acc.result_api_error_status,
+                        acc.result_errors,
+                    ))
                 raise
             finally:
                 self._active_stream = None
@@ -1105,7 +1181,12 @@ class ClaudeSDKExecutor(AgentExecutor):
             except Exception:
                 logger.debug("MCP-gated client disconnect raised (ignored)")
         if acc.result_is_error:
-            raise _ResultError(acc.result_text or "")
+            raise _ResultError(_result_error_detail(
+                acc.result_text,
+                acc.result_subtype,
+                acc.result_api_error_status,
+                acc.result_errors,
+            ))
         text = acc.result_text if acc.result_text is not None else "".join(acc.assistant_chunks)
         if acc.result_text is not None or acc.assistant_chunks:
             _clear_sdk_wedge_on_success()
@@ -1138,6 +1219,9 @@ class ClaudeSDKExecutor(AgentExecutor):
         result_text: str | None = None
         session_id: str | None = None
         result_is_error: bool = False
+        result_subtype: str | None = None
+        result_api_error_status: int | None = None
+        result_errors: list | None = None
         self._active_stream = sdk.query(prompt=prompt, options=options)
         try:
             try:
@@ -1182,6 +1266,11 @@ class ClaudeSDKExecutor(AgentExecutor):
                         # raised exception. Capture it so the error path below
                         # can re-raise it into the unified classification.
                         result_is_error = bool(getattr(message, "is_error", False))
+                        # Same diagnostic capture as the gated path so an
+                        # opaque is_error result (result=None) self-diagnoses.
+                        result_subtype = getattr(message, "subtype", None)
+                        result_api_error_status = getattr(message, "api_error_status", None)
+                        result_errors = getattr(message, "errors", None)
             except Exception:
                 # REAL-SDK SHAPE (claude CLI 2.1.163 / SDK 0.1.72): on a
                 # terminal error result the SDK yields the is_error=True
@@ -1201,7 +1290,12 @@ class ClaudeSDKExecutor(AgentExecutor):
                 # in `_execute_locked`. Any other stream exception (no
                 # is_error result captured) propagates unchanged.
                 if result_is_error:
-                    raise _ResultError(result_text or "")
+                    raise _ResultError(_result_error_detail(
+                        result_text,
+                        result_subtype,
+                        result_api_error_status,
+                        result_errors,
+                    ))
                 raise
         finally:
             self._active_stream = None
@@ -1217,7 +1311,12 @@ class ClaudeSDKExecutor(AgentExecutor):
         # and then completes the iterator cleanly (no trailing raise); the
         # except-branch above handles the real-SDK variant where it raises.
         if result_is_error:
-            raise _ResultError(result_text or "")
+            raise _ResultError(_result_error_detail(
+                result_text,
+                result_subtype,
+                result_api_error_status,
+                result_errors,
+            ))
         text = result_text if result_text is not None else "".join(assistant_chunks)
         # Auto-recover the wedge flag — if a previous query() left this
         # process in `_sdk_wedged` and THIS query just completed
@@ -1625,7 +1724,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                             "command/env",
                             exc.server, exc.status, _MCP_HEAL_MAX_RETRIES + 1,
                         )
-                        response_text = sanitize_agent_error(exc)
+                        response_text = sanitize_agent_error(
+                            exc=exc, stderr=error_detail_for_external(exc)
+                        )
                         break
 
                     # A context overflow that survives a heal (overflow_healed
@@ -1687,7 +1788,9 @@ class ClaudeSDKExecutor(AgentExecutor):
                                 f"claude_agent_sdk wedge: {formatted[:200]} — restart workspace to recover"
                             )
                             break
-                    response_text = sanitize_agent_error(exc)
+                    response_text = sanitize_agent_error(
+                        exc=exc, stderr=error_detail_for_external(exc)
+                    )
                     break
         finally:
             await set_current_task(self.heartbeat, "")

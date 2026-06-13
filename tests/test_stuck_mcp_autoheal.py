@@ -114,7 +114,8 @@ def _install_stubs() -> None:
         return ""
 
     _ensure_attr(helpers, "recall_memories", _recall)
-    _ensure_attr(helpers, "sanitize_agent_error", lambda e: f"Agent error: {e}")
+    _ensure_attr(helpers, "sanitize_agent_error", lambda exc=None, category=None, stderr=None: (f"Agent error ({type(exc).__name__}): {stderr}" if stderr else f"Agent error: {exc}"))
+    _ensure_attr(helpers, "error_detail_for_external", lambda exc: str(exc) or None)
     _ensure_attr(helpers, "set_current_task", _async_noop)
 
 
