@@ -399,6 +399,36 @@ _CONTEXT_OVERFLOW_PATTERNS = (
 )
 
 
+# Known context windows for proxy-routed (non-Anthropic) models that
+# claude-code's own resolver doesn't know (it falls back to 200k for these).
+# Keyed by a substring of the resolved model id (matched case-insensitively,
+# longest key first so e.g. "kimi-k2.6" can override a generic "kimi"). Values
+# are the model's REAL token window. Used ONLY as the last fallback in
+# _maybe_set_context_window_env (env + config.yaml take precedence). Adding an
+# entry requires confidence in the value — too high re-introduces the overflow
+# wedge, too low wastes context. SSOT: centralize via config.yaml/provisioner
+# (runtime#133). Confirmed: Kimi K2 = 262144 (the JRS incident model; reported
+# `token limit 262144`).
+_KNOWN_PROXY_MODEL_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("kimi", 262144),          # Moonshot Kimi K2 family — 256K
+    ("moonshot", 262144),      # provider-prefixed form (moonshot/kimi-*)
+)
+
+
+def _known_model_context_window(model: str | None) -> int | None:
+    """Best-effort context window for a proxy-routed model id, or None when
+    unknown (leaving claude-code's default resolver in place — no regression
+    for Anthropic models)."""
+    low = (model or "").lower()
+    if not low:
+        return None
+    # longest key first for specificity
+    for key, window in sorted(_KNOWN_PROXY_MODEL_CONTEXT_WINDOWS, key=lambda kv: -len(kv[0])):
+        if key in low:
+            return window
+    return None
+
+
 def _is_context_overflow(text: str) -> bool:
     """True if `text` looks like a context-window overflow (vs. a generic
     rate-limit or subprocess crash). Case-insensitive substring match
@@ -817,6 +847,21 @@ class ClaudeSDKExecutor(AgentExecutor):
         raw = os.environ.get("MODEL_CONTEXT_WINDOW")
         if not raw:
             raw = self._load_config_dict().get("context_window")
+        if raw in (None, ""):
+            # 3rd source (the gap that wedged JRS): proxy-routed models
+            # (Kimi/MiniMax/GLM/DeepSeek) are NOT in claude-code's window
+            # resolver AND usually have no MODEL_CONTEXT_WINDOW/config set, so
+            # without this the env stays unset → claude-code uses its 200k
+            # fallback → auto-compact fires against the wrong number → the
+            # session overflows the model's REAL window (Kimi hit 262191 >
+            # 262144) → the wipe-reset auto-heal loses all task memory. Map
+            # the known proxy models to their true window so claude-code's
+            # NATIVE compaction (which summarizes, NOT wipes) triggers
+            # correctly and the overflow never happens. Substring match on the
+            # resolved model id. SSOT note: ideally the provisioner sets
+            # `context_window` in config.yaml per model (the 2nd source above);
+            # this map is the safety net until that lands (tracked: runtime#133).
+            raw = _known_model_context_window(self.model)
         if raw in (None, ""):
             return
         try:
