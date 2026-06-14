@@ -545,3 +545,68 @@ def test_known_model_context_window_lookup():
     assert f("sonnet") is None
     assert f(None) is None
     assert f("") is None
+
+
+@pytest.mark.asyncio
+async def test_overflow_heal_reinjects_memory_into_fresh_session(tmp_path):
+    """Regression: 'agent forgets everything (even things I asked it to
+    remember) after an overflow auto-heal'.
+
+    Memory is injected only at the TOP of a dispatch, and only when no session
+    exists (`_inject_memories_if_first_turn`). A mid-conversation overflow
+    resets the session and retries on a FRESH (empty) session — so without an
+    explicit re-inject, that retry runs amnesiac: the durable recall snapshot
+    (persona, account, 'remember X' facts) is dropped. This pins that the heal
+    re-injects the recalled memory into the post-reset retry prompt.
+    """
+    mod = _load_executor()
+    sdk = sys.modules["claude_agent_sdk"]
+    ex = _make_executor(mod, tmp_path)
+    ex._session_id = "sess-bloated"  # mid-conversation → first inject is skipped
+
+    MEMORY = "PERSONA: commit as jerry@jrsautocustoms.com / Jerry655-p"
+
+    async def _recall(*_a, **_kw):
+        return MEMORY
+
+    # Override the name `_inject_memories_if_first_turn` actually calls.
+    mod.recall_memories = _recall
+
+    seen_prompts: list[str] = []
+    calls = {"n": 0}
+
+    def query(*_args, prompt=None, **_kwargs):
+        seen_prompts.append(prompt or "")
+        idx = calls["n"]
+        calls["n"] += 1
+        if idx == 0:
+            msgs = [sdk.ResultMessage(
+                result="token limit 262144 requested 268132",
+                is_error=True, session_id="sess-bloated",
+            )]
+        else:
+            msgs = [sdk.ResultMessage(
+                result="ok fresh", is_error=False, session_id="sess-fresh",
+            )]
+
+        async def _gen():
+            for m in msgs:
+                yield m
+        return _gen()
+
+    sdk.query = query
+
+    out = await ex._execute_locked("who am I supposed to commit as?")
+
+    assert out == "ok fresh"
+    assert len(seen_prompts) == 2, "expected original dispatch + one heal retry"
+    # Pre-reset prompt: mid-conversation, so memory was NOT injected (this is
+    # exactly the state that made the old code lose it).
+    assert MEMORY not in seen_prompts[0]
+    # THE FIX: the post-reset retry prompt MUST carry the recalled memory so
+    # the fresh session is not amnesiac.
+    assert MEMORY in seen_prompts[1], (
+        "durable memory was NOT re-injected into the fresh post-overflow "
+        "session — the agent would start amnesiac (the bug this fixes)"
+    )
+    assert "[Prior context from memory]" in seen_prompts[1]
