@@ -1725,6 +1725,24 @@ class ClaudeSDKExecutor(AgentExecutor):
                         )
                         self._reset_session_for_context_overflow()
                         await self._notify_context_overflow_heal(formatted)
+                        # RE-INJECT durable memory into the fresh session.
+                        # `prompt` was built at the top of this dispatch when a
+                        # session existed, so `_inject_memories_if_first_turn`
+                        # returned it WITHOUT the recalled memory snapshot. The
+                        # heal just reset `_session_id` to None, so the retry
+                        # runs on a brand-new session — without this re-inject it
+                        # starts amnesiac (the "agent forgets everything, even
+                        # things I asked it to remember, after an overflow reset"
+                        # bug: the durable commit_memory store is never re-fed
+                        # into the post-reset session). Rebuild the prompt from
+                        # the clean input so the fresh session gets the recalled
+                        # memory back. (System-prompt memory snapshot files —
+                        # MEMORY.md/CLAUDE.md — already ride along via `options`,
+                        # but the dynamic recall prefix does not; this restores
+                        # it.)
+                        prompt = await self._inject_memories_if_first_turn(
+                            self._prepare_prompt(original_input)
+                        )
                         # No backoff: the fresh session is independent of
                         # any upstream rate state; retry immediately.
                         continue
