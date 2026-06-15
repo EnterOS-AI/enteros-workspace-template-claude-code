@@ -24,10 +24,10 @@ ARG MCP_VERSION=1.6.1
 
 USER root
 
-# Pin Node 20. The debian-slim base apt-installs `nodejs` (Node 18); the org
-# MCP's @modelcontextprotocol/sdk requires >=20. Install Node 20 from NodeSource,
-# replacing the apt nodejs so `node` resolves to 20 for both claude-code and the
-# baked MCP.
+# Pin Node 20 — the workspace-template-claude-code base Dockerfile
+# apt-installs `nodejs` (Debian 12 / bookworm default), which is older than
+# what the baked MCP needs. Install Node 20 from NodeSource, replacing the
+# apt nodejs so `node` resolves to 20 for both claude-code and the baked MCP.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
