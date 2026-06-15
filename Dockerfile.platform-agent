@@ -73,5 +73,35 @@ ENV PYTHONPATH=/app
 # (and not an ordinary workspace image) before declaring the platform MCP.
 ENV MOLECULE_PLATFORM_AGENT_IMAGE_BAKED=1
 
+# ────────────────────────────────────────────────────────────────────
+# #2919 risk-1+2: per-file /opt→/configs reconcile (core#2919 R1).
+#
+# The base image's entrypoint runs /entrypoint.sh (drop-priv, chown,
+# gosu agent, exec molecule-runtime). On the platform-agent image we
+# need an EXTRA step BEFORE the base entrypoint: copy the image-baked
+# /opt/molecule-platform-agent-template/<file> → /configs/<file>
+# PER-FILE for any file NOT already delivered to /configs. This is
+# the concierge self-host / no-token / partial-fetch safety path:
+#   - /configs is empty (no asset-fetcher delivery) → fill from /opt
+#   - /configs has a partial delivery (e.g. only mcp_servers.yaml)
+#     → fill the missing config.yaml + prompts/concierge.md from /opt
+#   - /configs has a full delivery → wrapper is a no-op (every
+#     [ ! -f "$DST/$rel" ] guard fails)
+#
+# Augment-vs-strip proof: every copy is guarded by [ ! -f "$DST/$rel" ],
+# so a delivered file is NEVER overwritten. A partial template
+# delivery CANNOT strip the baked identity — the missing file is
+# FILLED, the present file is LEFT ALONE. Researcher RC 12052
+# finding (concierge boots with right model but empty system prompt
+# without this reconcile) closed.
+#
+# This wrapper is image-scoped (only the platform-agent image installs
+# it) so the ordinary claude-code boot path is untouched. See
+# scripts/platform-agent-entrypoint.sh for the full contract.
+# ────────────────────────────────────────────────────────────────────
+COPY scripts/platform-agent-entrypoint.sh /platform-agent-entrypoint.sh
+RUN chmod +x /platform-agent-entrypoint.sh
+ENTRYPOINT ["/platform-agent-entrypoint.sh"]
+
 # Return to the agent uid the base image runs as.
 USER agent
