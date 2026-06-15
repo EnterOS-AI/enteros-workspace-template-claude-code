@@ -162,6 +162,18 @@ RUN chmod +x /app/scripts/molecule-git-token-helper.sh /app/scripts/molecule-gh-
 COPY scripts/molecule-askpass /usr/local/bin/molecule-askpass
 RUN chmod +x /usr/local/bin/molecule-askpass
 
+# Gitea credential-safety wrapper (#34).
+#   - setup-gitea-netrc.sh writes ~/.netrc from the platform-projected
+#     GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD env vars, mode 600, atomically.
+#   - gitea-curl is a structural argv-scan wrapper that forces curl to read
+#     credentials from ~/.netrc and rejects any inline -u/--user or
+#     Authorization header, keeping tokens out of process argv / activity logs.
+# Vendored from molecule-ci; the same pattern should propagate to the other
+# runtime templates (codex / hermes / openclaw) as a follow-up.
+COPY scripts/setup-gitea-netrc.sh /usr/local/bin/setup-gitea-netrc.sh
+COPY bin/gitea-curl /usr/local/bin/gitea-curl
+RUN chmod +x /usr/local/bin/setup-gitea-netrc.sh /usr/local/bin/gitea-curl
+
 # Drop-priv entrypoint — claude-code refuses --dangerously-skip-permissions
 # as root, so we run molecule-runtime as the agent user (uid 1000).
 # The script handles volume-ownership fix + session-dir symlink before

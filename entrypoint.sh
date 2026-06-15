@@ -293,6 +293,15 @@ fi
 
 # Now running as agent (uid 1000)
 
+# Safe Gitea API credential setup (#34).
+# The platform projects GIT_HTTP_USERNAME / GIT_HTTP_PASSWORD into the
+# container. Write them to ~/.netrc (mode 600, atomically) so that subsequent
+# `gitea-curl` / `curl --netrc` calls authenticate without leaking the token
+# onto the command line. Idempotent: re-running just rewrites the file.
+if [ -x /usr/local/bin/setup-gitea-netrc.sh ]; then
+    /usr/local/bin/setup-gitea-netrc.sh
+fi
+
 # Optional background token refresh daemon for GitHub mirror credentials.
 if [ "${ENABLE_GITHUB_MIRROR_CREDENTIALS:-false}" = "true" ] && [ -x /app/scripts/molecule-gh-token-refresh.sh ]; then
     nohup bash -c '
