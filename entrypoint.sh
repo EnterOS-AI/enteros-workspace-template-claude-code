@@ -210,6 +210,79 @@ if [ "$(id -u)" = "0" ]; then
     # Layer-3 conformance gate asserts owner_uid==1000 on the running
     # container alongside the host-root-reach assertion.
     chown -R agent:agent /configs 2>/dev/null
+
+    # RFC#2843 #32: install the workspace's DECLARED plugins (the DB desired-set,
+    # passed as MOLECULE_DECLARED_PLUGINS — comma-separated gitea:// sources)
+    # into /configs/plugins BEFORE dropping to agent + exec'ing the runtime.
+    #
+    # WHY HERE (not provisioning user-data): agent-skills are plugins, installed
+    # dynamically — but a SaaS "restart" is a full ephemeral re-provision (fresh
+    # instance + disk), so a plugin pushed post-online lived only on the
+    # destroyed instance and vanished on every restart (root-caused 2026-06-17
+    # from live box logs). /configs is re-rendered every boot; bringing plugins
+    # onto the same every-boot model — installed in-container before serving —
+    # makes skills survive the restart, loop-free (present before the agent
+    # starts, so no online->install->restart cycle). The box fetches each source
+    # itself via the read-only PAT already in this container's env; only the
+    # small source LIST rides the provision env (MOLECULE_DECLARED_PLUGINS),
+    # never the skill content — so it never hits the user-data 16 KiB cap.
+    # Fail-soft: a fetch/extract failure logs and continues; never blocks boot.
+    if [ -n "${MOLECULE_DECLARED_PLUGINS:-}" ]; then
+        _plg_base="${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}"
+        _plg_base="${_plg_base%/}"
+        rm -rf /configs/plugins 2>/dev/null
+        mkdir -p /configs/plugins
+        _plg_old_ifs="$IFS"
+        IFS=','
+        for _plg_src in $MOLECULE_DECLARED_PLUGINS; do
+            IFS="$_plg_old_ifs"
+            _plg_src="$(printf '%s' "$_plg_src" | tr -d '[:space:]')"
+            if [ -z "$_plg_src" ]; then IFS=','; continue; fi
+            case "$_plg_src" in
+                gitea://*) : ;;
+                *) echo "[plugins] skip unsupported source: $_plg_src"; IFS=','; continue ;;
+            esac
+            _plg_spec="${_plg_src#gitea://}"
+            _plg_ref="main"
+            case "$_plg_spec" in *"#"*) _plg_ref="${_plg_spec##*#}"; _plg_spec="${_plg_spec%%#*}" ;; esac
+            _plg_owner="${_plg_spec%%/*}"
+            _plg_rest="${_plg_spec#*/}"
+            _plg_repo="${_plg_rest%%/*}"
+            _plg_sub="${_plg_rest#*/}"
+            [ "$_plg_sub" = "$_plg_rest" ] && _plg_sub=""
+            if [ -n "$_plg_sub" ]; then _plg_name="${_plg_sub##*/}"; else _plg_name="$_plg_repo"; fi
+            if [ -z "$_plg_owner" ] || [ -z "$_plg_repo" ] || [ -z "$_plg_name" ]; then
+                echo "[plugins] bad source: $_plg_src"; IFS=','; continue
+            fi
+            _plg_td="$(mktemp -d)"
+            _plg_url="${_plg_base}/api/v1/repos/${_plg_owner}/${_plg_repo}/archive/${_plg_ref}.tar.gz"
+            if [ -n "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ]; then
+                curl -fsSL --retry 3 --max-time 120 -H "Authorization: token ${MOLECULE_TEMPLATE_REPO_TOKEN}" "$_plg_url" -o "$_plg_td/a.tgz"
+            else
+                curl -fsSL --retry 3 --max-time 120 "$_plg_url" -o "$_plg_td/a.tgz"
+            fi
+            if [ -s "$_plg_td/a.tgz" ] && tar -xzf "$_plg_td/a.tgz" -C "$_plg_td" 2>/dev/null; then
+                _plg_top="$(find "$_plg_td" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+                _plg_dir="$_plg_top"
+                [ -n "$_plg_sub" ] && _plg_dir="$_plg_top/$_plg_sub"
+                if [ -d "$_plg_dir" ]; then
+                    mkdir -p "/configs/plugins/$_plg_name"
+                    cp -a "$_plg_dir/." "/configs/plugins/$_plg_name/" 2>/dev/null \
+                        && echo "[plugins] installed $_plg_name <- $_plg_src" \
+                        || echo "[plugins] copy failed: $_plg_src"
+                else
+                    echo "[plugins] subpath not in archive: $_plg_sub ($_plg_src)"
+                fi
+            else
+                echo "[plugins] fetch/extract failed: $_plg_src"
+            fi
+            rm -rf "$_plg_td"
+            IFS=','
+        done
+        IFS="$_plg_old_ifs"
+        chown -R agent:agent /configs/plugins 2>/dev/null || true
+    fi
+
     # /workspace handling — only chown when the contents are root-owned
     # (typical on Docker Desktop on Windows where host uid maps to 0).
     # On Linux Docker with matching uids the recursive chown is skipped
