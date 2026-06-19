@@ -1,0 +1,120 @@
+name: mcp-plugin-delivery-contract-drift
+
+# Cross-repo drift gate for the MCP-plugin delivery contract (core#3080).
+#
+# The contract file contracts/mcp-plugin-delivery.contract.json is the SSOT
+# shared between molecule-core (producer side) and this template repo
+# (consumer side). This workflow fetches core's copy via the Gitea raw
+# endpoint and byte-compares it against the template's local copy. RED if they
+# differ — the two repos must stay byte-identical so the drift gate and
+# runtime agree on the same contract.
+#
+# ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT in
+# branch protection (soak-then-promote; mirrors molecule-core's
+# mcp-plugin-delivery-contract-drift.yml).
+#
+# AUTH: uses AUTO_SYNC_TOKEN (the existing cross-repo read token). If the
+# secret is absent on a trusted context the job fails closed; on untrusted
+# fork PRs it soft-skips.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
+  schedule:
+    # Daily at :37 — catch a core-side contract change that landed without a
+    # paired template re-sync PR (off-zero to spread cron load).
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-plugin-delivery-contract-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-required: pending #3080 — soak-then-promote; standalone drift gate, not in branch protection yet.
+  compare:
+    name: Compare MCP plugin delivery contract against core canonical
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch core contract and byte-compare
+        env:
+          AUTO_SYNC_TOKEN: ${{ secrets.AUTO_SYNC_TOKEN }}
+          API_ROOT: ${{ github.server_url }}/api/v1
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            push|schedule|workflow_dispatch)
+              is_trusted=true
+              ;;
+            pull_request)
+              if [ "${{ github.event.pull_request.head.repo.fork }}" = "false" ]; then
+                is_trusted=true
+              else
+                is_trusted=false
+              fi
+              ;;
+            *)
+              is_trusted=true
+              ;;
+          esac
+          if [ -z "${AUTO_SYNC_TOKEN:-}" ]; then
+            if [ "$is_trusted" = "true" ]; then
+              echo "::error::AUTO_SYNC_TOKEN secret missing on trusted context (${{ github.event_name }}). Live cross-repo contract-drift detection cannot run."
+              exit 1
+            fi
+            echo "::warning::AUTO_SYNC_TOKEN secret missing on untrusted fork PR — skipping live cross-repo compare."
+            exit 0
+          fi
+          REF="${{ github.head_ref || github.ref_name }}"
+          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=${REF}"
+          set +e
+          curl -fsS \
+            -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
+            "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
+          curl_status=$?
+          set -e
+          if [ "$curl_status" -ne 0 ]; then
+            if [ "$curl_status" -eq 22 ]; then
+              echo "::warning::Canonical contract not found on core ref ${REF} (HTTP 404); falling back to main."
+              CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
+              set +e
+              curl -fsS \
+                -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
+                "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
+              curl_status=$?
+              set -e
+              if [ "$curl_status" -eq 22 ]; then
+                echo "::warning::Canonical contract not found on core main either (HTTP 404) — expected during bootstrap. Skipping drift check."
+                exit 0
+              fi
+              if [ "$curl_status" -ne 0 ]; then
+                echo "::error::Failed to fetch canonical contract from core main (exit $curl_status)."
+                exit 1
+              fi
+            else
+              echo "::error::Failed to fetch canonical contract (exit $curl_status)."
+              exit 1
+            fi
+          fi
+          LOCAL=contracts/mcp-plugin-delivery.contract.json
+          if diff -u /tmp/canonical-mcp-plugin-delivery.contract.json "$LOCAL"; then
+            echo "OK — template's contract is byte-identical to the core canonical."
+          else
+            echo "::error::template's mcp-plugin-delivery.contract.json DRIFTED from the core canonical."
+            echo "Re-sync: copy molecule-core contracts/mcp-plugin-delivery.contract.json verbatim over $LOCAL."
+            exit 1
+          fi
