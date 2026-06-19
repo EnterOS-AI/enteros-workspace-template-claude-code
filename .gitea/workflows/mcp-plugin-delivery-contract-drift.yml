@@ -79,7 +79,8 @@ jobs:
             echo "::warning::AUTO_SYNC_TOKEN secret missing on untrusted fork PR — skipping live cross-repo compare."
             exit 0
           fi
-          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
+          REF="${{ github.head_ref || github.ref_name }}"
+          CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=${REF}"
           set +e
           curl -fsS \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
@@ -88,11 +89,26 @@ jobs:
           set -e
           if [ "$curl_status" -ne 0 ]; then
             if [ "$curl_status" -eq 22 ]; then
-              echo "::warning::Canonical contract not found on core main (HTTP 404) — expected during bootstrap. Skipping drift check."
-              exit 0
+              echo "::warning::Canonical contract not found on core ref ${REF} (HTTP 404); falling back to main."
+              CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
+              set +e
+              curl -fsS \
+                -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
+                "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
+              curl_status=$?
+              set -e
+              if [ "$curl_status" -eq 22 ]; then
+                echo "::warning::Canonical contract not found on core main either (HTTP 404) — expected during bootstrap. Skipping drift check."
+                exit 0
+              fi
+              if [ "$curl_status" -ne 0 ]; then
+                echo "::error::Failed to fetch canonical contract from core main (exit $curl_status)."
+                exit 1
+              fi
+            else
+              echo "::error::Failed to fetch canonical contract (exit $curl_status)."
+              exit 1
             fi
-            echo "::error::Failed to fetch canonical contract (exit $curl_status)."
-            exit 1
           fi
           LOCAL=contracts/mcp-plugin-delivery.contract.json
           if diff -u /tmp/canonical-mcp-plugin-delivery.contract.json "$LOCAL"; then
