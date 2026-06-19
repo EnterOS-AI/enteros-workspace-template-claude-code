@@ -42,10 +42,10 @@ name: CI
 #   - molecule-ai/molecule-core/.gitea/workflows/ci.yml — Gitea port style reference
 
 on:
+  push:
+    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches: [main, staging]
 
 # Defense-in-depth de-dup ONLY (the t4-conformance unique-name fix is the
 # actual fail-closed primitive against the shared-host-daemon race; see
