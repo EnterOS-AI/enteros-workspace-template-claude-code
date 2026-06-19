@@ -80,9 +80,20 @@ jobs:
             exit 0
           fi
           CANON_URL="${API_ROOT}/repos/molecule-ai/molecule-core/raw/contracts/mcp-plugin-delivery.contract.json?ref=main"
+          set +e
           curl -fsS \
             -H "Authorization: token ${AUTO_SYNC_TOKEN}" \
             "${CANON_URL}" -o /tmp/canonical-mcp-plugin-delivery.contract.json
+          curl_status=$?
+          set -e
+          if [ "$curl_status" -ne 0 ]; then
+            if [ "$curl_status" -eq 22 ]; then
+              echo "::warning::Canonical contract not found on core main (HTTP 404) — expected during bootstrap. Skipping drift check."
+              exit 0
+            fi
+            echo "::error::Failed to fetch canonical contract (exit $curl_status)."
+            exit 1
+          fi
           LOCAL=contracts/mcp-plugin-delivery.contract.json
           if diff -u /tmp/canonical-mcp-plugin-delivery.contract.json "$LOCAL"; then
             echo "OK — template's contract is byte-identical to the core canonical."
