@@ -9,6 +9,7 @@ malformed entries are skipped rather than crashing the executor.
 (RFC: molecule-core docs/design/rfc-platform-agent.md)
 """
 
+import json
 import os
 import sys
 import types
@@ -272,3 +273,47 @@ def test_declared_extra_mcp_names_includes_plugin_settings(tmp_path):
     names = ex._declared_extra_mcp_names()
     assert "molecule-platform" in names
     assert "a2a" not in names
+
+
+def test_load_settings_mcp_reads_contract_path(tmp_path):
+    """_load_settings_mcp reads the same settings_path/key pinned in the
+    cross-repo mcp-plugin-delivery.contract.json (core#3080)."""
+    mod = _load_executor()
+    contract_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "contracts",
+        "mcp-plugin-delivery.contract.json",
+    )
+    with open(contract_path) as f:
+        contract = json.load(f)
+
+    assert contract["settings_path"] == "/configs/.claude/settings.json"
+    assert contract["key"] == "mcpServers"
+
+    settings_root = tmp_path / "settings-root"
+    settings_root.mkdir()
+    claude_dir = settings_root / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(
+        '{"mcpServers": {"molecule-platform": {"command": "npx"}}}'
+    )
+
+    ex = object.__new__(mod.ClaudeSDKExecutor)
+    ex.config_path = str(settings_root)
+    settings = ex._load_settings_mcp()
+    assert settings == {"mcpServers": {"molecule-platform": {"command": "npx"}}}
+
+
+def test_mcp_plugin_delivery_contract_is_byte_identical_ssot():
+    """The contract file must exist and match the expected SSOT content so the
+    cross-repo drift gate has a stable canonical copy to compare."""
+    contract_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "contracts",
+        "mcp-plugin-delivery.contract.json",
+    )
+    with open(contract_path) as f:
+        contract = json.load(f)
+    assert contract["producer"] == "MCPServerAdaptor"
+    assert contract["consumer"] == "claude_sdk_executor._load_settings_mcp"
+    assert contract["entry_shape"] == "name->{command,args?,env?}"

@@ -1,0 +1,1 @@
+{"settings_path":"/configs/.claude/settings.json","key":"mcpServers","entry_shape":"name->{command,args?,env?}","producer":"MCPServerAdaptor","consumer":"claude_sdk_executor._load_settings_mcp"}
