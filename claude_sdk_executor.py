@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import json
 import logging
 import os
 import shutil
@@ -99,6 +100,42 @@ def _apply_extra_mcp_servers(mcp_servers: dict, config: dict) -> dict:
         server: dict = {"command": command, "args": entry.get("args") or []}
         if entry.get("env"):
             server["env"] = entry["env"]
+        mcp_servers[name] = server
+    return mcp_servers
+
+
+def _apply_settings_mcp_servers(mcp_servers: dict, settings: dict) -> dict:
+    """Merge plugin-delivered MCP servers from a Claude-Code ``settings.json``
+    ``mcpServers`` MAP into the base ``mcp_servers`` dict.
+
+    The platform-management MCP can also arrive as a PLUGIN (RFC#3045,
+    rfc-platform-mcp-as-plugin): the MCPServerAdaptor merges the plugin's
+    server into ``/configs/.claude/settings.json`` under ``mcpServers`` — the
+    Claude Code NATIVE shape, a ``name -> {command, args?, env?}`` MAP (distinct
+    from config.yaml's ``mcp_servers`` LIST). The executor launches the CLI with
+    ``--strict-mcp-config``, so the CLI ignores on-disk settings files entirely
+    and honors ONLY the servers passed in the SDK options here. Without folding
+    this map in, a plugin-delivered server (e.g. ``molecule-platform`` →
+    ``create_workspace``) is installed and written to settings.json but NEVER
+    loaded by the agent. (core#3079)
+
+    Same defensive posture as ``_apply_extra_mcp_servers``: non-dict specs,
+    entries missing ``command``, and any attempt to redefine the built-in
+    ``a2a`` server are skipped. Callers apply this AFTER the config.yaml + YAML
+    fragment merges, so a plugin server wins on a same-name entry.
+    """
+    servers = settings.get("mcpServers")
+    if not isinstance(servers, dict):
+        return mcp_servers
+    for name, spec in servers.items():
+        if not name or name == "a2a" or not isinstance(spec, dict):
+            continue
+        command = spec.get("command")
+        if not command:
+            continue
+        server: dict = {"command": command, "args": spec.get("args") or []}
+        if spec.get("env"):
+            server["env"] = spec["env"]
         mcp_servers[name] = server
     return mcp_servers
 _MAX_RETRIES = 3
@@ -774,6 +811,21 @@ class ClaudeSDKExecutor(AgentExecutor):
         except Exception:
             return {}
 
+    def _load_settings_mcp(self) -> dict:
+        """Read ``/configs/.claude/settings.json`` for its ``mcpServers`` map.
+
+        This is the file the plugin MCPServerAdaptor (RFC#3045) merges
+        plugin-delivered MCP servers into. Same defensive posture as
+        ``_load_config_dict``: any I/O or parse error returns ``{}`` so a
+        malformed settings file can never crash the executor. (core#3079)
+        """
+        try:
+            settings_file = os.path.join(self.config_path, ".claude", "settings.json")
+            with open(settings_file) as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
     def _load_config_dict(self) -> dict:
         """Read config.yaml as a raw dict for field-level inspection.
 
@@ -788,31 +840,29 @@ class ClaudeSDKExecutor(AgentExecutor):
             return {}
 
     def _declared_extra_mcp_names(self) -> list[str]:
-        """Names of config-declared MCP servers other than the built-in
-        ``a2a`` server.
+        """Names of declared MCP servers other than the built-in ``a2a`` server.
 
         These are the servers the readiness gate must wait for before the
         turn's prompt is sent — ``a2a`` is an in-process stdio MCP that the
         executor controls and that connects immediately, but extra servers
-        (the platform agent's ``platform`` / molecule-mcp-server) are slow
-        external ``node``/binary subprocesses whose handshake races the CLI's
-        init message. Empty for ordinary workspaces → the fast `query()` path
-        stays in effect.
+        (the platform agent's ``platform`` / molecule-mcp-server, or a
+        plugin-delivered ``molecule-platform`` npx server) are slow external
+        subprocesses whose handshake races the CLI's init message. Empty for
+        ordinary workspaces → the fast `query()` path stays in effect.
 
-        Filtering mirrors `_apply_extra_mcp_servers`: skip non-dict entries,
-        entries missing ``name``/``command``, and any attempt to redefine
-        ``a2a``.
+        Built by running the SAME merge helpers the options build uses across
+        ALL three delivery channels (config.yaml `mcp_servers`, the
+        /configs/mcp_servers.yaml fragment, and the plugin's
+        /configs/.claude/settings.json `mcpServers` — core#3079), so the gate
+        stays in lockstep with what is actually launched. Without the plugin
+        channel here, a plugin-delivered server would load but the turn could
+        start before its handshake completes.
         """
-        names: list[str] = []
-        for entry in self._load_config_dict().get("mcp_servers") or []:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name")
-            command = entry.get("command")
-            if not name or not command or name == "a2a":
-                continue
-            names.append(name)
-        return names
+        merged: dict = {"a2a": {}}
+        _apply_extra_mcp_servers(merged, self._load_config_dict())
+        _apply_extra_mcp_servers(merged, self._load_mcp_fragment())
+        _apply_settings_mcp_servers(merged, self._load_settings_mcp())
+        return [name for name in merged if name != "a2a"]
 
     def _maybe_set_context_window_env(self) -> None:
         """Tell claude-code the model's REAL context window (deeper fix).
@@ -961,6 +1011,13 @@ class ClaudeSDKExecutor(AgentExecutor):
         # a same-name entry. Absent file -> {} -> no-op for every ordinary
         # workspace.
         _apply_extra_mcp_servers(mcp_servers, self._load_mcp_fragment())
+        # Plugin channel (core#3079): when the platform-management MCP is
+        # delivered as a PLUGIN (RFC#3045), the MCPServerAdaptor writes it into
+        # /configs/.claude/settings.json `mcpServers`. The CLI runs with
+        # --strict-mcp-config and ignores that on-disk file, so fold those
+        # servers into the SDK options here or they never load. Applied LAST so
+        # a plugin-authored server is authoritative on a same-name entry.
+        _apply_settings_mcp_servers(mcp_servers, self._load_settings_mcp())
 
         create_kwargs: dict = dict(
             model=self.model,

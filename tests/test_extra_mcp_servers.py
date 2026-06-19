@@ -186,3 +186,89 @@ def test_fragment_wins_over_config_yaml_same_name():
     mod._apply_extra_mcp_servers(base, {"mcp_servers": [{"name": "platform", "command": "stale-path"}]})
     mod._apply_extra_mcp_servers(base, {"mcp_servers": [{"name": "platform", "command": "molecule-mcp"}]})
     assert base["platform"]["command"] == "molecule-mcp"
+
+
+# ---- plugin channel: /configs/.claude/settings.json `mcpServers` (core#3079) ----
+#
+# When the management MCP is delivered as a PLUGIN (RFC#3045), the MCPServerAdaptor
+# merges it into /configs/.claude/settings.json `mcpServers` — a name->spec MAP
+# (Claude Code native shape), NOT config.yaml's `mcp_servers` LIST. The CLI runs
+# with --strict-mcp-config and ignores on-disk settings, so the executor must fold
+# this map into the SDK options or the plugin server (create_workspace) never loads.
+
+
+def test_settings_mcp_servers_merged():
+    mod = _load_executor()
+    settings = {"mcpServers": {"molecule-platform": {
+        "command": "npx",
+        "args": ["-y", "@molecule-ai/mcp-server@1.6.1"],
+        "env": {"MOLECULE_MCP_MODE": "management"},
+    }}}
+    out = mod._apply_settings_mcp_servers(_base(), settings)
+    assert set(out.keys()) == {"a2a", "molecule-platform"}
+    assert out["molecule-platform"]["command"] == "npx"
+    assert out["molecule-platform"]["args"] == ["-y", "@molecule-ai/mcp-server@1.6.1"]
+    assert out["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
+
+
+def test_settings_mcp_servers_noop_and_a2a_protected():
+    mod = _load_executor()
+    assert list(mod._apply_settings_mcp_servers(_base(), {}).keys()) == ["a2a"]
+    assert list(mod._apply_settings_mcp_servers(_base(), {"mcpServers": None}).keys()) == ["a2a"]
+    # malformed specs skipped; a2a never overridden
+    settings = {"mcpServers": {
+        "ok": {"command": "node"},
+        "no_command": {"args": ["x"]},   # skipped: no command
+        "not_dict": "nope",              # skipped: not a dict
+        "a2a": {"command": "evil"},      # must NOT override built-in a2a
+    }}
+    out = mod._apply_settings_mcp_servers(_base(), settings)
+    assert out["a2a"]["args"] == ["/a2a"], "built-in a2a server must be protected"
+    assert out["ok"] == {"command": "node", "args": []}
+    assert "no_command" not in out
+    assert "not_dict" not in out
+
+
+def test_load_settings_mcp_reads_file(tmp_path):
+    mod = _load_executor()
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(
+        '{"mcpServers": {"molecule-platform": {"command": "npx", "args": ["-y", "@molecule-ai/mcp-server@1.6.1"], "env": {"MOLECULE_MCP_MODE": "management"}}}}'
+    )
+    ex = _executor_with_config_path(mod, tmp_path)
+    settings = ex._load_settings_mcp()
+    merged = mod._apply_settings_mcp_servers(_base(), settings)
+    assert merged["molecule-platform"]["command"] == "npx"
+    assert merged["molecule-platform"]["env"] == {"MOLECULE_MCP_MODE": "management"}
+    assert "a2a" in merged  # built-in never displaced
+
+
+def test_load_settings_mcp_absent_is_empty(tmp_path):
+    mod = _load_executor()
+    ex = _executor_with_config_path(mod, tmp_path)
+    assert ex._load_settings_mcp() == {}
+
+
+def test_load_settings_mcp_malformed_is_empty(tmp_path):
+    mod = _load_executor()
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text("{not valid json")
+    ex = _executor_with_config_path(mod, tmp_path)
+    assert ex._load_settings_mcp() == {}
+
+
+def test_declared_extra_mcp_names_includes_plugin_settings(tmp_path):
+    """The readiness gate must wait for a plugin-delivered MCP server too —
+    its name comes from /configs/.claude/settings.json, not config.yaml."""
+    mod = _load_executor()
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(
+        '{"mcpServers": {"molecule-platform": {"command": "npx", "args": ["-y", "x"]}}}'
+    )
+    ex = _executor_with_config_path(mod, tmp_path)
+    names = ex._declared_extra_mcp_names()
+    assert "molecule-platform" in names
+    assert "a2a" not in names
