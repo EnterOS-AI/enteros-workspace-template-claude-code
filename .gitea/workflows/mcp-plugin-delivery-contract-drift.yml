@@ -42,6 +42,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # bp-required: pending #3080 — soak-then-promote; standalone drift gate, not in branch protection yet.
   compare:
     name: Compare MCP plugin delivery contract against core canonical
     runs-on: ubuntu-latest
