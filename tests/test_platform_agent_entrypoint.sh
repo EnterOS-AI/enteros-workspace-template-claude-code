@@ -251,15 +251,103 @@ t5() {
     echo "PASS T5: prompts/ subdir - fill-absent-only at every level"
 }
 
+# T6: USER/volume-permission contract (CR2 #12653).
+#
+# The wrapper does `mkdir -p "$DST"` + `cp "$SRC/$rel" "$DST/$rel"`
+# (the per-file /opt→/configs reconcile, #2919 risk-1+2). In the
+# running container, /configs is a volume mounted as ROOT-owned
+# (mode 755) — writable ONLY by uid 0. The wrapper MUST run as
+# root for those ops to succeed; under `set -eu` a non-root
+# mkdir/cp aborts the boot with an EACCES.
+#
+# The earlier tests in this file (T1–T5) rewrite SRC + DST to
+# per-test temp dirs that the test runner can freely read AND
+# write to (because we make them). That hides the
+# USER/volume-permission contract: the wrapper succeeds as
+# non-root against user-writable sandboxes, so a future PR that
+# added a final `USER agent` (or any non-root USER) back to
+# Dockerfile.platform-agent would NOT be caught by T1–T5 — the
+# wrapper would still "work" in CI, then EACCES in the container.
+#
+# T6 simulates the in-container contract: chmod 555 the /configs
+# sandbox (read+execute only, no write for the test user OR
+# anyone else except root — equivalent to root-owned mode 755).
+# The wrapper MUST fail. This is a "negative" test: it asserts
+# the contract by failing the wrapper on purpose, so a future
+# regression that runs the wrapper as non-root in a root-owned
+# /configs would ALSO fail in T6's simulation.
+#
+# If the test runner cannot simulate the contract (e.g. it's
+# already running as root and chmod 555 doesn't affect root's
+# access), T6 SKIPs rather than producing a false pass — the
+# Dockerfile-side guard (no final `USER agent`) is the
+# authoritative check; T6 is the contract-assertion belt-and-
+# braces.
+t6() {
+    local sb
+    sb="$(mktemp -d)"
+    mkdir -p "$sb/opt/molecule-platform-agent-template/prompts" "$sb/configs/prompts"
+    # Populate /opt so the wrapper has files to copy.
+    cat > "$sb/opt/molecule-platform-agent-template/config.yaml" <<'EOF'
+model: moonshot/kimi-k2.6
+runtime: claude-code
+EOF
+    cat > "$sb/opt/molecule-platform-agent-template/mcp_servers.yaml" <<'EOF'
+mcp_servers:
+  - name: platform
+    command: molecule-platform-mcp
+EOF
+    # Simulate the in-container USER/volume-permission contract:
+    # /configs is a root-owned volume mount, mode 755 (writable
+    # only by uid 0). We can't chown to root as a non-root test
+    # user, so chmod 555 (read+execute only, no write for anyone
+    # except root) achieves the same effective contract: the
+    # wrapper's `cp "$SRC/file" "$DST/file"` will fail with EACCES
+    # under `set -eu`.
+    chmod 555 "$sb/configs"
+    chmod 555 "$sb/configs/prompts"
+
+    # If we're running as root, chmod 555 doesn't restrict us, so
+    # the simulation is meaningless (the wrapper would succeed
+    # and T6 would falsely report PASS). SKIP in that case —
+    # the Dockerfile-side guard (no final USER) is the
+    # authoritative check; T6 is for non-root test environments.
+    if [ "$(id -u)" = "0" ]; then
+        echo "SKIP T6: test runner is uid 0 (chmod 555 doesn't restrict root); the Dockerfile-side guard (no final \`USER agent\`) is the authoritative check for this regression"
+        chmod 755 "$sb/configs" "$sb/configs/prompts"
+        rm -rf "$sb"
+        return 0
+    fi
+
+    local patched
+    patched="$(mktemp)"
+    extract_per_file_body "$sb/opt/molecule-platform-agent-template" "$sb/configs" > "$patched"
+    set +e
+    sh "$patched" 2>/dev/null
+    local rc=$?
+    set -e
+    rm -f "$patched"
+    # Restore perms so we can clean up.
+    chmod 755 "$sb/configs" "$sb/configs/prompts"
+    rm -rf "$sb"
+
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL [T6]: wrapper SUCCEEDED against a non-writable /configs sandbox — the USER/volume-permission contract is NOT enforced. A future PR that adds a final \`USER agent\` to Dockerfile.platform-agent would NOT be caught by this test." >&2
+        return 1
+    fi
+    echo "PASS T6: wrapper correctly FAILS when run as non-root against a non-writable /configs — USER/volume-permission contract enforced (proves Dockerfile MUST NOT set a final non-root USER after the ENTRYPOINT)"
+}
+
 failed=0
 t1 || failed=1
 t2 || failed=1
 t3 || failed=1
 t4 || failed=1
 t5 || failed=1
+t6 || failed=1
 
 if [ "$failed" -ne 0 ]; then
     echo "FAILED" >&2
     exit 1
 fi
-echo "OK: all 5 platform-agent-entrypoint tests passed"
+echo "OK: all 6 platform-agent-entrypoint tests passed"

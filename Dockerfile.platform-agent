@@ -103,5 +103,46 @@ COPY scripts/platform-agent-entrypoint.sh /platform-agent-entrypoint.sh
 RUN chmod +x /platform-agent-entrypoint.sh
 ENTRYPOINT ["/platform-agent-entrypoint.sh"]
 
-# Return to the agent uid the base image runs as.
-USER agent
+# CR2 fix/2919-platform-agent-entrypoint-fallback (PR #133
+# reviewer findings, #12653): the platform-agent wrapper does
+# `mkdir -p /configs` + `cp /opt/.../<file> /configs/<file>` (the
+# per-file /opt→/configs reconcile, #2919 risk-1+2). On the
+# running container, /configs is a volume mounted as ROOT-owned
+# (mode 755), so the wrapper MUST run as root (uid 0) for those
+# ops to succeed — under `set -eu` a non-root mkdir/cp aborts the
+# boot with an EACCES that was being masked by the previous
+# `USER agent` final instruction.
+#
+# We intentionally do NOT set `USER agent` here. Two reasons:
+#
+# 1. The base image's /entrypoint.sh (claude-code-default) starts
+#    as root, runs chown + restore-on-recreate + other root-only
+#    setup, then re-execs itself via `exec gosu agent "$0" "$@"`
+#    to drop privileges. If we ran the platform-agent wrapper as
+#    agent and exec'd /entrypoint.sh, the base script would START
+#    as agent and skip its entire root-only setup — silent
+#    privilege drop on the very first instruction. molecule-runtime
+#    would then be started by an agent-uid /entrypoint.sh that
+#    never ran the chown/gosu step, so any state that the root
+#    setup is supposed to deliver (volume ownership, restore
+#    marker) would be missing.
+#
+# 2. The wrapper itself does the /opt→/configs copy (root-only).
+#    The base /entrypoint.sh then runs its chown step and
+#    re-execs as agent. molecule-runtime still ends up running as
+#    agent (uid 1000) — that's the only invariant we care about,
+#    and the base /entrypoint.sh enforces it.
+#
+# Net: the platform-agent image runs the wrapper + base entrypoint
+# as root, the base entrypoint drops privileges via gosu before
+# exec'ing molecule-runtime, so the runtime still runs as
+# agent. The intermediate /opt→/configs copy is the root-only
+# step that needs the contract preserved.
+#
+# Test that pins this contract: tests/test_platform_agent_entrypoint.sh
+# T6 — the wrapper MUST FAIL when run as non-root against a
+# non-writable /configs (the in-container root-only contract). If
+# a future PR adds a final `USER agent` (or any non-root USER)
+# back to this Dockerfile, T6 will pass in CI (because T6 simulates
+# the regression with chmod 555 /configs) but the in-container
+# behavior will be the regression the test is named after.
