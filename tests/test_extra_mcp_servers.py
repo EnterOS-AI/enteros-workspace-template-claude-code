@@ -317,3 +317,30 @@ def test_mcp_plugin_delivery_contract_is_byte_identical_ssot():
     assert contract["producer"] == "MCPServerAdaptor"
     assert contract["consumer"] == "claude_sdk_executor._load_settings_mcp"
     assert contract["entry_shape"] == "name->{command,args?,env?}"
+
+
+def test_build_options_logs_settings_mcp_servers_folding(tmp_path, caplog):
+    """core#3082: when /configs/.claude/settings.json contains mcpServers,
+    _build_options logs the on-disk names that --strict-mcp-config would
+    ignore before folding them into SDK options."""
+    mod = _load_executor()
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.json").write_text(
+        '{"mcpServers": {"molecule-platform": {"command": "npx", "args": ["-y", "x"]}}}'
+    )
+    ex = _executor_with_config_path(mod, tmp_path)
+    ex.model = "test-model"
+    ex._session_id = None
+
+    # Minimize unrelated work in _build_options.
+    ex._maybe_set_context_window_env = lambda: None
+    ex._maybe_set_mcp_connect_timeout_env = lambda: None
+    ex._resolve_cwd = lambda: str(tmp_path)
+    ex._build_system_prompt = lambda: "system"
+
+    with caplog.at_level("INFO", logger="claude_sdk_executor"):
+        ex._build_options()
+
+    assert "molecule-platform" in caplog.text
+    assert "--strict-mcp-config" in caplog.text

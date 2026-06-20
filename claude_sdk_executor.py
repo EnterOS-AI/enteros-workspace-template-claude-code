@@ -1011,13 +1011,26 @@ class ClaudeSDKExecutor(AgentExecutor):
         # a same-name entry. Absent file -> {} -> no-op for every ordinary
         # workspace.
         _apply_extra_mcp_servers(mcp_servers, self._load_mcp_fragment())
-        # Plugin channel (core#3079): when the platform-management MCP is
+        # Plugin channel (core#3079 / core#3082): when the platform-management MCP is
         # delivered as a PLUGIN (RFC#3045), the MCPServerAdaptor writes it into
         # /configs/.claude/settings.json `mcpServers`. The CLI runs with
         # --strict-mcp-config and ignores that on-disk file, so fold those
         # servers into the SDK options here or they never load. Applied LAST so
         # a plugin-authored server is authoritative on a same-name entry.
-        _apply_settings_mcp_servers(mcp_servers, self._load_settings_mcp())
+        #
+        # Log the on-disk names so operators can see what --strict-mcp-config
+        # would silently swallow if the executor did not fold it (core#3082).
+        settings_mcp = self._load_settings_mcp()
+        settings_mcp_servers = settings_mcp.get("mcpServers") or {}
+        if settings_mcp_servers:
+            settings_path = os.path.join(self.config_path, ".claude", "settings.json")
+            logger.info(
+                "on-disk mcpServers from %s would be ignored due to --strict-mcp-config; "
+                "folding into SDK options: %s",
+                settings_path,
+                sorted(settings_mcp_servers.keys()),
+            )
+        _apply_settings_mcp_servers(mcp_servers, settings_mcp)
 
         create_kwargs: dict = dict(
             model=self.model,
