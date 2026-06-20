@@ -28,6 +28,8 @@ git clone https://git.moleculesai.app/molecule-ai/molecule-ai-workspace-template
 cd molecule-ai-workspace-template-claude-code
 ```
 
+> **Local platform development note:** If you are running `molecule-core` locally with `MOLECULE_IMAGE_REGISTRY` unset, the workspace-server provisioner clones this template repository automatically and `docker build`s it locally. Manual cloning is only required when you are modifying template code itself.
+
 Always branch off `main` for local development:
 
 ```bash

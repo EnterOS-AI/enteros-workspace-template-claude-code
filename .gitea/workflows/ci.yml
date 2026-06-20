@@ -391,13 +391,18 @@ jobs:
             echo "::error::validate-runtime did not succeed: $runtime"
             exit 1
           fi
-          # T4 conformance is a hard gate; keep accepting `skipped` only
-          # for compatibility with older runs that used job-level guards.
-          # Any other non-success fails the build:
-          # "verified" T4 requires this live gate green, never inference.
-          if [ "$t4" != "success" ] && [ "$t4" != "skipped" ]; then
-            echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
-            exit 1
+          # T4 conformance is a HARD gate on internal (non-fork) PRs
+          # and main pushes. `skipped` is only acceptable on fork PRs.
+          # Any other non-success fails the build: "verified" T4 requires
+          # this live gate green, never inference.
+          is_fork_pr="${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}"
+          if [ "$t4" != "success" ]; then
+            if [ "$t4" = "skipped" ] && [ "$is_fork_pr" = "true" ]; then
+              echo "::notice::t4-conformance skipped on fork PR — allowing aggregate to pass."
+            else
+              echo "::error::t4-conformance did not succeed: $t4 — T4 host-root reach / token-ownership not verified on a live container. Failing closed (RFC internal#456 §11)."
+              exit 1
+            fi
           fi
           echo "::notice::Template validation aggregate passed (static=$static, runtime=$runtime, t4=$t4)"
 
