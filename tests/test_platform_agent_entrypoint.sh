@@ -251,6 +251,31 @@ t5() {
     echo "PASS T5: prompts/ subdir - fill-absent-only at every level"
 }
 
+# Helpers for privilege handling in T6. Tests may run as a non-root
+# user with passwordless sudo (local dev) OR as root (CI). We use sudo
+# only when we are not already root, and we use runuser(1) to drop to
+# uid 1000 for the negative sub-case so it is exercised even when the
+# test runner itself is root.
+maybe_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo -n "$@"
+    fi
+}
+
+as_non_root() {
+    # Prefer the image's runtime user if it exists locally.
+    if id agent >/dev/null 2>&1; then
+        runuser -u agent -- "$@"
+    elif id -u nobody >/dev/null 2>&1; then
+        runuser -u nobody -- "$@"
+    else
+        # Last resort: rely on the test runner already being non-root.
+        "$@"
+    fi
+}
+
 # T6: USER/volume-permission contract (CR2 #12653 / review 12686).
 #
 # Reproduces the REAL container contract, end-to-end:
@@ -288,7 +313,7 @@ t6() {
     # Sudo required to chown to root, bind-mount over /opt and
     # /configs, and run the wrapper as root. The test runner
     # (uid 1000) cannot do any of these.
-    if ! sudo -n true 2>/dev/null; then
+    if ! maybe_sudo true 2>/dev/null; then
         echo "SKIP T6: no passwordless sudo (cannot reproduce the root-owned /configs contract); the Dockerfile-side guard is the authoritative check"
         return 0
     fi
@@ -333,12 +358,12 @@ EOF
     # Reproduce the in-container contract: /configs is root-owned
     # (chown 0:0) and mode 755. The test runner (uid 1000) cannot
     # write to it; only the root-run wrapper (sub-case A) can.
-    sudo -n chown -R 0:0 "$sb/configs" 2>/dev/null || {
+    maybe_sudo chown -R 0:0 "$sb/configs" 2>/dev/null || {
         echo "SKIP T6: cannot sudo chown to root" >&2
         rm -rf "$sb"
         return 0
     }
-    sudo -n chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
+    maybe_sudo chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
 
     # Bind-mount the sandbox over the real /opt, /configs, AND
     # /entrypoint.sh so the wrapper's hardcoded paths resolve to
@@ -350,26 +375,26 @@ EOF
     # exits 0, so the wrapper's chain-to-base-entrypoint contract
     # is exercised without side effects.
     local mounted_opt=0 mounted_configs=0 mounted_entrypoint=0
-    if ! sudo -n mount --bind "$sb/opt" /opt 2>/dev/null; then
+    if ! maybe_sudo mount --bind "$sb/opt" /opt 2>/dev/null; then
         echo "SKIP T6: cannot sudo mount --bind /opt" >&2
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         rm -rf "$sb"
         return 0
     fi
     mounted_opt=1
-    if ! sudo -n mount --bind "$sb/configs" /configs 2>/dev/null; then
-        sudo -n umount /opt 2>/dev/null || true
+    if ! maybe_sudo mount --bind "$sb/configs" /configs 2>/dev/null; then
+        maybe_sudo umount /opt 2>/dev/null || true
         echo "SKIP T6: cannot sudo mount --bind /configs" >&2
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         rm -rf "$sb"
         return 0
     fi
     mounted_configs=1
-    if ! sudo -n mount --bind "$sb/entrypoint.sh" /entrypoint.sh 2>/dev/null; then
-        sudo -n umount /configs 2>/dev/null || true
-        sudo -n umount /opt 2>/dev/null || true
+    if ! maybe_sudo mount --bind "$sb/entrypoint.sh" /entrypoint.sh 2>/dev/null; then
+        maybe_sudo umount /configs 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
         echo "SKIP T6: cannot sudo mount --bind /entrypoint.sh" >&2
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         rm -rf "$sb"
         return 0
     fi
@@ -379,14 +404,14 @@ EOF
     # ROOT-OWNED /configs. After the Dockerfile fix (no final
     # `USER agent`), this is what happens in the container.
     set +e
-    sudo -n "$wrapper_path" 2>/dev/null
+    maybe_sudo "$wrapper_path" 2>/dev/null
     local rc_root=$?
     set -e
     if [ "$rc_root" -ne 0 ]; then
-        sudo -n umount /entrypoint.sh 2>/dev/null || true
-        sudo -n umount /configs 2>/dev/null || true
-        sudo -n umount /opt 2>/dev/null || true
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo umount /entrypoint.sh 2>/dev/null || true
+        maybe_sudo umount /configs 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         echo "FAIL [T6-A]: wrapper aborted under set -eu (root-owned /configs, run as root via sudo). The Dockerfile fix should let the wrapper run as root, but it aborted. The cp into /configs is failing for some other reason (sandbox path, bind-mount, etc.) — investigate before claiming the contract is upheld." >&2
         rm -rf "$sb"
         return 1
@@ -401,10 +426,10 @@ EOF
         fi
     done
     if [ "$copied_ok" -ne 1 ]; then
-        sudo -n umount /entrypoint.sh 2>/dev/null || true
-        sudo -n umount /configs 2>/dev/null || true
-        sudo -n umount /opt 2>/dev/null || true
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo umount /entrypoint.sh 2>/dev/null || true
+        maybe_sudo umount /configs 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         echo "FAIL [T6-A]: wrapper exited 0 but did NOT copy the expected files into /configs" >&2
         rm -rf "$sb"
         return 1
@@ -423,33 +448,33 @@ EOF
     # (otherwise the [ ! -f ] guards skip and the test never
     # exercises the cp permission path). Keep root ownership +
     # mode 755.
-    sudo -n rm -rf "$sb/configs"/* "$sb/configs/prompts"/* 2>/dev/null
-    sudo -n chown -R 0:0 "$sb/configs" 2>/dev/null
-    sudo -n chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
+    maybe_sudo rm -rf "$sb/configs"/* "$sb/configs/prompts"/* 2>/dev/null
+    maybe_sudo chown -R 0:0 "$sb/configs" 2>/dev/null
+    maybe_sudo chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
 
     # Run the wrapper as the non-root test user (NO sudo) — the
     # cp into root-owned /configs MUST fail with EACCES.
     set +e
-    "$wrapper_path" 2>/dev/null
+    as_non_root "$wrapper_path" 2>/dev/null
     local rc_nonroot=$?
     set -e
     if [ "$rc_nonroot" -eq 0 ]; then
         # The wrapper SUCCEEDED as non-root. This is the regression:
         # the contract that the wrapper requires root is BROKEN.
-        sudo -n umount /entrypoint.sh 2>/dev/null || true
-        sudo -n umount /configs 2>/dev/null || true
-        sudo -n umount /opt 2>/dev/null || true
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo umount /entrypoint.sh 2>/dev/null || true
+        maybe_sudo umount /configs 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         echo "FAIL [T6-B]: wrapper SUCCEEDED as non-root against root-owned /configs. The USER=agent contract is NOT enforced — a future PR that adds a final \`USER agent\` (or any non-root USER) to Dockerfile.platform-agent would NOT be caught by this test. The original bug (CR2 #12653) would re-occur." >&2
         rm -rf "$sb"
         return 1
     fi
     # And the copies should NOT have happened (EACCES prevented them).
     if [ -f "$sb/configs/config.yaml" ]; then
-        sudo -n umount /entrypoint.sh 2>/dev/null || true
-        sudo -n umount /configs 2>/dev/null || true
-        sudo -n umount /opt 2>/dev/null || true
-        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        maybe_sudo umount /entrypoint.sh 2>/dev/null || true
+        maybe_sudo umount /configs 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
+        maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         echo "FAIL [T6-B]: wrapper aborted but config.yaml was still copied — the EACCES did not block the cp (sandbox perms wrong?)" >&2
         rm -rf "$sb"
         return 1
@@ -458,16 +483,68 @@ EOF
 
     # Cleanup: unmount in REVERSE bind order, restore perms, rm -rf.
     if [ "$mounted_entrypoint" = "1" ]; then
-        sudo -n umount /entrypoint.sh 2>/dev/null || true
+        maybe_sudo umount /entrypoint.sh 2>/dev/null || true
     fi
     if [ "$mounted_configs" = "1" ]; then
-        sudo -n umount /configs 2>/dev/null || true
+        maybe_sudo umount /configs 2>/dev/null || true
     fi
     if [ "$mounted_opt" = "1" ]; then
-        sudo -n umount /opt 2>/dev/null || true
+        maybe_sudo umount /opt 2>/dev/null || true
     fi
-    sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+    maybe_sudo chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
     rm -rf "$sb"
+}
+
+# T7: Dockerfile-level contract guard (no-sudo fallback).
+#
+# T6 exercises the real wrapper-to-base-entrypoint chain against a
+# root-owned /configs path, but it needs passwordless sudo (or a root
+# test runner) to bind-mount /opt, /configs and /entrypoint.sh. In
+# restricted CI runners T6 may SKIP. This test pins the same contract
+# from the build artifact:
+#   1. Dockerfile.platform-agent must NOT end with a non-root USER
+#      (specifically no `USER agent`), so the wrapper starts as root.
+#   2. Dockerfile.platform-agent must set ENTRYPOINT to the wrapper.
+#   3. The wrapper script must chain to /entrypoint.sh.
+# A future PR that re-adds `USER agent` or breaks the entrypoint chain
+# will fail this test immediately, even where T6 cannot run.
+t7() {
+    local df
+    df="$(dirname "$0")/../Dockerfile.platform-agent"
+    if [ ! -f "$df" ]; then
+        echo "FAIL [T7]: Dockerfile.platform-agent not found at $df" >&2
+        return 1
+    fi
+
+    # Reject a final USER agent (or any non-root USER after the wrapper
+    # is installed). USER root is fine; no USER after ENTRYPOINT is also
+    # fine because the base image runs as root by default.
+    local last_user
+    last_user="$(grep -E '^USER ' "$df" | tail -n1 || true)"
+    if [ -n "$last_user" ] && [ "$last_user" != "USER root" ]; then
+        echo "FAIL [T7]: Dockerfile.platform-agent ends with non-root $last_user; the wrapper needs root to write the root-owned /configs volume" >&2
+        return 1
+    fi
+
+    # Wrapper must be installed as the image entrypoint.
+    if ! grep -Eq '^ENTRYPOINT\s+\["/platform-agent-entrypoint\.sh"\]' "$df"; then
+        echo "FAIL [T7]: Dockerfile.platform-agent does not set ENTRYPOINT [\"/platform-agent-entrypoint.sh\"]" >&2
+        return 1
+    fi
+
+    # Wrapper script must hand off to the base entrypoint.
+    local wrapper
+    wrapper="$(dirname "$0")/../scripts/platform-agent-entrypoint.sh"
+    if [ ! -f "$wrapper" ]; then
+        echo "FAIL [T7]: wrapper script not found at $wrapper" >&2
+        return 1
+    fi
+    if ! grep -Eq '^exec /entrypoint\.sh "\$@"$' "$wrapper"; then
+        echo "FAIL [T7]: wrapper does not end with 'exec /entrypoint.sh \"\$@\"'" >&2
+        return 1
+    fi
+
+    echo "PASS T7: Dockerfile/platform-agent preserves root-entrypoint contract (no USER agent, wrapper ENTRYPOINT, chains to /entrypoint.sh)"
 }
 
 failed=0
@@ -477,9 +554,10 @@ t3 || failed=1
 t4 || failed=1
 t5 || failed=1
 t6 || failed=1
+t7 || failed=1
 
 if [ "$failed" -ne 0 ]; then
     echo "FAILED" >&2
     exit 1
 fi
-echo "OK: all 6 platform-agent-entrypoint tests passed"
+echo "OK: all 7 platform-agent-entrypoint tests passed"
