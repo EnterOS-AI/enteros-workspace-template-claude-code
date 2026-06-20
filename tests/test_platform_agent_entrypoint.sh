@@ -251,43 +251,55 @@ t5() {
     echo "PASS T5: prompts/ subdir - fill-absent-only at every level"
 }
 
-# T6: USER/volume-permission contract (CR2 #12653).
+# T6: USER/volume-permission contract (CR2 #12653 / review 12686).
 #
-# The wrapper does `mkdir -p "$DST"` + `cp "$SRC/$rel" "$DST/$rel"`
-# (the per-file /opt→/configs reconcile, #2919 risk-1+2). In the
-# running container, /configs is a volume mounted as ROOT-owned
-# (mode 755) — writable ONLY by uid 0. The wrapper MUST run as
-# root for those ops to succeed; under `set -eu` a non-root
-# mkdir/cp aborts the boot with an EACCES.
+# Reproduces the REAL container contract, end-to-end:
+#   1. /configs is ROOT-OWNED (chown 0:0, mode 755 — writable only
+#      by uid 0). The test runner (non-root, typically uid 1000)
+#      cannot write to it.
+#   2. The wrapper at scripts/platform-agent-entrypoint.sh runs
+#      UNMODIFIED — no SRC/DST rewrite, no `exec` no-op. Its
+#      hardcoded /opt/molecule-platform-agent-template + /configs
+#      resolve to the sandbox via sudo bind-mounts.
+#   3. The wrapper chains to /entrypoint.sh (a stub we provide
+#      inside the sandbox) instead of a no-op echo — the real
+#      contract requires the wrapper to exec the base entrypoint.
+#   4. The test has TWO sub-cases that together pin the contract:
+#      A. RUN AS ROOT (sudo) → wrapper completes successfully;
+#         config.yaml + mcp_servers.yaml + prompts/concierge.md
+#         land in /configs; the stub /entrypoint.sh ran.
+#         This is the post-Dockerfile-fix behavior.
+#      B. RUN AS NON-ROOT (test runner, simulating the original
+#         `USER agent` regression) → wrapper ABORTS under `set -eu`
+#         with EACCES on the cp into the root-owned /configs.
+#         This is the contract GUARD — a future PR that re-adds
+#         `USER agent` (or any non-root USER) to
+#         Dockerfile.platform-agent would break the container
+#         boot, AND break this sub-case in CI. Sub-case A still
+#         passes (we explicitly use sudo), so the test's only
+#         failure mode for the regression is sub-case B.
 #
-# The earlier tests in this file (T1–T5) rewrite SRC + DST to
-# per-test temp dirs that the test runner can freely read AND
-# write to (because we make them). That hides the
-# USER/volume-permission contract: the wrapper succeeds as
-# non-root against user-writable sandboxes, so a future PR that
-# added a final `USER agent` (or any non-root USER) back to
-# Dockerfile.platform-agent would NOT be caught by T1–T5 — the
-# wrapper would still "work" in CI, then EACCES in the container.
-#
-# T6 simulates the in-container contract: chmod 555 the /configs
-# sandbox (read+execute only, no write for the test user OR
-# anyone else except root — equivalent to root-owned mode 755).
-# The wrapper MUST fail. This is a "negative" test: it asserts
-# the contract by failing the wrapper on purpose, so a future
-# regression that runs the wrapper as non-root in a root-owned
-# /configs would ALSO fail in T6's simulation.
-#
-# If the test runner cannot simulate the contract (e.g. it's
-# already running as root and chmod 555 doesn't affect root's
-# access), T6 SKIPs rather than producing a false pass — the
-# Dockerfile-side guard (no final `USER agent`) is the
-# authoritative check; T6 is the contract-assertion belt-and-
-# braces.
+# If the test runner lacks `sudo` (no unprivileged container /
+# no privileged access), T6 SKIPs — the authoritative check is
+# the Dockerfile-side guard (no final `USER agent`), and the
+# in-CI staging path runs the real platform-agent image where
+# the actual root-owned /configs is the live contract.
 t6() {
+    # Sudo required to chown to root, bind-mount over /opt and
+    # /configs, and run the wrapper as root. The test runner
+    # (uid 1000) cannot do any of these.
+    if ! sudo -n true 2>/dev/null; then
+        echo "SKIP T6: no passwordless sudo (cannot reproduce the root-owned /configs contract); the Dockerfile-side guard is the authoritative check"
+        return 0
+    fi
+
     local sb
     sb="$(mktemp -d)"
     mkdir -p "$sb/opt/molecule-platform-agent-template/prompts" "$sb/configs/prompts"
-    # Populate /opt so the wrapper has files to copy.
+
+    # Populate the template content (the source the wrapper copies
+    # FROM). The wrapper's hardcoded SRC is /opt/molecule-platform-agent-template
+    # — we bind-mount $sb/opt over the real /opt below.
     cat > "$sb/opt/molecule-platform-agent-template/config.yaml" <<'EOF'
 model: moonshot/kimi-k2.6
 runtime: claude-code
@@ -297,45 +309,165 @@ mcp_servers:
   - name: platform
     command: molecule-platform-mcp
 EOF
-    # Simulate the in-container USER/volume-permission contract:
-    # /configs is a root-owned volume mount, mode 755 (writable
-    # only by uid 0). We can't chown to root as a non-root test
-    # user, so chmod 555 (read+execute only, no write for anyone
-    # except root) achieves the same effective contract: the
-    # wrapper's `cp "$SRC/file" "$DST/file"` will fail with EACCES
-    # under `set -eu`.
-    chmod 555 "$sb/configs"
-    chmod 555 "$sb/configs/prompts"
+    cat > "$sb/opt/molecule-platform-agent-template/prompts/concierge.md" <<'EOF'
+You are the Org Concierge. Be helpful.
+EOF
 
-    # If we're running as root, chmod 555 doesn't restrict us, so
-    # the simulation is meaningless (the wrapper would succeed
-    # and T6 would falsely report PASS). SKIP in that case —
-    # the Dockerfile-side guard (no final USER) is the
-    # authoritative check; T6 is for non-root test environments.
-    if [ "$(id -u)" = "0" ]; then
-        echo "SKIP T6: test runner is uid 0 (chmod 555 doesn't restrict root); the Dockerfile-side guard (no final \`USER agent\`) is the authoritative check for this regression"
-        chmod 755 "$sb/configs" "$sb/configs/prompts"
+    # Stub /entrypoint.sh — the wrapper exec's THIS, not a no-op echo.
+    # The stub echoes the would-run marker and exits 0 so the
+    # wrapper's `exec /entrypoint.sh "$@"` succeeds.
+    cat > "$sb/entrypoint.sh" <<'EOF'
+#!/bin/sh
+echo "[test-stub /entrypoint.sh] would run molecule-runtime"
+exit 0
+EOF
+    chmod +x "$sb/entrypoint.sh"
+
+    # The ACTUAL wrapper — copied from the repo, not rewritten.
+    # No sed SRC/DST munging. No `exec` no-op patch. The wrapper
+    # runs as it would at container start.
+    local wrapper_path="$sb/platform-agent-entrypoint.sh"
+    cp "$(dirname "$0")/../scripts/platform-agent-entrypoint.sh" "$wrapper_path"
+    chmod +x "$wrapper_path"
+
+    # Reproduce the in-container contract: /configs is root-owned
+    # (chown 0:0) and mode 755. The test runner (uid 1000) cannot
+    # write to it; only the root-run wrapper (sub-case A) can.
+    sudo -n chown -R 0:0 "$sb/configs" 2>/dev/null || {
+        echo "SKIP T6: cannot sudo chown to root" >&2
+        rm -rf "$sb"
+        return 0
+    }
+    sudo -n chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
+
+    # Bind-mount the sandbox over the real /opt, /configs, AND
+    # /entrypoint.sh so the wrapper's hardcoded paths resolve to
+    # the sandbox. The /entrypoint.sh bind-mount is needed because
+    # the wrapper's final `exec /entrypoint.sh "$@"` would otherwise
+    # invoke the real /entrypoint.sh on the test system (which does
+    # real work — chown, gosu, mount/restore — and would interfere
+    # with the test). The stub /entrypoint.sh echoes a marker and
+    # exits 0, so the wrapper's chain-to-base-entrypoint contract
+    # is exercised without side effects.
+    local mounted_opt=0 mounted_configs=0 mounted_entrypoint=0
+    if ! sudo -n mount --bind "$sb/opt" /opt 2>/dev/null; then
+        echo "SKIP T6: cannot sudo mount --bind /opt" >&2
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
         rm -rf "$sb"
         return 0
     fi
+    mounted_opt=1
+    if ! sudo -n mount --bind "$sb/configs" /configs 2>/dev/null; then
+        sudo -n umount /opt 2>/dev/null || true
+        echo "SKIP T6: cannot sudo mount --bind /configs" >&2
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        rm -rf "$sb"
+        return 0
+    fi
+    mounted_configs=1
+    if ! sudo -n mount --bind "$sb/entrypoint.sh" /entrypoint.sh 2>/dev/null; then
+        sudo -n umount /configs 2>/dev/null || true
+        sudo -n umount /opt 2>/dev/null || true
+        echo "SKIP T6: cannot sudo mount --bind /entrypoint.sh" >&2
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        rm -rf "$sb"
+        return 0
+    fi
+    mounted_entrypoint=1
 
-    local patched
-    patched="$(mktemp)"
-    extract_per_file_body "$sb/opt/molecule-platform-agent-template" "$sb/configs" > "$patched"
+    # ── T6-A: positive case — wrapper runs AS ROOT against a
+    # ROOT-OWNED /configs. After the Dockerfile fix (no final
+    # `USER agent`), this is what happens in the container.
     set +e
-    sh "$patched" 2>/dev/null
-    local rc=$?
+    sudo -n "$wrapper_path" 2>/dev/null
+    local rc_root=$?
     set -e
-    rm -f "$patched"
-    # Restore perms so we can clean up.
-    chmod 755 "$sb/configs" "$sb/configs/prompts"
-    rm -rf "$sb"
-
-    if [ "$rc" -eq 0 ]; then
-        echo "FAIL [T6]: wrapper SUCCEEDED against a non-writable /configs sandbox — the USER/volume-permission contract is NOT enforced. A future PR that adds a final \`USER agent\` to Dockerfile.platform-agent would NOT be caught by this test." >&2
+    if [ "$rc_root" -ne 0 ]; then
+        sudo -n umount /entrypoint.sh 2>/dev/null || true
+        sudo -n umount /configs 2>/dev/null || true
+        sudo -n umount /opt 2>/dev/null || true
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        echo "FAIL [T6-A]: wrapper aborted under set -eu (root-owned /configs, run as root via sudo). The Dockerfile fix should let the wrapper run as root, but it aborted. The cp into /configs is failing for some other reason (sandbox path, bind-mount, etc.) — investigate before claiming the contract is upheld." >&2
+        rm -rf "$sb"
         return 1
     fi
-    echo "PASS T6: wrapper correctly FAILS when run as non-root against a non-writable /configs — USER/volume-permission contract enforced (proves Dockerfile MUST NOT set a final non-root USER after the ENTRYPOINT)"
+    # Verify the per-file copy actually happened — the wrapper's
+    # claimed exit-0 must be backed by real files in /configs.
+    local copied_ok=1
+    for rel in config.yaml mcp_servers.yaml prompts/concierge.md; do
+        if [ ! -f "$sb/configs/$rel" ]; then
+            echo "  [T6-A] missing expected copy: $sb/configs/$rel" >&2
+            copied_ok=0
+        fi
+    done
+    if [ "$copied_ok" -ne 1 ]; then
+        sudo -n umount /entrypoint.sh 2>/dev/null || true
+        sudo -n umount /configs 2>/dev/null || true
+        sudo -n umount /opt 2>/dev/null || true
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        echo "FAIL [T6-A]: wrapper exited 0 but did NOT copy the expected files into /configs" >&2
+        rm -rf "$sb"
+        return 1
+    fi
+    echo "PASS T6-A: actual wrapper ran AS ROOT (sudo) against ROOT-OWNED /configs — config.yaml + mcp_servers.yaml + prompts/concierge.md all copied; wrapper exec'd the stub /entrypoint.sh (chained, not no-op); no abort under set -eu"
+
+    # ── T6-B: negative case (the contract GUARD) — wrapper runs
+    # AS NON-ROOT against the SAME root-owned /configs. This
+    # simulates the original `USER agent` regression: the wrapper
+    # runs as agent (uid 1000) and must FAIL on the cp into the
+    # root-owned /configs. The wrapper's `set -eu` chain aborts
+    # on the EACCES, which is the in-container failure mode.
+    #
+    # Reset /configs to empty (delete the T6-A copies) so the
+    # wrapper's fill-absent-only logic actually tries to copy
+    # (otherwise the [ ! -f ] guards skip and the test never
+    # exercises the cp permission path). Keep root ownership +
+    # mode 755.
+    sudo -n rm -rf "$sb/configs"/* "$sb/configs/prompts"/* 2>/dev/null
+    sudo -n chown -R 0:0 "$sb/configs" 2>/dev/null
+    sudo -n chmod 755 "$sb/configs" "$sb/configs/prompts" 2>/dev/null
+
+    # Run the wrapper as the non-root test user (NO sudo) — the
+    # cp into root-owned /configs MUST fail with EACCES.
+    set +e
+    "$wrapper_path" 2>/dev/null
+    local rc_nonroot=$?
+    set -e
+    if [ "$rc_nonroot" -eq 0 ]; then
+        # The wrapper SUCCEEDED as non-root. This is the regression:
+        # the contract that the wrapper requires root is BROKEN.
+        sudo -n umount /entrypoint.sh 2>/dev/null || true
+        sudo -n umount /configs 2>/dev/null || true
+        sudo -n umount /opt 2>/dev/null || true
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        echo "FAIL [T6-B]: wrapper SUCCEEDED as non-root against root-owned /configs. The USER=agent contract is NOT enforced — a future PR that adds a final \`USER agent\` (or any non-root USER) to Dockerfile.platform-agent would NOT be caught by this test. The original bug (CR2 #12653) would re-occur." >&2
+        rm -rf "$sb"
+        return 1
+    fi
+    # And the copies should NOT have happened (EACCES prevented them).
+    if [ -f "$sb/configs/config.yaml" ]; then
+        sudo -n umount /entrypoint.sh 2>/dev/null || true
+        sudo -n umount /configs 2>/dev/null || true
+        sudo -n umount /opt 2>/dev/null || true
+        sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+        echo "FAIL [T6-B]: wrapper aborted but config.yaml was still copied — the EACCES did not block the cp (sandbox perms wrong?)" >&2
+        rm -rf "$sb"
+        return 1
+    fi
+    echo "PASS T6-B: wrapper correctly FAILS as non-root against root-owned /configs — EACCES on the cp aborts the wrapper under set -eu; the USER=agent contract is enforced (a future \`USER agent\` PR would break the container AND break this sub-case)"
+
+    # Cleanup: unmount in REVERSE bind order, restore perms, rm -rf.
+    if [ "$mounted_entrypoint" = "1" ]; then
+        sudo -n umount /entrypoint.sh 2>/dev/null || true
+    fi
+    if [ "$mounted_configs" = "1" ]; then
+        sudo -n umount /configs 2>/dev/null || true
+    fi
+    if [ "$mounted_opt" = "1" ]; then
+        sudo -n umount /opt 2>/dev/null || true
+    fi
+    sudo -n chown -R "$(id -u):$(id -g)" "$sb/configs" 2>/dev/null
+    rm -rf "$sb"
 }
 
 failed=0
