@@ -341,11 +341,19 @@ jobs:
     # `publish` job just pushed, and bakes @molecule-ai/mcp-server from the org's
     # Gitea npm registry (anonymous read — no token / no cross-repo checkout).
     #
-    # Deliberately NO auto pin-promote: publishing the image is decoupled from
-    # ACTIVATING the feature. The image stays available in ECR; an operator
-    # activates it by promoting the `platform-agent` runtime_image_pins entry
-    # (POST /cp/admin/runtime-image/promote) when ready, which the merged
-    # control-plane Phase 3c then consumes.
+    # Auto pin-promote (#162): the `promote-platform-agent-pin` job below now
+    # promotes the `platform-agent` runtime_image_pins entry to this image's
+    # digest, mirroring `promote-pin` for claude-code. RATIONALE: the concierge
+    # IS this image (claude-code base + baked org MCP), so the runtime fix that
+    # ships in the claude-code pin must also reach the concierge — leaving the
+    # platform-agent pin operator-gated meant a runtime bump silently advanced
+    # the claude-code pin while the concierge kept booting the stale digest.
+    # That stranded the RCA#2970 online gate: test1's concierge fail-closed on
+    # `/opt/molecule-mcp-server missing` for 3 days because the v0.3.43 fix
+    # (recognize plugin-delivered MCP) was built into this image but the
+    # platform-agent pin still pointed at the pre-fix sha-201a5fa. Auto-promote
+    # keeps the concierge pin lock-step with the build, same as every workspace
+    # runtime. Rollback is the existing DELETE/promote-by-digest admin surface.
     name: Build & push molecule-platform-agent image
     runs-on: [publish, release]
     timeout-minutes: 30
@@ -353,6 +361,13 @@ jobs:
     if: ${{ success() && github.ref == 'refs/heads/main' }}
     env:
       PA_IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/molecule-platform-agent
+    # Bubble the Push step's digest to the job level so the downstream
+    # `promote-platform-agent-pin` job can consume
+    # `needs.publish-platform-agent.outputs.digest` (mirrors the `publish`
+    # job's digest output — a step output is not visible across a `needs:`
+    # edge).
+    outputs:
+      digest: ${{ steps.pa_push.outputs.digest }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -431,6 +446,7 @@ jobs:
           '
 
       - name: Push image to ECR (post-smoke)
+        id: pa_push
         uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
         with:
           context: .
@@ -455,4 +471,82 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI org-level platform agent (claude-code + org-management MCP)
+
+  promote-platform-agent-pin:
+    # #162 — auto-promote the just-pushed molecule-platform-agent digest to the
+    # `platform-agent` runtime_image_pins entry, mirroring `promote-pin` for the
+    # claude-code workspace image. Without this the concierge pin drifts behind
+    # the runtime: a runtime bump rebuilds + repins claude-code but the concierge
+    # (which IS this image) keeps booting the last hand-promoted digest, so a
+    # runtime-level concierge fix never reaches it. That stranded test1's RCA#2970
+    # online gate (`/opt/molecule-mcp-server missing`) for 3 days — the v0.3.43
+    # plugin-MCP-recognition fix was baked into this image but the pin still
+    # pointed at the pre-fix sha-201a5fa.
+    #
+    # Same matrix + token + fail-loud shape as `promote-pin`. Per-target
+    # isolation via fail-fast:false; non-2xx for a target turns the job red so a
+    # stranded concierge pin is never hidden behind a green workflow. The digest
+    # promoted is the molecule-platform-agent image digest (NOT the claude-code
+    # base) — CP resolves the concierge via resolvePlatformAgentImage, which
+    # composes the molecule-platform-agent repo name + this pinned digest.
+    name: Promote platform-agent runtime_image_pins (CP admin)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish-platform-agent]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: prod
+            cp_host: api.moleculesai.app
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+    steps:
+      - name: POST /cp/admin/runtime-image/promote (platform-agent, ${{ matrix.env_name }})
+        env:
+          PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
+          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          ENV_NAME: ${{ matrix.env_name }}
+          CP_HOST: ${{ matrix.cp_host }}
+          TEMPLATE_NAME: platform-agent
+          IMAGE_DIGEST: ${{ needs.publish-platform-agent.outputs.digest }}
+          GIT_SHA: ${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ "${ENV_NAME}" = "prod" ]; then
+            CP_ADMIN_API_TOKEN="${PROD_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
+          else
+            CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
+            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+          fi
+          if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
+            echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} platform-agent pin"
+            exit 1
+          fi
+          if [ -z "${IMAGE_DIGEST}" ]; then
+            echo "::error::needs.publish-platform-agent.outputs.digest is empty — Push step did not expose digest"
+            exit 1
+          fi
+          body=$(printf '{"template_name":"%s","image_digest":"%s","git_sha":"%s","notes":"auto-promote platform-agent via publish-image.yml @ %s -> %s"}' \
+            "${TEMPLATE_NAME}" "${IMAGE_DIGEST}" "${GIT_SHA}" "${GITHUB_SHA}" "${ENV_NAME}")
+          echo "::notice::POST runtime-image/promote env=${ENV_NAME} host=${CP_HOST} template=${TEMPLATE_NAME} digest=${IMAGE_DIGEST} git_sha=${GIT_SHA}"
+          resp=$(mktemp)
+          code=$(curl -sS -o "${resp}" -w '%{http_code}' \
+            -X POST \
+            -H "Authorization: Bearer ${CP_ADMIN_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "${body}" \
+            "https://${CP_HOST}/cp/admin/runtime-image/promote")
+          echo "HTTP ${code}"
+          cat "${resp}"
+          echo
+          if [ "${code}" != "200" ] && [ "${code}" != "201" ]; then
+            echo "::error::${ENV_NAME} platform-agent promote failed (HTTP ${code})"
+            exit 1
+          fi
+          echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
 
