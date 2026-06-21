@@ -50,12 +50,21 @@ RUN set -eux; \
 #                 env: {MOLECULE_MCP_MODE: management}}]`
 # (core: conciergeMCPServersBlock). The symlink targets the package entry
 # directly so it cannot be shadowed by any future bin-name squatter.
+#
+# The runtime also proves platform-agent identity by checking for the legacy
+# in-image path `/opt/molecule-mcp-server` (RCA #2970; the MCP-plugin delivery
+# contract's legacy_binary_path). Provide that path as a symlink to the same
+# package entry so `mcp_server_present()` reports true on the platform-agent
+# image without relying on a plugin install.
 RUN set -eux; \
     printf '@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n' > /etc/npmrc; \
     npm install -g --userconfig /etc/npmrc "@molecule-ai/mcp-server@${MCP_VERSION}"; \
     chmod +x /usr/lib/node_modules/@molecule-ai/mcp-server/dist/index.js; \
     ln -sf /usr/lib/node_modules/@molecule-ai/mcp-server/dist/index.js /usr/local/bin/molecule-platform-mcp; \
-    command -v molecule-platform-mcp
+    command -v molecule-platform-mcp; \
+    mkdir -p /opt; \
+    ln -sf /usr/lib/node_modules/@molecule-ai/mcp-server/dist/index.js /opt/molecule-mcp-server; \
+    test -e /opt/molecule-mcp-server
 
 # Self-contain the adapter-module import path. The runtime boots via its console-script
 # entrypoint, which does NOT put the working dir on sys.path — so the adapter
