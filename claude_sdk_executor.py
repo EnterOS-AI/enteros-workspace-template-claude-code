@@ -66,6 +66,15 @@ from molecule_runtime.executor_helpers import (
     set_current_task,
 )
 
+try:
+    from molecule_runtime.platform_agent_identity import set_loaded_mcp_tools
+except Exception:  # pragma: no cover - shim for stub test harnesses that fake
+    # `molecule_runtime` as an empty module. In production the real runtime
+    # always provides this; the no-op fallback keeps loaded_mcp_tools capture
+    # from being a hard import dependency of the executor under test stubs.
+    def set_loaded_mcp_tools(_tools):  # type: ignore[misc]
+        return None
+
 if TYPE_CHECKING:
     from molecule_runtime.heartbeat import HeartbeatLoop
 
@@ -1182,6 +1191,32 @@ class ClaudeSDKExecutor(AgentExecutor):
             acc.result_subtype = getattr(message, "subtype", None)
             acc.result_api_error_status = getattr(message, "api_error_status", None)
             acc.result_errors = getattr(message, "errors", None)
+        elif type(message).__name__ == "SystemMessage":
+            # The CLI's `init` system message carries the tool list the model
+            # will see this turn (.data["tools"]). Record the loaded mcp__* tool
+            # ids so the heartbeat reports `loaded_mcp_tools` (core#3082) —
+            # proving the management MCP's tools are actually LIVE in the model's
+            # tool list, not merely declared. This is the producer the platform
+            # online/degraded gate needs; without it the gate fail-closes on the
+            # absent tool list and the concierge reads as degraded.
+            #
+            # Class-name check (not isinstance) so the conftest SDK stub, which
+            # need not define SystemMessage, doesn't break. Bookkeeping only —
+            # never let it raise into the turn.
+            if getattr(message, "subtype", None) == "init":
+                try:
+                    data = getattr(message, "data", None)
+                    tools = data.get("tools") if isinstance(data, dict) else None
+                    if isinstance(tools, list):
+                        set_loaded_mcp_tools(
+                            [
+                                t
+                                for t in tools
+                                if isinstance(t, str) and t.startswith("mcp__")
+                            ]
+                        )
+                except Exception:
+                    logger.debug("loaded_mcp_tools capture skipped", exc_info=True)
 
     @staticmethod
     def _mcp_servers_from_status(status: Any) -> list[dict]:
