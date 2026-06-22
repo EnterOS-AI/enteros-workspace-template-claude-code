@@ -242,6 +242,21 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI workspace template — claude-code runtime
 
+      # Keep the prod ECR storage bill bounded: declare the canonical image
+      # lifecycle policy on the runtime repo we just pushed. Idempotent +
+      # fail-soft (never fails the publish). SSOT JSON lives in the script.
+      - name: Ensure ECR lifecycle policy (workspace-template-claude-code)
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -uo pipefail
+          # Strip the registry host; pass the bare molecule-ai/<repo> name.
+          REPO_NAME="${IMAGE_NAME#*/}"
+          bash scripts/ensure-ecr-lifecycle.sh "${REPO_NAME}"
+
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
     # runtime_image_pins via the control-plane admin endpoint. Gitea 1.22.6
@@ -471,6 +486,21 @@ jobs:
             org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=Molecule AI org-level platform agent (claude-code + org-management MCP)
+
+      # Keep the prod ECR storage bill bounded: declare the canonical image
+      # lifecycle policy on the platform-agent (concierge) repo we just pushed.
+      # Idempotent + fail-soft (never fails the publish). SSOT JSON in script.
+      - name: Ensure ECR lifecycle policy (molecule-platform-agent)
+        env:
+          PA_IMAGE_NAME: ${{ env.PA_IMAGE_NAME }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+        run: |
+          set -uo pipefail
+          # Strip the registry host; pass the bare molecule-ai/<repo> name.
+          REPO_NAME="${PA_IMAGE_NAME#*/}"
+          bash scripts/ensure-ecr-lifecycle.sh "${REPO_NAME}"
 
   promote-platform-agent-pin:
     # #162 — auto-promote the just-pushed molecule-platform-agent digest to the
