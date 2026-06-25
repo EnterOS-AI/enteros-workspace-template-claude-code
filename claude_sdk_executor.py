@@ -55,11 +55,8 @@ from molecule_runtime.executor_helpers import (
     error_detail_for_external,
     extract_attached_files,
     extract_message_text,
-    get_a2a_instructions,
     get_display_instructions,
-    get_hma_instructions,
     get_mcp_server_path,
-    get_system_prompt,
     read_delegation_results,
     recall_memories,
     sanitize_agent_error,
@@ -759,11 +756,29 @@ class ClaudeSDKExecutor(AgentExecutor):
         config_path: str,
         heartbeat: "HeartbeatLoop | None",
         model: str = "sonnet",
+        prompt_files: list[str] | None = None,
+        workspace_id: str = "",
+        plugin_rules: str | None = None,
+        plugin_prompts: list[str] | None = None,
     ):
+        # system_prompt is the base-built prompt published onto
+        # config.system_prompt (BASE-OWNED, honors prompt_files). It is the
+        # authoritative SSOT value + the hot-reload fallback below.
         self.system_prompt = system_prompt
         self.config_path = config_path
         self.heartbeat = heartbeat
         self.model = model
+        # prompt_files lets the per-turn hot-reload re-derive through the SAME
+        # single builder (build_system_prompt) the base used — so a delivered
+        # prompt takes effect without a restart AND prompt_files is honored
+        # (no system-prompt.md-only re-read that ignores prompt_files).
+        self.prompt_files = list(prompt_files or [])
+        self.workspace_id = workspace_id
+        # plugin_rules/plugin_prompts must also be threaded through the SAME
+        # builder on hot-reload, otherwise a reloaded turn silently drops the
+        # plugin fragments that setup() included (task #76 / #185).
+        self.plugin_rules = plugin_rules
+        self.plugin_prompts = list(plugin_prompts or [])
         self._session_id: str | None = None
         self._active_stream: AsyncIterator[Any] | None = None
         # Serializes concurrent execute() calls on the same executor so
@@ -781,12 +796,50 @@ class ClaudeSDKExecutor(AgentExecutor):
         return CONFIG_MOUNT
 
     def _build_system_prompt(self) -> str | None:
-        """Compose system prompt from file + A2A + HMA memory instructions."""
-        base = get_system_prompt(self.config_path, fallback=self.system_prompt)
-        a2a = get_a2a_instructions(mcp=True)
+        """Compose the per-turn system prompt through the SINGLE base builder.
+
+        SSOT (task #76): the prompt is built by the one canonical
+        ``build_system_prompt`` (the same function the base ``_common_setup``
+        uses), which honors ``config.prompt_files`` (with the legacy
+        ``system-prompt.md`` fallback baked in) and already includes the base
+        platform identity, A2A and HMA instructions. We call it PER TURN from
+        ``self.config_path`` so a freshly-delivered/edited prompt file still
+        hot-reloads without a restart (the load-bearing claude-code behavior),
+        but the resolution now lives in ONE place — no more re-reading only
+        ``system-prompt.md`` and silently ignoring ``prompt_files`` (the
+        per-runtime drift that left the concierge identity-less).
+
+        Only ``get_display_instructions()`` is appended here: it is the
+        claude-code-specific native-tool-display guidance that is NOT part of
+        the shared base build.
+
+        If the builder is unavailable (e.g. a stubbed test runtime), fall back
+        to the base-published ``self.system_prompt`` so the executor never
+        boots prompt-less.
+        """
+        base: str | None = None
+        try:
+            from molecule_runtime.prompt import build_system_prompt
+
+            base = build_system_prompt(
+                self.config_path,
+                self.workspace_id,
+                [],   # skills: claude-code reads /configs/skills natively
+                [],   # peers: the CLI discovers peers live via the a2a MCP
+                prompt_files=self.prompt_files,
+                plugin_rules=self.plugin_rules,
+                plugin_prompts=self.plugin_prompts,
+            )
+        except Exception:  # noqa: BLE001 — never let prompt-build crash a turn
+            base = None
+
+        if not base:
+            # Builder unavailable / empty → the base-published prompt, which
+            # itself was built by the same builder at setup() time.
+            base = self.system_prompt
+
         display = get_display_instructions()
-        hma = get_hma_instructions()
-        parts = [p for p in (base, a2a, display, hma) if p]
+        parts = [p for p in (base, display) if p]
         return "\n\n".join(parts) if parts else None
 
     def _prepare_prompt(self, user_input: str) -> str:
