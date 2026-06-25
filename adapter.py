@@ -902,6 +902,12 @@ class ClaudeCodeAdapter(BaseAdapter):
         )
         await self.install_plugins_via_registry(config, plugins)
 
+        # Capture plugin fragments for create_executor() so the executor's
+        # per-turn hot-reload rebuild threads the SAME plugin_rules/plugin_prompts
+        # through build_system_prompt that setup() used (#185).
+        self._plugin_rules = getattr(plugins, "rules", None)
+        self._plugin_prompts = list(getattr(plugins, "prompt_fragments", []) or [])
+
         # --- SSOT: publish the single base-built system prompt onto config ---
         # config.system_prompt is BASE-OWNED and None until something fills it.
         # Build it HERE via the one canonical builder (``build_system_prompt``),
@@ -918,8 +924,8 @@ class ClaudeCodeAdapter(BaseAdapter):
             [],  # skills: claude-code reads /configs/skills natively
             [],  # peers: discovered live via the a2a MCP, not baked
             prompt_files=config.prompt_files,
-            plugin_rules=getattr(plugins, "rules", None),
-            plugin_prompts=list(getattr(plugins, "prompt_fragments", []) or []),
+            plugin_rules=self._plugin_rules,
+            plugin_prompts=self._plugin_prompts,
         )
 
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
@@ -1015,6 +1021,11 @@ class ClaudeCodeAdapter(BaseAdapter):
             # honoring prompt_files instead of re-reading only system-prompt.md.
             prompt_files=config.prompt_files,
             workspace_id=config.workspace_id,
+            # Thread plugin_rules/plugin_prompts for the same reason: without
+            # them the hot-reload path would silently drop plugin fragments
+            # (task #76 / #185).
+            plugin_rules=getattr(self, "_plugin_rules", None),
+            plugin_prompts=list(getattr(self, "_plugin_prompts", []) or []),
         )
 
     async def transcript_lines(self, since: int = 0, limit: int = 100) -> dict:

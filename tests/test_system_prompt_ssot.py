@@ -169,3 +169,28 @@ def test_legacy_system_prompt_md_still_loads_without_prompt_files(tmp_path):
     prompt = ex._build_system_prompt()
 
     assert "LEGACY-SINGLE-FILE" in prompt
+
+
+def test_hot_reload_preserves_plugin_fragments(tmp_path):
+    """The executor's per-turn hot-reload rebuild threads plugin_rules and
+    plugin_prompts through build_system_prompt just like setup() does, so a
+    reloaded turn does NOT silently drop plugin fragments (#185)."""
+    mod = _load_executor()
+    config_path = _concierge_configs(tmp_path)
+    ex = mod.ClaudeSDKExecutor(
+        system_prompt="BOOT-PUBLISHED-FALLBACK",
+        config_path=config_path,
+        heartbeat=None,
+        model="sonnet",
+        prompt_files=["prompts/concierge.md"],
+        workspace_id="ws-concierge",
+        plugin_rules="RULE-FRAGMENT",
+        plugin_prompts=["PROMPT-FRAGMENT-1", "PROMPT-FRAGMENT-2"],
+    )
+
+    prompt = ex._build_system_prompt()
+
+    assert "ORG-CONCIERGE-IDENTITY" in prompt
+    assert "RULE-FRAGMENT" in prompt
+    assert "PROMPT-FRAGMENT-1" in prompt
+    assert "PROMPT-FRAGMENT-2" in prompt

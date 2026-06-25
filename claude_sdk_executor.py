@@ -758,6 +758,8 @@ class ClaudeSDKExecutor(AgentExecutor):
         model: str = "sonnet",
         prompt_files: list[str] | None = None,
         workspace_id: str = "",
+        plugin_rules: str | None = None,
+        plugin_prompts: list[str] | None = None,
     ):
         # system_prompt is the base-built prompt published onto
         # config.system_prompt (BASE-OWNED, honors prompt_files). It is the
@@ -772,6 +774,11 @@ class ClaudeSDKExecutor(AgentExecutor):
         # (no system-prompt.md-only re-read that ignores prompt_files).
         self.prompt_files = list(prompt_files or [])
         self.workspace_id = workspace_id
+        # plugin_rules/plugin_prompts must also be threaded through the SAME
+        # builder on hot-reload, otherwise a reloaded turn silently drops the
+        # plugin fragments that setup() included (task #76 / #185).
+        self.plugin_rules = plugin_rules
+        self.plugin_prompts = list(plugin_prompts or [])
         self._session_id: str | None = None
         self._active_stream: AsyncIterator[Any] | None = None
         # Serializes concurrent execute() calls on the same executor so
@@ -820,6 +827,8 @@ class ClaudeSDKExecutor(AgentExecutor):
                 [],   # skills: claude-code reads /configs/skills natively
                 [],   # peers: the CLI discovers peers live via the a2a MCP
                 prompt_files=self.prompt_files,
+                plugin_rules=self.plugin_rules,
+                plugin_prompts=self.plugin_prompts,
             )
         except Exception:  # noqa: BLE001 — never let prompt-build crash a turn
             base = None

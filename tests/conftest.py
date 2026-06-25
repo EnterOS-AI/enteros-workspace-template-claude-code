@@ -74,6 +74,13 @@ def _stub_build_system_prompt(
                 content = fh.read().strip()
             if content:
                 parts.append(content)
+    # Include plugin fragments so tests can assert the hot-reload path threads
+    # plugin_rules/plugin_prompts through the same builder as setup() (#185).
+    if plugin_rules:
+        parts.append(f"[plugin_rules]\n{plugin_rules}")
+    for pp in plugin_prompts or []:
+        if pp:
+            parts.append(f"[plugin_prompt]\n{pp}")
     return "\n\n".join(parts)
 
 
