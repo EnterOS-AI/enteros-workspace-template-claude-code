@@ -24,7 +24,7 @@ async-setup tests, which need the method to exist on the parent class).
 import os
 import sys
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
 
@@ -39,11 +39,42 @@ class _StubAdapterConfig:
     config_path: str = "/tmp/configs"
     system_prompt: str = ""
     heartbeat: object = None
+    prompt_files: list = field(default_factory=list)
+    workspace_id: str = ""
 
 
 class _StubBaseAdapter:
     async def install_plugins_via_registry(self, *_args, **_kwargs):
         pass
+
+
+def _stub_build_system_prompt(
+    config_path,
+    workspace_id="",
+    loaded_skills=None,
+    peers=None,
+    *,
+    prompt_files=None,
+    plugin_rules=None,
+    plugin_prompts=None,
+    **_kwargs,
+):
+    """Faithful-enough stand-in for molecule_runtime.prompt.build_system_prompt.
+
+    Honors prompt_files (the SSOT behavior under test): loads the declared
+    files in order, else falls back to system-prompt.md. Always prefixes the
+    base platform frame so prompt-presence assertions match production shape.
+    """
+    parts = ["# You are a workspace on the Molecule AI platform"]
+    files = list(prompt_files or []) or ["system-prompt.md"]
+    for fname in files:
+        fpath = os.path.join(config_path, fname)
+        if os.path.exists(fpath):
+            with open(fpath) as fh:
+                content = fh.read().strip()
+            if content:
+                parts.append(content)
+    return "\n\n".join(parts)
 
 
 def _install_stubs() -> None:
@@ -57,10 +88,17 @@ def _install_stubs() -> None:
         mr.adapters.base.RuntimeCapabilities = _StubRuntimeCapabilities
         mr.plugins = types.ModuleType("molecule_runtime.plugins")
         mr.plugins.load_plugins = lambda **_kwargs: []
+        # adapter.setup() + the executor lazy-import
+        # molecule_runtime.prompt.build_system_prompt to publish/derive the
+        # SSOT prompt. Stub it to honor prompt_files so the SSOT behavior is
+        # exercised without the real runtime installed.
+        mr.prompt = types.ModuleType("molecule_runtime.prompt")
+        mr.prompt.build_system_prompt = _stub_build_system_prompt
         sys.modules["molecule_runtime"] = mr
         sys.modules["molecule_runtime.adapters"] = mr.adapters
         sys.modules["molecule_runtime.adapters.base"] = mr.adapters.base
         sys.modules["molecule_runtime.plugins"] = mr.plugins
+        sys.modules["molecule_runtime.prompt"] = mr.prompt
     if "a2a" not in sys.modules:
         a2a = types.ModuleType("a2a")
         a2a.server = types.ModuleType("a2a.server")

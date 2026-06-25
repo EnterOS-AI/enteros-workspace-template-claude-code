@@ -17,7 +17,7 @@ import os
 import sys
 import textwrap
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,11 +45,29 @@ class _StubAdapterConfig:
     config_path: str = "/tmp/configs"
     system_prompt: str = ""
     heartbeat: object = None
+    # Mirror the real AdapterConfig: setup()/create_executor read these to
+    # publish + thread the SSOT prompt (build_system_prompt honors prompt_files).
+    prompt_files: list = field(default_factory=list)
+    workspace_id: str = ""
 
 
 class _StubBaseAdapter:
     async def install_plugins_via_registry(self, *_args, **_kwargs):
         pass
+
+
+def _stub_build_system_prompt(config_path, workspace_id="", *_a,
+                              prompt_files=None, **_kw):
+    """Honor prompt_files (else system-prompt.md) so setup() runs without the
+    real runtime; mirrors conftest._stub_build_system_prompt."""
+    parts = ["# You are a workspace on the Molecule AI platform"]
+    for fname in (list(prompt_files or []) or ["system-prompt.md"]):
+        fpath = os.path.join(config_path, fname)
+        if os.path.exists(fpath):
+            content = open(fpath).read().strip()
+            if content:
+                parts.append(content)
+    return "\n\n".join(parts)
 
 
 def _install_stubs():
@@ -66,10 +84,15 @@ def _install_stubs():
         # without needing the real runtime installed in the test env.
         mr.plugins = types.ModuleType("molecule_runtime.plugins")
         mr.plugins.load_plugins = lambda **_kwargs: []
+        # adapter.setup() also lazy-imports molecule_runtime.prompt.
+        # build_system_prompt to publish config.system_prompt (the SSOT).
+        mr.prompt = types.ModuleType("molecule_runtime.prompt")
+        mr.prompt.build_system_prompt = _stub_build_system_prompt
         sys.modules["molecule_runtime"] = mr
         sys.modules["molecule_runtime.adapters"] = mr.adapters
         sys.modules["molecule_runtime.adapters.base"] = mr.adapters.base
         sys.modules["molecule_runtime.plugins"] = mr.plugins
+        sys.modules["molecule_runtime.prompt"] = mr.prompt
     if "a2a" not in sys.modules:
         a2a = types.ModuleType("a2a")
         a2a.server = types.ModuleType("a2a.server")

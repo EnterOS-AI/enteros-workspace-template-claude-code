@@ -902,16 +902,34 @@ class ClaudeCodeAdapter(BaseAdapter):
         )
         await self.install_plugins_via_registry(config, plugins)
 
+        # --- SSOT: publish the single base-built system prompt onto config ---
+        # config.system_prompt is BASE-OWNED and None until something fills it.
+        # Build it HERE via the one canonical builder (``build_system_prompt``),
+        # which honors ``config.prompt_files`` (with the legacy
+        # ``system-prompt.md`` fallback baked in). This is the authoritative
+        # boot value the executor receives + its hot-reload fallback; the
+        # executor re-derives through the SAME builder per turn so a delivered
+        # prompt still takes effect without a restart. Plugin rules/prompts
+        # loaded above are folded in to match the base ``_common_setup`` shape.
+        from molecule_runtime.prompt import build_system_prompt
+        config.system_prompt = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            [],  # skills: claude-code reads /configs/skills natively
+            [],  # peers: discovered live via the a2a MCP, not baked
+            prompt_files=config.prompt_files,
+            plugin_rules=getattr(plugins, "rules", None),
+            plugin_prompts=list(getattr(plugins, "prompt_fragments", []) or []),
+        )
+
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         from claude_sdk_executor import ClaudeSDKExecutor
 
-        # Load system prompt if exists
+        # The base-published prompt (setup() → build_system_prompt, honoring
+        # prompt_files) is the authoritative SSOT value + the executor's
+        # hot-reload fallback. No per-runtime system-prompt.md re-read here —
+        # that re-read ignored prompt_files (the concierge-identity drift).
         system_prompt = config.system_prompt
-        if not system_prompt:
-            prompt_file = os.path.join(config.config_path, "system-prompt.md")
-            if os.path.exists(prompt_file):
-                with open(prompt_file) as f:
-                    system_prompt = f.read()
 
         # runtime_config may arrive as a dict (from main.py vars(...)) or as a
         # RuntimeConfig dataclass. Read `model` defensively from either shape.
@@ -991,6 +1009,12 @@ class ClaudeCodeAdapter(BaseAdapter):
             config_path=config.config_path,
             heartbeat=config.heartbeat,
             model=model,
+            # Thread prompt_files + workspace_id so the executor's per-turn
+            # hot-reload re-derives through the SAME single builder
+            # (build_system_prompt) that produced config.system_prompt —
+            # honoring prompt_files instead of re-reading only system-prompt.md.
+            prompt_files=config.prompt_files,
+            workspace_id=config.workspace_id,
         )
 
     async def transcript_lines(self, since: int = 0, limit: int = 100) -> dict:
