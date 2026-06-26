@@ -163,6 +163,75 @@ _RETRYABLE_PATTERNS = (
     "try again",
 )
 
+# ---------------------------------------------------------------------------
+# Completion-stream idle cap (the platform-agent wedge fix)
+# ---------------------------------------------------------------------------
+# A hung LLM completion has no built-in deadline: the SDK's `query()` /
+# `receive_response()` async iterators simply never yield the next message
+# when the upstream stalls. Because `_execute_locked` holds the per-turn
+# run-lock for the entire stream, ONE stalled completion blocks the lock
+# forever — every subsequent inbound A2A message queues behind it, 524s, and
+# strands, while the workspace heartbeat still reports "online" (the wedge is
+# invisible).
+#
+# Mirror the guard the NATIVE LangGraph runtime already ships
+# (molecule_runtime.a2a_executor, gated on A2A_COMPLETION_IDLE_TIMEOUT_SECONDS):
+# cap the idle gap BETWEEN streamed messages — NOT the whole turn — so a long
+# but legitimately-progressing tool turn is never killed, while a stream that
+# goes silent for the cap is aborted with a TimeoutError. Same env knob and
+# default (900s) as the native executor so operators tune one value across
+# both runtimes.
+_COMPLETION_IDLE_CAP_S = float(os.environ.get("A2A_COMPLETION_IDLE_TIMEOUT_SECONDS", "900"))
+# Hard bound on the best-effort teardown of a stalled stream. A hung aclose()
+# does NOT raise — try/except catches errors, not hangs — so without this cap the
+# idle-cap cleanup below could block the recovery path indefinitely. Kept small
+# by design (10–30s): just long enough for a healthy stream to close.
+_ACLOSE_TIMEOUT_S = 15.0
+
+
+async def _aiter_with_idle_cap(stream: Any) -> AsyncIterator[Any]:
+    """Yield items from an async message stream, enforcing an idle cap
+    BETWEEN items.
+
+    Mirrors the native a2a_executor guard — its
+    ``await asyncio.wait_for(_aiter.__anext__(), _idle_cap)`` loop. The
+    timeout is reset on every yielded message, so it bounds the gap between
+    messages, not the total turn duration: a long tool turn that keeps
+    emitting events is never killed, but a completion that goes silent for
+    ``_COMPLETION_IDLE_CAP_S`` seconds closes the underlying stream (so the
+    stalled CLI subprocess coroutine sees the cancellation and cleans up) and
+    raises a builtin ``TimeoutError`` carrying the "completion stalled" marker
+    the executor's wedge-detection matches on.
+    """
+    aiter = stream.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(aiter.__anext__(), _COMPLETION_IDLE_CAP_S)
+        except StopAsyncIteration:
+            return
+        except asyncio.TimeoutError:
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                # Bound the teardown explicitly. A hung aclose() never raises
+                # (except catches errors, not hangs), so an unbounded await here
+                # could block the recovery path below forever. wait_for makes the
+                # cleanup best-effort AND time-bounded, so the terminal raise
+                # (-> _mark_sdk_wedged -> slot freed -> queue drains) is always
+                # reachable even when aclose hangs or errors.
+                try:
+                    await asyncio.wait_for(aclose(), timeout=_ACLOSE_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - best-effort, bounded teardown
+                    logger.debug(
+                        "idle-cap stream.aclose() hung or errored (bounded at %ss, ignored)",
+                        _ACLOSE_TIMEOUT_S,
+                        exc_info=True,
+                    )
+            raise TimeoutError(
+                f"completion stalled: no SDK message for {_COMPLETION_IDLE_CAP_S}s"
+            )
+        yield item
+
+
 # Module-level SDK-wedge flag. When claude_agent_sdk's `query.initialize()`
 # raises `Control request timeout: initialize`, the SDK's internal client-
 # process state is corrupted for the rest of the Python process — every
@@ -1360,7 +1429,7 @@ class ClaudeSDKExecutor(AgentExecutor):
             await client.query(prompt)
             self._active_stream = client.receive_response()
             try:
-                async for message in self._active_stream:
+                async for message in _aiter_with_idle_cap(self._active_stream):
                     await self._accumulate_message(message, acc)
             except Exception:
                 # Mirror _run_query: prefer the captured is_error text over a
@@ -1428,7 +1497,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         self._active_stream = sdk.query(prompt=prompt, options=options)
         try:
             try:
-                async for message in self._active_stream:
+                async for message in _aiter_with_idle_cap(self._active_stream):
                     if isinstance(message, sdk.AssistantMessage):
                         for block in message.content:
                             if isinstance(block, sdk.TextBlock):
@@ -2003,6 +2072,21 @@ class ClaudeSDKExecutor(AgentExecutor):
                     # which already includes both the message and the
                     # exception class name.
                     formatted_lc = formatted.lower()
+                    # Completion-stall wedge (the platform-agent wedge fix):
+                    # `_aiter_with_idle_cap` aborted the turn because the LLM
+                    # completion stream went silent for > _COMPLETION_IDLE_CAP_S.
+                    # By the time we get here the per-turn run-lock has been held
+                    # for the full idle cap, so inbound A2A messages have been
+                    # queuing/524-ing the whole time while the workspace still
+                    # showed "online" — an invisible wedge. Flag it so the next
+                    # heartbeat reports runtime_state="wedged" → the platform
+                    # flips the workspace to degraded and surfaces a Restart
+                    # hint. A later good turn clears it via
+                    # _clear_sdk_wedge_on_success.
+                    if "completion stalled" in formatted_lc:
+                        _mark_sdk_wedged(
+                            f"completion stalled >{_COMPLETION_IDLE_CAP_S}s - restart workspace"
+                        )
                     for pat in _WEDGE_ERROR_PATTERNS:
                         if pat in formatted_lc:
                             _mark_sdk_wedged(
