@@ -128,7 +128,8 @@ def _tool_names_from_mcp_server_status(server: dict) -> set[str]:
     """Normalize the optional ``tools`` field on an SDK McpServerStatus dict.
 
     The real SDK returns a list of ``McpToolInfo`` objects (each with a ``name``
-    attr); the unit-test stub returns a list of plain strings. Accept both.
+    attr); the unit-test stub returns a list of plain strings. Accept all three
+    shapes: objects with ``.name``, dicts with a ``name`` key, and plain strings.
     """
     tools = server.get("tools") or []
     names: set[str] = set()
@@ -136,7 +137,7 @@ def _tool_names_from_mcp_server_status(server: dict) -> set[str]:
         if isinstance(tool, dict):
             name = tool.get("name")
         else:
-            name = tool
+            name = getattr(tool, "name", tool)
         if isinstance(name, str):
             names.add(name)
     return names

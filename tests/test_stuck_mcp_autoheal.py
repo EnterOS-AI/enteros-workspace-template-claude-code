@@ -452,3 +452,25 @@ async def test_heal_does_not_mark_wedge(tmp_path):
     ])
     await ex._execute_locked("create a workspace")
     assert not mod.is_wedged()
+
+
+def test_tool_names_from_mcp_server_status_handles_object_name_attr():
+    """The real SDK returns McpToolInfo objects with a .name attr; dicts and
+    plain strings also appear in stubs. _tool_names_from_mcp_server_status
+    must normalize all three shapes."""
+    mod = _load_executor()
+    _tool_names = mod._tool_names_from_mcp_server_status
+
+    class ToolInfo:
+        def __init__(self, name):
+            self.name = name
+
+    names = _tool_names({
+        "tools": [
+            "plain-string-tool",
+            {"name": "dict-tool"},
+            ToolInfo("object-tool"),
+            ToolInfo("provision_workspace"),
+        ]
+    })
+    assert names == {"plain-string-tool", "dict-tool", "object-tool", "provision_workspace"}
