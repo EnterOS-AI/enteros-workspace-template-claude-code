@@ -12,16 +12,19 @@ This suite pins the durable fix in `claude_sdk_executor.py`:
 
   (a) When the config declares extra (non-`a2a`) MCP servers, the turn is
       routed through a persistent `ClaudeSDKClient` and GATED on
-      `get_mcp_status()` until every declared server is `connected` BEFORE the
-      prompt is sent — so the tools are live in the model's tool list.
+      `get_mcp_status()` until every declared server is `connected` AND the
+      SSOT-required tool (`provision_workspace`) is present in its callable
+      `tools` list BEFORE the prompt is sent.
   (b) Ordinary workspaces (no extra MCP servers) keep the fast one-shot
       `query()` path untouched.
-  (c) If a declared server never connects within the bounded poll window, the
-      gate raises `_McpNotReadyError`; the executor RESETS the session and
-      RETRIES once (loud ERROR log).
-  (d) The retry, finding the server now connected, succeeds.
-  (e) The heal is CAPPED at one reset per dispatch — a server that is still
-      not-ready on the retry is a hard, loud error, not an infinite loop.
+  (c) If a declared server is not ready (or is connected but missing the
+      required tool), the gate raises `_McpNotReadyError`; the executor
+      reloads the MCP server via `client.reconnect_mcp_server()` and re-gates,
+      bounded by `_MCP_HEAL_MAX_RETRIES`.
+  (d) The reload, finding the server now connected with the required tool,
+      succeeds.
+  (e) The reload loop is CAPPPED; after exhausting the retries the workspace
+      fails-degraded (marked wedged) so the platform surfaces a Restart hint.
 
 No network: `sdk.ClaudeSDKClient` is a scriptable stub. Mirrors
 tests/test_context_overflow_autoheal.py's stub-install pattern.
@@ -71,9 +74,11 @@ class _StubTextBlock:
 def _install_stubs() -> None:
     sdk = _ensure_module("claude_agent_sdk")
     _ensure_attr(sdk, "ClaudeAgentOptions", MagicMock(name="ClaudeAgentOptions"))
-    _ensure_attr(sdk, "AssistantMessage", _StubAssistantMessage)
-    _ensure_attr(sdk, "TextBlock", _StubTextBlock)
-    _ensure_attr(sdk, "ResultMessage", _StubResultMessage)
+    # Force-overwrite message classes so this file's stubs win even when other
+    # test modules (e.g. test_extra_mcp_servers.py) have installed narrower stubs.
+    sdk.AssistantMessage = _StubAssistantMessage
+    sdk.TextBlock = _StubTextBlock
+    sdk.ResultMessage = _StubResultMessage
     _ensure_attr(sdk, "query", MagicMock(name="query"))
     # ClaudeSDKClient is overridden per-test via mod.sdk.ClaudeSDKClient.
     _ensure_attr(sdk, "ClaudeSDKClient", MagicMock(name="ClaudeSDKClient"))
@@ -156,7 +161,6 @@ def _make_executor(mod, config_path, model="sonnet"):
         return None
 
     # Neutralize the best-effort activity-row notifications (no httpx).
-    ex._notify_stuck_mcp_heal = _noop_notify  # type: ignore[assignment]
     ex._notify_context_overflow_heal = _noop_notify  # type: ignore[assignment]
     return ex
 
@@ -178,7 +182,9 @@ class _ClientScript:
 
 class _StubClient:
     """Records calls + replays a scripted _ClientScript. Class-level `_scripts`
-    list is consumed one per connect()."""
+    list is consumed one per connect(); reconnect_mcp_server() consumes the
+    next script to simulate a fresh server load without tearing down the CLI.
+    """
 
     _scripts: list = []
     instances: list = []
@@ -190,6 +196,7 @@ class _StubClient:
         self.queried = None
         self.connected = False
         self.disconnected = False
+        self.reconnects: list[str] = []
         _StubClient.instances.append(self)
 
     async def connect(self, prompt=None):
@@ -212,6 +219,17 @@ class _StubClient:
     async def disconnect(self):
         self.disconnected = True
 
+    async def reconnect_mcp_server(self, server_name: str):
+        """Simulate a server reload: consume the next queued script (if any)
+        and reset the status poll so the new handshake sequence replays."""
+        self.reconnects.append(server_name)
+        if _StubClient._scripts:
+            next_script = _StubClient._scripts.pop(0)
+            self._script.status_sequence = next_script.status_sequence
+            if next_script.response:
+                self._script.response = next_script.response
+        self._poll = 0
+
 
 def _install_client_scripts(mod, scripts):
     _StubClient._scripts = list(scripts)
@@ -225,10 +243,11 @@ def mod_RM(**kw):
     return sdk.ResultMessage(**kw)
 
 
-CONNECTED = [{"name": "platform", "status": "connected", "tools": ["a"] * 88}]
+CONNECTED = [{"name": "platform", "status": "connected", "tools": ["provision_workspace", "other"]}]
 PENDING = [{"name": "platform", "status": "pending"}]
 FAILED = [{"name": "platform", "status": "failed", "error": "boom"}]
 DISABLED = [{"name": "platform", "status": "disabled"}]
+MISSING_TOOL = [{"name": "platform", "status": "connected", "tools": ["other"]}]
 
 
 # ---- Tests ----------------------------------------------------------------
@@ -295,7 +314,7 @@ async def test_stuck_pending_raises_not_ready(tmp_path):
 @pytest.mark.asyncio
 async def test_disabled_status_raises_early(tmp_path):
     """A `disabled` status is hard-terminal — gate stops immediately, no
-    waiting (a config/auth problem no retry can fix)."""
+    waiting (a config/auth problem no reload can fix)."""
     mod = _load_executor()
     cfgdir = _write_platform_config(tmp_path)
     ex = _make_executor(mod, cfgdir)
@@ -309,17 +328,38 @@ async def test_disabled_status_raises_early(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_failed_is_retryable_not_terminal(tmp_path):
-    """A `failed` status is RETRYABLE (intermittent under load), not hard-
-    terminal: the gate raises _McpNotReadyError so the heal retries on a fresh
-    subprocess. First turn fails, retry connects → success."""
+async def test_connected_missing_required_tool_raises_not_ready(tmp_path):
+    """A server can report `connected` but not expose the SSOT-required
+    management tool. The gate must treat that as NOT ready so the reload
+    heal can try again."""
     mod = _load_executor()
     cfgdir = _write_platform_config(tmp_path)
     ex = _make_executor(mod, cfgdir)
     mod._MCP_READY_POLL_INTERVAL_S = 0
     mod._MCP_READY_MAX_POLLS = 1
     _install_client_scripts(mod, [
+        _ClientScript(status_sequence=[MISSING_TOOL], response=[]),
+    ])
+    with pytest.raises(mod._McpNotReadyError) as ei:
+        await ex._run_query("x", ex._build_options())
+    assert ei.value.server == "platform"
+    assert "missing-provision_workspace" in ei.value.status
+
+
+@pytest.mark.asyncio
+async def test_failed_is_retryable_not_terminal(tmp_path):
+    """A `failed` status is RETRYABLE (intermittent under load), not hard-
+    terminal: the gate reloads the server with `reconnect_mcp_server()`,
+    the reload handshake succeeds, and the turn completes."""
+    mod = _load_executor()
+    cfgdir = _write_platform_config(tmp_path)
+    ex = _make_executor(mod, cfgdir)
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 1
+    _install_client_scripts(mod, [
+        # Initial load: server failed.
         _ClientScript(status_sequence=[FAILED], response=[]),
+        # After reconnect: server healthy.
         _ClientScript(
             status_sequence=[CONNECTED],
             response=[mod_RM(result="recovered", session_id="s2")],
@@ -327,12 +367,17 @@ async def test_failed_is_retryable_not_terminal(tmp_path):
     ])
     out = await ex._execute_locked("create a workspace")
     assert out == "recovered"
+    client = _StubClient.instances[0]
+    assert client.reconnects == ["platform"]
+    # Same CLI subprocess / client is reused across the reload.
+    assert len(_StubClient.instances) == 1
 
 
 @pytest.mark.asyncio
-async def test_heal_resets_and_retries_then_succeeds(tmp_path, caplog):
-    """First turn: stuck pending → _McpNotReadyError → session reset + retry.
-    Second turn (retry): connected → success. Exactly one heal."""
+async def test_heal_reloads_server_then_succeeds(tmp_path, caplog):
+    """First turn: stuck pending → _McpNotReadyError → reload server with
+    reconnect_mcp_server(). Second load: connected → success. Exactly one
+    reload, one client instance."""
     import logging
     mod = _load_executor()
     cfgdir = _write_platform_config(tmp_path)
@@ -340,7 +385,7 @@ async def test_heal_resets_and_retries_then_succeeds(tmp_path, caplog):
     ex._session_id = "old-session"
     mod._MCP_READY_POLL_INTERVAL_S = 0
     mod._MCP_READY_MAX_POLLS = 2
-    # Turn 1: stuck pending (heal fires). Turn 2: connected (succeeds).
+    # Turn 1: stuck pending (reload fires). Turn 2: connected (succeeds).
     _install_client_scripts(mod, [
         _ClientScript(status_sequence=[PENDING], response=[]),
         _ClientScript(
@@ -353,23 +398,26 @@ async def test_heal_resets_and_retries_then_succeeds(tmp_path, caplog):
     assert out == "created workspace e2e"
     assert ex._session_id == "s2"
     # Loud ERROR log on heal.
-    assert any("not ready" in r.message for r in caplog.records)
-    # Two connects (original + retry).
-    assert len(_StubClient.instances) == 2
+    assert any("reloading MCP server" in r.message for r in caplog.records)
+    # One connect; reconnect reloads within the same client.
+    assert len(_StubClient.instances) == 1
+    assert _StubClient.instances[0].reconnects == ["platform"]
 
 
 @pytest.mark.asyncio
 async def test_heal_bounded_no_infinite_loop(tmp_path, caplog):
-    """Server stuck pending on the original AND every retry → no infinite
-    loop; surfaces a hard error after exactly `_MCP_HEAL_MAX_RETRIES` resets
-    (original + the retries = total attempts)."""
+    """Server stuck pending on the original load AND every reload → no infinite
+    loop; the workspace fails-degraded (wedged) after exactly
+    `_MCP_HEAL_MAX_RETRIES` reload attempts."""
     import logging
     mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
     cfgdir = _write_platform_config(tmp_path)
     ex = _make_executor(mod, cfgdir)
     mod._MCP_READY_POLL_INTERVAL_S = 0
     mod._MCP_READY_MAX_POLLS = 1
-    total_attempts = mod._MCP_HEAL_MAX_RETRIES + 1
+    # Original load + one script per allowed reload, all stuck pending.
+    total_attempts = 1 + mod._MCP_HEAL_MAX_RETRIES
     _install_client_scripts(
         mod, [_ClientScript(status_sequence=[PENDING], response=[])] * total_attempts
     )
@@ -377,9 +425,12 @@ async def test_heal_bounded_no_infinite_loop(tmp_path, caplog):
         out = await ex._execute_locked("create a workspace")
     # Sanitized hard error, not an infinite loop.
     assert "Agent error" in out
-    assert any("auto-heal exhausted" in r.message for r in caplog.records)
-    # Exactly total_attempts connects: original + the bounded retries.
-    assert len(_StubClient.instances) == total_attempts
+    assert any("stuck-MCP auto-heal exhausted" in r.message for r in caplog.records)
+    # Exactly `_MCP_HEAL_MAX_RETRIES` reconnect calls, all on one client.
+    assert len(_StubClient.instances) == 1
+    assert len(_StubClient.instances[0].reconnects) == mod._MCP_HEAL_MAX_RETRIES
+    # Exhausted reloads fail-degraded.
+    assert mod.is_wedged()
 
 
 @pytest.mark.asyncio
