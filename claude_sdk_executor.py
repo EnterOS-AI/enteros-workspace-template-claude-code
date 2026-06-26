@@ -182,6 +182,11 @@ _RETRYABLE_PATTERNS = (
 # default (900s) as the native executor so operators tune one value across
 # both runtimes.
 _COMPLETION_IDLE_CAP_S = float(os.environ.get("A2A_COMPLETION_IDLE_TIMEOUT_SECONDS", "900"))
+# Hard bound on the best-effort teardown of a stalled stream. A hung aclose()
+# does NOT raise — try/except catches errors, not hangs — so without this cap the
+# idle-cap cleanup below could block the recovery path indefinitely. Kept small
+# by design (10–30s): just long enough for a healthy stream to close.
+_ACLOSE_TIMEOUT_S = 15.0
 
 
 async def _aiter_with_idle_cap(stream: Any) -> AsyncIterator[Any]:
@@ -207,12 +212,22 @@ async def _aiter_with_idle_cap(stream: Any) -> AsyncIterator[Any]:
         except asyncio.TimeoutError:
             aclose = getattr(stream, "aclose", None)
             if aclose is not None:
+                # Bound the teardown explicitly. A hung aclose() never raises
+                # (except catches errors, not hangs), so an unbounded await here
+                # could block the recovery path below forever. wait_for makes the
+                # cleanup best-effort AND time-bounded, so the terminal raise
+                # (-> _mark_sdk_wedged -> slot freed -> queue drains) is always
+                # reachable even when aclose hangs or errors.
                 try:
-                    await aclose()
-                except Exception:  # noqa: BLE001 - best-effort teardown
-                    pass
+                    await asyncio.wait_for(aclose(), timeout=_ACLOSE_TIMEOUT_S)
+                except Exception:  # noqa: BLE001 - best-effort, bounded teardown
+                    logger.debug(
+                        "idle-cap stream.aclose() hung or errored (bounded at %ss, ignored)",
+                        _ACLOSE_TIMEOUT_S,
+                        exc_info=True,
+                    )
             raise TimeoutError(
-                "completion stalled: no message for %ss" % _COMPLETION_IDLE_CAP_S
+                f"completion stalled: no SDK message for {_COMPLETION_IDLE_CAP_S}s"
             )
         yield item
 
