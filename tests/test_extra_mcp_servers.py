@@ -317,6 +317,9 @@ def test_mcp_plugin_delivery_contract_is_byte_identical_ssot():
     assert contract["producer"] == "MCPServerAdaptor"
     assert contract["consumer"] == "claude_sdk_executor._load_settings_mcp"
     assert contract["entry_shape"] == "name->{command,args?,env?}"
+    assert contract["mcp_server_name"] == "molecule-platform"
+    assert contract["required_tool"] == "provision_workspace"
+    assert contract["loaded_mcp_tools_field"] == "loaded_mcp_tools"
 
 
 def test_build_options_logs_settings_mcp_servers_folding(tmp_path, caplog):
