@@ -43,10 +43,6 @@ on:
       - 'internal/providers/registry-projection.json'
       - 'internal/providers/registry_projection.py'
       - '.gitea/workflows/sync-providers-yaml.yml'
-  schedule:
-    # Daily at :41 — catch a canonical change in controlplane that landed
-    # without a paired template re-sync PR. Off-zero to spread cron load.
-    - cron: '41 4 * * *'
   workflow_dispatch:
 
 env:

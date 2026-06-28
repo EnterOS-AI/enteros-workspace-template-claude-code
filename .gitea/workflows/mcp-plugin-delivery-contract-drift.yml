@@ -28,10 +28,6 @@ on:
     paths:
       - 'contracts/mcp-plugin-delivery.contract.json'
       - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
-  schedule:
-    # Daily at :37 — catch a core-side contract change that landed without a
-    # paired template re-sync PR (off-zero to spread cron load).
-    - cron: '37 4 * * *'
   workflow_dispatch:
 
 permissions:
