@@ -251,17 +251,29 @@ jobs:
         run: |
           set -euo pipefail
           SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
-          docker tag "${SHA_REF}" "${PUSH_IMAGE_NAME}:latest"
-          docker push "${PUSH_IMAGE_NAME}:latest"
+          LATEST_REF="${PUSH_IMAGE_NAME}:latest"
+          # Push the IMMUTABLE sha tag FIRST and derive the pin digest from it;
+          # only advance the floating :latest AFTER the sha publish + digest are
+          # confirmed. A partial publish (latest ok, sha/digest fails) must never
+          # leave :latest ahead of a promoted sha pin. (review #201/#141)
           PUSHOUT="$(docker push "${SHA_REF}")"
           printf '%s\n' "${PUSHOUT}"
+          # docker push stdout is not a stable API: prefer its digest line, but
+          # fall back to an inspect of the just-pushed immutable ref so a missing/
+          # reformatted line can't drop the digest (BuildKit treats localhost as
+          # insecure, so the HTTP inspect works). (review)
           DIGEST="$(printf '%s\n' "${PUSHOUT}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
           if [ -z "${DIGEST}" ]; then
-            echo "::error::could not parse the pushed manifest digest from docker push output"
+            DIGEST="$(docker buildx imagetools inspect "${SHA_REF}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"[:space:]' || true)"
+          fi
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not determine the pushed manifest digest for ${SHA_REF}"
             exit 1
           fi
+          docker tag "${SHA_REF}" "${LATEST_REF}"
+          docker push "${LATEST_REF}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "::notice::pushed ${SHA_REF} + :latest to ${PUSH_HOST}; manifest digest ${DIGEST} (pins as ${IMAGE_NAME}@${DIGEST})"
+          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
