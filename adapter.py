@@ -568,6 +568,14 @@ def _resolve_provider(
 ) -> dict:
     """Return the provider entry matching this model id.
 
+    Selection is flag-free: the ``platform`` arm (CP proxy, metered billing)
+    is chosen exactly like every other provider — by the resolved provider
+    (``explicit_provider``/``LLM_PROVIDER``/model→provider), NOT by a
+    ``MOLECULE_LLM_BILLING_MODE`` env. ``provider==platform`` is the single
+    signal that routes through the proxy (part of the org-wide
+    ``llm_billing_mode`` removal; core injects ``LLM_PROVIDER=platform`` for
+    platform-routed workspaces).
+
     If ``explicit_provider`` is given (set via the ``provider:`` field in
     workspace config.yaml or runtime_config), look up by name first. If the
     named provider is not in the registry, RAISE ``ValueError`` with an
