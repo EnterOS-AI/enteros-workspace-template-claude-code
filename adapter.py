@@ -788,6 +788,23 @@ class ClaudeCodeAdapter(BaseAdapter):
         if not picked_model:
             picked_model = "sonnet"
 
+        # SSOT signal — TOP PRECEDENCE. ``MOLECULE_RESOLVED_PROVIDER`` is the
+        # single provider value core's workspace provisioner publishes after
+        # resolving the provider ONCE (Go ``manifest.DeriveProvider``). When it
+        # is set it overrides every other source here — the env
+        # MODEL_PROVIDER/MODEL convention, the YAML/runtime_config ``provider:``
+        # field, and model-prefix derivation — so claude-code selects exactly the
+        # registry arm core resolved (``platform`` for the metered proxy, a byok
+        # arm such as ``anthropic-api`` otherwise). It carries the registry arm
+        # name verbatim, so it flows straight into ``explicit_provider`` and is
+        # validated by ``_resolve_provider`` (which raises an actionable
+        # ValueError if the name is not in the registry, same as #180). The
+        # adapter falls back to the resolution above ONLY when the SSOT signal is
+        # absent (back-compat for provisioners that predate it).
+        resolved_provider = (os.environ.get("MOLECULE_RESOLVED_PROVIDER") or "").strip()
+        if resolved_provider:
+            explicit_provider_name = resolved_provider
+
         # NOTE: do NOT strip the provider prefix here. The pre-fix routing
         # behavior — `anthropic:claude-opus-4-7` falls through to
         # providers[0] (anthropic-oauth) when no model_prefixes match — is

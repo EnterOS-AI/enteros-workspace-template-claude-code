@@ -1026,3 +1026,94 @@ async def test_setup_keeps_prefix_routing_oauth_for_anthropic_prefix(
     assert not auth_warnings, (
         f"OAuth users should not see API-key warnings; got {auth_warnings}"
     )
+
+
+# ---- SSOT signal: MOLECULE_RESOLVED_PROVIDER (TOP PRECEDENCE) ----
+#
+# Core's workspace provisioner resolves the provider ONCE (Go
+# manifest.DeriveProvider) and publishes the registry arm name in the single env
+# var MOLECULE_RESOLVED_PROVIDER. The adapter READS it as the top-precedence
+# explicit provider: it overrides MODEL_PROVIDER/the YAML provider/model
+# derivation and selects the named registry arm directly. It falls back to the
+# existing resolution ONLY when the signal is absent (back-compat).
+
+_PLATFORM_BASE = "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
+_MINIMAX_BASE = "https://api.minimax.io/anthropic"
+
+
+def _clear_provider_env(monkeypatch):
+    for k in ("MOLECULE_RESOLVED_PROVIDER", "MODEL", "MODEL_PROVIDER",
+              "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(k, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_platform_selects_platform_arm(
+    adapter, monkeypatch, configs_dir, caplog
+):
+    """MOLECULE_RESOLVED_PROVIDER=platform selects the platform arm even though
+    the model (`sonnet`) would otherwise resolve to anthropic-oauth."""
+    import logging
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "platform")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path=configs_dir
+    )
+    with caplog.at_level(logging.INFO, logger="adapter"):
+        await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _PLATFORM_BASE
+    banner = next(
+        (r.getMessage() for r in caplog.records
+         if "Claude Code adapter starting" in r.getMessage()), "",
+    )
+    assert "provider=platform" in banner, f"banner={banner!r}"
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_beats_legacy_model_provider(
+    adapter, monkeypatch, configs_dir
+):
+    """TOP PRECEDENCE: MOLECULE_RESOLVED_PROVIDER=platform wins even when the
+    legacy MODEL_PROVIDER names a different (byok) registry arm."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "platform")
+    monkeypatch.setenv("MODEL", "MiniMax-M2")
+    monkeypatch.setenv("MODEL_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2", "provider": "minimax"},
+        config_path=configs_dir,
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _PLATFORM_BASE
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_byok_arm_selected_by_name(
+    adapter, monkeypatch, configs_dir
+):
+    """A byok resolved arm (minimax) is selected by name — NOT re-derived from
+    the model. Model `sonnet` would map to anthropic-oauth, but the SSOT signal
+    routes to the minimax Anthropic-compat endpoint."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path=configs_dir
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _MINIMAX_BASE
+
+
+@pytest.mark.asyncio
+async def test_setup_absent_signal_falls_back_to_legacy_resolution(
+    adapter, monkeypatch, configs_dir
+):
+    """Back-compat: with MOLECULE_RESOLVED_PROVIDER absent, the legacy
+    MODEL_PROVIDER=minimax slug still selects the minimax arm."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MODEL", "MiniMax-M2")
+    monkeypatch.setenv("MODEL_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2"}, config_path=configs_dir
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _MINIMAX_BASE
