@@ -1,6 +1,6 @@
 name: publish-image
 
-# Builds the claude-code workspace template Dockerfile and pushes it to ECR as
+# Builds the claude-code workspace template Dockerfile and pushes it to the Gitea registry (registry.moleculesai.app) as
 # `<REGISTRY>/workspace-template-claude-code:latest` + `:sha-<7>`.
 #
 # Ported/inlined from molecule-ci's publish-template-image.yml reusable
@@ -39,9 +39,23 @@ env:
   # Belt-and-suspenders for act_runner runners regenerated without the
   # config.yaml envs block. (feedback_act_runner_github_server_url)
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  ECR_REGISTRY: 153263036946.dkr.ecr.us-east-2.amazonaws.com
-  IMAGE_NAME: 153263036946.dkr.ecr.us-east-2.amazonaws.com/molecule-ai/workspace-template-claude-code
-  AWS_DEFAULT_REGION: us-east-2
+  # CANONICAL content-addressed registry host (Cloudflare-fronted alias) -
+  # used for the promoted PIN ref and the image labels (IMAGE_NAME@<digest>).
+  IMAGE_NAME: registry.moleculesai.app/molecule-ai/workspace-template-claude-code
+  # CF-BYPASS local push endpoint. registry.moleculesai.app is Cloudflare-
+  # fronted with a ~100MB request-body cap, but buildx/docker uploads the
+  # 1.7-2.4GB template layers as a monolithic blob PUT -> Cloudflare 413
+  # Payload Too Large. Push straight to the local Gitea OCI endpoint instead:
+  # the runner mounts the host docker.sock, so docker login/push execute
+  # against the HOST docker daemon, where `localhost:3200` is the host's
+  # Gitea port-map (an insecure-OK localhost registry - no TLS / insecure-
+  # registries config required). It is the SAME Gitea backend that serves
+  # registry.moleculesai.app, so the pushed manifest is content-addressed
+  # and host-independent and the canonical-host pin resolves + pulls
+  # identically. Mirrors the Track-A Phase-1 host-side seed (blobs pushed
+  # direct to the local Gitea, not via the Cloudflare alias).
+  PUSH_HOST: localhost:3200
+  PUSH_IMAGE_NAME: localhost:3200/molecule-ai/workspace-template-claude-code
 
 permissions:
   contents: read
@@ -71,28 +85,18 @@ jobs:
 
   publish:
     name: Build & push workspace-template-claude-code image
-    # internal#512: pin to the dedicated Linux publish runners (label
-    # "publish" → molecule-runner-publish-1/2). MUST NOT use `ubuntu-latest`:
-    # that label is also advertised by the Windows/WSL self-hosted runners
-    # (hongming-pc-runner-*), so this docker build/push job lands
-    # non-deterministically on a Windows runner where `aws ecr
-    # get-login-password | docker login --password-stdin` fails with
-    # "Failed to initialize: protocol not available" and the image never
-    # publishes. Placement-dependent, NOT a transient flake. Mirrors the
-    # molecule-core convention (publish-workspace-server-image.yml /
-    # publish-runtime.yml / publish-canvas-image.yml: `runs-on: publish`)
-    # and the codex sibling fix (PR#9).
-    # AND-of-labels: `publish` is also advertised by some
-    # hongming-pc-runner-publish-* runners (Windows), whose runner-base
-    # image (`docker-config-fix`) breaks `docker login --password-stdin`
-    # with `Error saving credentials: mkdir /home/hongming: permission
-    # denied` (same EACCES bug class as internal#597/#603 act_runner HOME
-    # injection). op-host molecule-runner-publish-{1,2} are the only
-    # runners advertising BOTH `publish` AND `release` (op-host
-    # /opt/molecule/runners/config.publish.yaml lines 28-29). Requiring
-    # both labels routes publish to op-host deterministically. Matches
-    # template-codex tc#22 (merge 0fb25352).
-    runs-on: [publish, release]
+    # CF-bypass (Cloudflare 413): this job PUSHES the 1.7-2.4GB image to the
+    # Gitea OCI registry. registry.moleculesai.app is Cloudflare-fronted with a
+    # ~100MB request-body cap, so a monolithic blob PUT of the layers 413s. The
+    # push therefore has to run on a runner CO-LOCATED with the local Gitea,
+    # where `localhost:3200` is the host's registry port and docker login/push
+    # execute against the HOST docker daemon (this runner mounts the host
+    # /var/run/docker.sock; act_runner docker_host = that sock). The local
+    # `ci-meta` runner satisfies this. The dedicated remote `[publish, release]`
+    # runners CANNOT reach the host's localhost:3200 (verified: `docker login
+    # localhost:3200` -> dial tcp 127.0.0.1:3200: connection refused), so they
+    # must not run this job while the registry is served locally + CF-fronted.
+    runs-on: ci-meta
     timeout-minutes: 30
     needs: resolve-version
     # Bubble the Push step's digest to the job level so the downstream
@@ -140,15 +144,42 @@ jobs:
           fi
           echo "::notice::no bare imports of runtime modules in *.py files"
 
-      - name: Log in to ECR
+      - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
+        # ECR retired (operator directive: use our own registry). Push to the
+        # Gitea-backed OCI registry at registry.moleculesai.app. The push
+        # credential is the Gitea package-publisher, fetched from the Infisical
+        # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
+        # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
+        # workflow_dispatch only) so the trio is never exposed to a fork; the
+        # conditional is belt-and-suspenders (Gitea also withholds secrets from
+        # fork runners).
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
         env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          INFISICAL_CI_CLIENT_ID: ${{ secrets.INFISICAL_CI_CLIENT_ID }}
+          INFISICAL_CI_CLIENT_SECRET: ${{ secrets.INFISICAL_CI_CLIENT_SECRET }}
+          INFISICAL_PROJECT_ID: ${{ secrets.INFISICAL_CI_PROJECT_ID }}
         run: |
-          set -euo pipefail
-          aws ecr get-login-password --region us-east-2 | \
-            docker login --username AWS --password-stdin "${ECR_REGISTRY}"
-
+          set -uo pipefail
+          BASE="https://key.moleculesai.app"
+          TOK=$(curl -fsS -X POST "$BASE/api/v1/auth/universal-auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "{\"clientId\":\"$INFISICAL_CI_CLIENT_ID\",\"clientSecret\":\"$INFISICAL_CI_CLIENT_SECRET\"}" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); v=d.get("accessToken"); sys.stdout.write(v if isinstance(v,str) and v else "")')
+          read_secret() {
+            curl -fsS "$BASE/api/v3/secrets/raw/$1?workspaceId=$INFISICAL_PROJECT_ID&environment=prod&secretPath=$2" \
+              -H "Authorization: Bearer $TOK" \
+              | python3 -c 'import sys,json; d=json.load(sys.stdin); v=(d.get("secret") or {}).get("secretValue"); sys.stdout.write(v if isinstance(v,str) and v else "")'
+          }
+          GITEA_USER=$(read_secret GITEA_PYPI_PUBLISHER_USER %2Fci%2Fgitea-pypi-publisher)
+          GITEA_TOKEN=$(read_secret GITEA_PYPI_PUBLISHER_TOKEN %2Fci%2Fgitea-pypi-publisher)
+          echo "::add-mask::$GITEA_TOKEN"
+          if [ -z "$GITEA_USER" ] || [ -z "$GITEA_TOKEN" ]; then
+            echo "::error::Infisical returned empty registry publisher creds at /ci/gitea-pypi-publisher"
+            exit 1
+          fi
+          echo "$GITEA_TOKEN" | docker login "$PUSH_HOST" -u "$GITEA_USER" --password-stdin \
+            || { echo "::error::docker login to $PUSH_HOST failed"; exit 1; }
+          echo "::notice::logged in to $PUSH_HOST (CF-bypass local Gitea OCI) as $GITEA_USER"
       - name: Verify Docker daemon access
         run: |
           set -euo pipefail
@@ -161,24 +192,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
 
-      - name: Ensure ECR repository exists
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        run: |
-          set -euo pipefail
-          repo_path="${IMAGE_NAME#*/}"
-          repo_path="${repo_path#*/}"  # strip registry host + first slash → molecule-ai/workspace-template-claude-code
-          if ! aws ecr describe-repositories --repository-names "${repo_path}" --region us-east-2 >/dev/null 2>&1; then
-            aws ecr create-repository \
-              --repository-name "${repo_path}" \
-              --image-scanning-configuration scanOnPush=true \
-              --region us-east-2 >/dev/null
-            echo "::notice::created ECR repository ${repo_path}"
-          else
-            echo "ECR repository ${repo_path} already exists"
-          fi
-
       - name: Build image (load for smoke test, do not push yet)
         # Build into runner-local docker first. Smoke test runs before push so
         # a broken adapter module never poisons :latest.
@@ -189,7 +202,7 @@ jobs:
           platforms: linux/amd64
           load: true
           push: false
-          tags: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          tags: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
           build-args: |
             RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
           labels: |
@@ -202,7 +215,7 @@ jobs:
         # all module-level imports resolve against the pip-installed runtime.
         shell: bash
         env:
-          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+          IMAGE: ${{ env.PUSH_IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
         run: |
           set -eu
           docker run --rm \
@@ -222,40 +235,45 @@ jobs:
           '
           echo "::notice::${IMAGE}: all top-level modules import cleanly"
 
-      - name: Push image to ECR (post-smoke)
+      - name: Push image to registry (CF-bypass local endpoint, post-smoke)
         id: push
-        # Smoke passed — push both :latest and :sha-<7>. build-push-action
-        # reuses the cached layers so this is a layer-push, not a rebuild.
-        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
-        with:
-          context: .
-          file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:latest
-            ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
-          build-args: |
-            RUNTIME_VERSION=${{ needs.resolve-version.outputs.version }}
-          labels: |
-            org.opencontainers.image.source=https://git.moleculesai.app/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.description=Molecule AI workspace template — claude-code runtime
-
-      # Keep the prod ECR storage bill bounded: declare the canonical image
-      # lifecycle policy on the runtime repo we just pushed. Idempotent +
-      # fail-soft (never fails the publish). SSOT JSON lives in the script.
-      - name: Ensure ECR lifecycle policy (workspace-template-claude-code)
-        env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: us-east-2
+        # Smoke passed. Push the locally-loaded image straight to the local Gitea
+        # OCI endpoint via the HOST docker daemon with a plain `docker push` (NOT
+        # buildx): the blob upload travels host->localhost:3200 and never crosses
+        # Cloudflare, so the 1.7-2.4GB layers no longer hit the ~100MB CF request-
+        # body cap (413 Payload Too Large). The manifest digest is content-
+        # addressed and host-independent, so promote-pin still pins the CANONICAL
+        # host ref (IMAGE_NAME@<digest>), which resolves + pulls via Cloudflare
+        # all the same. Image labels are already baked by the build-load step, so
+        # no rebuild happens here. `steps.push.outputs.digest` is preserved for
+        # the downstream promote-pin job.
+        shell: bash
         run: |
-          set -uo pipefail
-          # Strip the registry host; pass the bare molecule-ai/<repo> name.
-          REPO_NAME="${IMAGE_NAME#*/}"
-          bash scripts/ensure-ecr-lifecycle.sh "${REPO_NAME}"
+          set -euo pipefail
+          SHA_REF="${PUSH_IMAGE_NAME}:sha-${{ needs.resolve-version.outputs.sha }}"
+          LATEST_REF="${PUSH_IMAGE_NAME}:latest"
+          # Push the IMMUTABLE sha tag FIRST and derive the pin digest from it;
+          # only advance the floating :latest AFTER the sha publish + digest are
+          # confirmed. A partial publish (latest ok, sha/digest fails) must never
+          # leave :latest ahead of a promoted sha pin. (review #201/#141)
+          PUSHOUT="$(docker push "${SHA_REF}")"
+          printf '%s\n' "${PUSHOUT}"
+          # docker push stdout is not a stable API: prefer its digest line, but
+          # fall back to an inspect of the just-pushed immutable ref so a missing/
+          # reformatted line can't drop the digest (BuildKit treats localhost as
+          # insecure, so the HTTP inspect works). (review)
+          DIGEST="$(printf '%s\n' "${PUSHOUT}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | head -1)"
+          if [ -z "${DIGEST}" ]; then
+            DIGEST="$(docker buildx imagetools inspect "${SHA_REF}" --format '{{json .Manifest.Digest}}' 2>/dev/null | tr -d '"[:space:]' || true)"
+          fi
+          if ! printf '%s' "${DIGEST}" | grep -Eq '^sha256:[0-9a-f]{64}$'; then
+            echo "::error::could not determine the pushed manifest digest for ${SHA_REF}"
+            exit 1
+          fi
+          docker tag "${SHA_REF}" "${LATEST_REF}"
+          docker push "${LATEST_REF}"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
@@ -348,5 +366,3 @@ jobs:
             exit 1
           fi
           echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
-
-
