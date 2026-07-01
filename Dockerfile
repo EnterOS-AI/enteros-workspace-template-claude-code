@@ -94,7 +94,7 @@ ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simp
 COPY requirements.txt .
 RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 # MOLECULE-HOTFIX (claude-code 2.1.150 / agent-sdk 0.2.84): apply in-place
