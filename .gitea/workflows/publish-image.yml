@@ -290,15 +290,13 @@ jobs:
     # template had NO promote job at all and hermes promoted ONLY to prod,
     # so staging pins never advanced past the pre-#85/#75 executor and the
     # canary failed reasoning models with "message contained no text
-    # content". We now promote to BOTH prod (api.moleculesai.app) and
-    # staging (staging-api.moleculesai.app).
+    # content". We promote to staging (staging-api.moleculesai.app). The prod
+    # leg is currently de-required under the prod-freeze (see the matrix
+    # comment below).
     #
-    # Per-target ISOLATION: `strategy.fail-fast: false` makes each matrix
-    # leg independent — a prod-promote failure does NOT cancel/block the
-    # staging-promote and vice-versa. Each leg is still fail-LOUD on a
-    # non-2xx for ITS OWN target so a stranded pin is never hidden behind a
-    # green workflow; one leg red turns the job red without suppressing the
-    # other leg's attempt or outcome.
+    # Per-target ISOLATION: `strategy.fail-fast: false` keeps each matrix
+    # leg independent and fail-LOUD on a non-2xx for ITS OWN target so a
+    # stranded pin is never hidden behind a green workflow.
     name: Promote runtime_image_pins (CP admin)
     runs-on: ubuntu-latest
     timeout-minutes: 2
@@ -310,20 +308,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - env_name: prod
-            cp_host: api.moleculesai.app
+          # prod leg removed (prod-freeze). Prod cutover is pending-operator and
+          # the prod CP admin bearer is not provisioned to match any token these
+          # template repos hold, so POST /cp/admin/runtime-image/promote to
+          # api.moleculesai.app returns HTTP 401 by design (AdminGate constant-
+          # time bearer compare, internal/auth/middleware.go). Auto-promoting to
+          # prod during the freeze is exactly what the freeze prohibits, so this
+          # leg is de-required rather than papered over. Restore the prod include
+          # once prod cutover completes and a matching prod CP admin token is
+          # provisioned. Staging stays the live promote target.
           - env_name: staging
             cp_host: staging-api.moleculesai.app
     steps:
       - name: POST /cp/admin/runtime-image/promote (${{ matrix.env_name }})
         env:
-          # Each matrix leg reads its own environment's CP admin token. Both
-          # secrets must be configured on this repo's CI for the respective
-          # promote to run: CP_ADMIN_API_TOKEN (prod, already used by the
-          # hermes promote) and CP_ADMIN_API_TOKEN_STAGING (staging — must be
-          # provisioned with a STAGING control-plane admin token).
+          # Staging promote reads the ORG-level CP_STAGING_ADMIN_API_TOKEN —
+          # the same secret the google-adk / openclaw templates use and which
+          # matches the staging CP admin bearer (verified HTTP 200). The old
+          # per-repo CP_ADMIN_API_TOKEN_STAGING held a stale value that the
+          # staging AdminGate rejected with HTTP 401; converging onto the org
+          # secret is the fix. PROD_TOKEN is retained only so the prod leg can
+          # be restored verbatim once the prod-freeze lifts (see matrix above).
           PROD_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN }}
-          STAGING_TOKEN: ${{ secrets.CP_ADMIN_API_TOKEN_STAGING }}
+          STAGING_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
           ENV_NAME: ${{ matrix.env_name }}
           CP_HOST: ${{ matrix.cp_host }}
           TEMPLATE_NAME: claude-code
@@ -336,7 +343,7 @@ jobs:
             TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN"
           else
             CP_ADMIN_API_TOKEN="${STAGING_TOKEN}"
-            TOKEN_SECRET_NAME="CP_ADMIN_API_TOKEN_STAGING"
+            TOKEN_SECRET_NAME="CP_STAGING_ADMIN_API_TOKEN"
           fi
           if [ -z "${CP_ADMIN_API_TOKEN}" ]; then
             echo "::error::${TOKEN_SECRET_NAME} secret not configured on this repo — cannot promote ${ENV_NAME} pin"
