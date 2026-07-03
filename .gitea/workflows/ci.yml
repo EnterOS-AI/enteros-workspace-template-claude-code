@@ -69,7 +69,16 @@ env:
   # but pinning at the workflow level protects against a runner
   # regenerated without the config file.
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  PIP_INDEX_URL: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+  # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
+  # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
+  # private index, which serves only molecules-workspace-runtime → 404s all
+  # public tooling (the Adapter-unit-tests / Template-validation reds). Public
+  # tooling resolves from the default (PyPI) index; the private runtime — which
+  # is ABSENT from public PyPI, so no dependency-confusion — is pulled via an
+  # EXPLICIT --extra-index-url on the runtime install only. The legacy name
+  # molecule-ai-workspace-runtime IS squatted on public PyPI (0.1.999999); we
+  # install the CURRENT dist name molecules-workspace-runtime (private-only).
+  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
 # Defense-in-depth on the GITHUB_TOKEN scope. The validate-runtime job
 # runs untrusted-by-design code from the calling repo — pip-installs
@@ -168,9 +177,9 @@ jobs:
       # syntactically-valid adapter that ImportErrors on a missing
       # transitive dep would build clean and crash on first user prompt.
       - if: hashFiles('requirements.txt') != ''
-        run: pip install -q -r requirements.txt
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
       - if: hashFiles('requirements.txt') == ''
-        run: pip install -q molecule-ai-workspace-runtime
+        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
       - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: entrypoint restore-from-secondary unit test (cp#326)
         # Container-runnable bash unit test for entrypoint.sh's

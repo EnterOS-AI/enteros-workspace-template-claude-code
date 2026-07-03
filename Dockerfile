@@ -87,14 +87,23 @@ WORKDIR /app
 # Empty default = falls back to whatever requirements.txt resolves to.
 ARG RUNTIME_VERSION=
 ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+# Public deps (python-multipart, a2a-sdk, claude-agent-sdk, and the private
+# runtime's public transitive deps) live on PyPI, not the private Gitea PyPI
+# index. Add pypi.org as an --extra-index-url (NOT --index-url) so the PRIVATE
+# Gitea index stays the PRIMARY resolver for the private molecules-workspace-
+# runtime dist. Matches the accepted pattern already shipped in the hermes/
+# openclaw/langgraph templates (RFC internal#596). Without this the docker
+# build dies with "No matching distribution found for python-multipart" — a
+# real build-arg bug, NOT a runner-egress issue (robot-1 reaches pypi.org).
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
 
 # Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
 # the RUN command itself but its presence as a declared ARG above
 # means buildx hashes it into the cache key.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
+RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
     if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
+      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
     fi
 
 # MOLECULE-HOTFIX (claude-code 2.1.150 / agent-sdk 0.2.84): apply in-place
