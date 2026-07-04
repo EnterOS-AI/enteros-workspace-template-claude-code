@@ -75,6 +75,52 @@ RUN set -eux; \
     usermod -aG docker-host agent || true; \
     id agent
 
+# --- Pre-bake the org-management MCP for DETERMINISTIC concierge warm-up (core#3082). ---
+# The kind=platform concierge's management MCP is delivered as a plugin
+# (molecule-ai-plugin-molecule-platform-mcp) whose settings-fragment launches
+#   npx --prefer-offline @molecule-ai/mcp-server@<ver>
+# On a FRESH concierge that npx would otherwise COLD-PULL the full ~100-dep tree
+# from the Cloudflare-fronted Gitea npm registry — a network fetch that races the
+# runtime readiness probe's per-server 20s handshake budget and, under CF-WAF
+# throttling / concurrent-npx contention, can blow past the readiness window
+# entirely (observed: a fresh concierge stuck 503 past 300s while a warm one
+# reached its tools in ~48s — the whole "flaky warm-up" is that ONE network pull).
+#
+# Baking the exact version + its dep tree into the AGENT user's npm CONTENT cache
+# (_cacache) at BUILD time makes the runtime's `npx --prefer-offline` resolve
+# ENTIRELY FROM CACHE — ZERO network pull — so warm-up is fast + deterministic
+# every time. `--prefer-offline` (set in the plugin fragment) keeps the registry
+# as a SELF-HEALING fallback if the cache ever misses (older image, cache evicted).
+#
+# HYGIENE: we warm only the CONTENT cache (throwaway install, then discard the
+# node_modules) — the admin MCP is NOT globally installed and NOT on PATH here, so
+# an ordinary (non-concierge) workspace on this shared image gains only inert
+# cached tarballs, never an active admin tool surface (the tools require
+# MOLECULE_MCP_MODE=management + a CP-authenticated bearer, injected only into the
+# concierge). Run as `agent` so the cache lands in the SAME /home/agent/.npm the
+# gosu-dropped runtime reads at boot.
+#
+# MCP_SERVER_VERSION MUST match the plugin fragment's pinned version
+# (molecule-ai-plugin-molecule-platform-mcp settings-fragment.json). A stale bake
+# still WORKS (npx --prefer-offline network-fallback) but forfeits determinism, so
+# keep them in lockstep. Declared as an ARG so the publish workflow can override.
+ARG MCP_SERVER_VERSION=1.7.0
+USER agent
+RUN set -eux; \
+    mkdir -p /home/agent/.npm; \
+    printf '@molecule-ai:registry=https://git.moleculesai.app/api/packages/molecule-ai/npm/\n' > /home/agent/.npmrc; \
+    warm="$(mktemp -d)"; cd "$warm"; npm init -y >/dev/null 2>&1; \
+    npm install --no-audit --no-fund --loglevel=error "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}"; \
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"prebake","version":"1"}}}' \
+      | MOLECULE_MCP_MODE=management timeout 60 npx -y --prefer-offline "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" >/dev/null 2>&1 || true; \
+    cd /; rm -rf "$warm"; \
+    printf '%s\n%s\n' \
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"verify","version":"1"}}}' \
+      '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+      | MOLECULE_MCP_MODE=management timeout 60 npx -y --offline "@molecule-ai/mcp-server@${MCP_SERVER_VERSION}" 2>/dev/null | grep -q provision_workspace \
+      || (echo "ERROR: pre-baked @molecule-ai/mcp-server@${MCP_SERVER_VERSION} did not resolve OFFLINE or provision_workspace missing — the concierge warm-up bake is broken" >&2 && exit 1)
+USER root
+
 WORKDIR /app
 
 # RUNTIME_VERSION is forwarded from the reusable publish workflow as
