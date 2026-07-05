@@ -189,6 +189,49 @@ restore_from_secondary_volume() {
     fi
 }
 
+# Expose plugin-contributed agent skills to Claude Code.
+#
+# The runtime's AgentskillsAdaptor materializes plugin skills into
+# /configs/skills/<skill>/SKILL.md — but Claude Code discovers personal
+# skills ONLY under ~/.claude/skills. Nothing else bridges the two, so
+# plugin skills were installed yet INVISIBLE to the agent (verified live
+# on the agents-team platform agent 2026-07-05: /configs/skills/lark-connect
+# present since plugin install, absent from the session's skill_listing;
+# hand-creating this exact symlink made the very next turn list + invoke
+# the skill successfully — the adapter.py/claude_sdk_executor.py claim
+# "claude-code reads /configs/skills natively" was wrong as deployed).
+#
+# Symlink the DIRECTORY (not per-skill copies) so post-boot plugin
+# installs/updates that rewrite /configs/skills are picked up by the
+# next turn without another boot. Guards:
+#   - create /configs/skills first (root context; chown to agent so the
+#     adaptor — uid 1000 — can keep writing skills into it post-boot)
+#   - never clobber a REAL directory already at ~/.claude/skills (could
+#     hold agent-authored skills; also `ln -sfn` against an existing dir
+#     would nest the link INSIDE it). A symlink (ours from a prior boot,
+#     possibly restored stale by the backup rsync) is safe to re-point.
+#   - fail-soft: skill exposure must never block boot.
+link_plugin_skills_into_claude_home() {
+    local CONFIG_SKILLS="/configs/skills"
+    local CLAUDE_SKILLS="/home/agent/.claude/skills"
+
+    mkdir -p "$CONFIG_SKILLS" 2>/dev/null || true
+    chown agent:agent "$CONFIG_SKILLS" 2>/dev/null || true
+
+    if [ -e "$CLAUDE_SKILLS" ] && [ ! -L "$CLAUDE_SKILLS" ]; then
+        echo "MOLECULE-SKILLS: $CLAUDE_SKILLS exists and is not a symlink — leaving it alone (plugin skills in $CONFIG_SKILLS will NOT be visible to Claude Code)"
+        return 0
+    fi
+
+    if ln -sfn "$CONFIG_SKILLS" "$CLAUDE_SKILLS" 2>/dev/null; then
+        chown -h agent:agent "$CLAUDE_SKILLS" 2>/dev/null || true
+        echo "MOLECULE-SKILLS: linked $CLAUDE_SKILLS -> $CONFIG_SKILLS"
+    else
+        echo "MOLECULE-SKILLS: WARN could not link $CLAUDE_SKILLS -> $CONFIG_SKILLS — plugin skills will not be visible this boot"
+    fi
+    return 0
+}
+
 if [ "$(id -u)" = "0" ]; then
     # Restore-on-recreate runs FIRST in the root branch — before any
     # chown — so rsync's preserved ownership doesn't immediately get
@@ -342,6 +385,11 @@ EOF
         chown -R agent:agent /root/.claude 2>/dev/null
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
+
+    # Plugin skills → Claude Code personal-skills dir (see function docs).
+    # Runs AFTER the ~/.claude mkdir/chown block so the parent dir exists
+    # and after the /configs chown so ownership is settled.
+    link_plugin_skills_into_claude_home
 
     # Optional GitHub mirror credential helper setup.
     # GitHub is mirror-only for Molecule; keep this disabled unless an

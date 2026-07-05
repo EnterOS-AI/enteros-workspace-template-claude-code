@@ -728,9 +728,12 @@ class ClaudeCodeAdapter(BaseAdapter):
         The legacy claude-code-specific ``inject_plugins()`` override is gone:
         each plugin now ships (or has registered in the platform registry) a
         per-runtime adaptor, and ``BaseAdapter.install_plugins_via_registry``
-        routes installs through it. The Claude Code SDK still reads
-        ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
-        :class:`AgentskillsAdaptor` writes to both.
+        routes installs through it. The Claude Code SDK reads ``CLAUDE.md``
+        natively; ``/configs/skills/`` (where the default
+        :class:`AgentskillsAdaptor` writes plugin skills) reaches Claude Code
+        via the ``~/.claude/skills`` symlink created by entrypoint.sh
+        (``link_plugin_skills_into_claude_home`` — Claude Code only scans
+        its own personal-skills dir, NOT /configs/skills directly).
         """
         # Load provider registry from /configs/config.yaml — canvas reads
         # the same YAML for its Config-tab Provider dropdown so adapter +
@@ -946,7 +949,8 @@ class ClaudeCodeAdapter(BaseAdapter):
         config.system_prompt = build_system_prompt(
             config.config_path,
             config.workspace_id,
-            [],  # skills: claude-code reads /configs/skills natively
+            [],  # skills: /configs/skills reaches claude-code via the
+            #     ~/.claude/skills symlink (entrypoint.sh)
             [],  # peers: discovered live via the a2a MCP, not baked
             prompt_files=config.prompt_files,
             plugin_rules=self._plugin_rules,
