@@ -163,7 +163,13 @@ providers:
 
 runtime: claude-code
 runtime_config:
-  model: moonshot/kimi-k2.6
+  # Default model for members/workers CREATED from this template. A created
+  # worker takes this value literally (only the concierge resolves the platform
+  # MOLECULE_LLM_DEFAULT_MODEL SSOT directly), so the retired moonshot/kimi-k2.6
+  # pin made every hired worker boot on moonshot and fail out-of-credits. minimax
+  # is the permanent platform default (matches the openclaw template + the
+  # platformDefaultModelFallback const); no moonshot default anywhere.
+  model: minimax/MiniMax-M2.7
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars based on the selected entry. OAuth and API-key

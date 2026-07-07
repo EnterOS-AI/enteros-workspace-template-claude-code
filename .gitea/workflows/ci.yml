@@ -191,6 +191,16 @@ jobs:
         # Stage C smoke (stage-c-workspace-backup-smoke.sh step 6b).
         if: hashFiles('tests/test_entrypoint_restore.sh') != ''
         run: bash tests/test_entrypoint_restore.sh
+      - name: Entrypoint plugin-skills link unit test
+        # Container-runnable bash unit test for entrypoint.sh's
+        # link_plugin_skills_into_claude_home() — the ~/.claude/skills ->
+        # /configs/skills bridge without which plugin-contributed skills
+        # install fine but never appear in Claude Code's skill listing
+        # (live-diagnosed 2026-07-05: lark-connect invisible on the
+        # agents-team platform agent until the symlink existed). Pure
+        # filesystem logic in a mktemp sandbox; chown is mocked.
+        if: hashFiles('tests/test_entrypoint_skills_link.sh') != ''
+        run: bash tests/test_entrypoint_skills_link.sh
       - name: Docker build smoke test
         if: hashFiles('Dockerfile') != ''
         run: |

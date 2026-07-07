@@ -957,7 +957,8 @@ class ClaudeSDKExecutor(AgentExecutor):
             base = build_system_prompt(
                 self.config_path,
                 self.workspace_id,
-                [],   # skills: claude-code reads /configs/skills natively
+                [],   # skills: /configs/skills reaches claude-code via the
+                #     ~/.claude/skills symlink (entrypoint.sh)
                 [],   # peers: the CLI discovers peers live via the a2a MCP
                 prompt_files=self.prompt_files,
                 plugin_rules=self.plugin_rules,
