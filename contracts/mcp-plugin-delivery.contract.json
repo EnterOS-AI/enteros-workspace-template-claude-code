@@ -1,1 +1,48 @@
-{"settings_path":"/configs/.claude/settings.json","key":"mcpServers","entry_shape":"name->{command,args?,env?}","mcp_server_name":"molecule-platform","required_tool":"provision_workspace","loaded_mcp_tools_field":"loaded_mcp_tools","legacy_binary_path":"/opt/molecule-mcp-server","runtime_present_field":"mcp_server_present","producer":"MCPServerAdaptor","consumer":"claude_sdk_executor._load_settings_mcp","consumers":["claude_sdk_executor._load_settings_mcp","platform_agent_identity.mcp_server_present","workspace-server/internal/handlers/registry.go#RCA2970-online-gate"],"descriptor":"runtime-agnostic name->{command,args?,env?}; the plugin is the SSOT for this descriptor (settings-fragment.json is the Claude adapter's rendering of it). The MCP-wiring PORT (InstallContext.register_mcp_server -> BaseAdapter.register_mcp_server_hook) renders the descriptor into the native config the ACTIVE runtime reads.","port":{"hook":"InstallContext.register_mcp_server","impl":"BaseAdapter.register_mcp_server_hook","present_probe":"BaseAdapter.management_mcp_present","dispatch":"BaseAdapter default hook dispatches on self.name() via mcp_render.render_for_runtime/mcp_settings_path_for/management_mcp_present_for; per-template adapter override NOT required.","resolver_default":"plugins_registry.resolve defaults an mcpServers-shaped plugin to MCPServerAdaptor (AdaptorSource.MCP_SERVER) for ANY runtime, so molecule-platform-mcp needs no per-runtime adapters/<runtime>.py."},"runtimes":{"claude_code":{"settings_path":"/configs/.claude/settings.json","format":"json","key":"mcpServers","renderer":"mcp_render.render_claude_settings","status":"implemented"},"codex":{"settings_path":"~/.codex/config.toml","format":"toml","table":"mcp_servers","renderer":"mcp_render.render_codex_config","status":"implemented"},"gemini_cli":{"settings_path":"~/.gemini/settings.json","format":"json","key":"mcpServers","renderer":"mcp_render.render_gemini_settings","status":"todo-unverified"},"hermes":{"settings_path":"unverified","format":"unverified","renderer":"mcp_render.render_hermes_config","status":"todo-unverified"}}}
+{
+  "settings_path": "/configs/.claude/settings.json",
+  "key": "mcpServers",
+  "entry_shape": "name->{command,args?,env?}",
+  "mcp_server_name": "molecule-platform",
+  "required_tool": "provision_workspace",
+  "loaded_mcp_tools_field": "loaded_mcp_tools",
+  "legacy_binary_path": "/opt/molecule-mcp-server",
+  "runtime_present_field": "mcp_server_present",
+  "producer": "MCPServerAdaptor",
+  "consumer": "claude_sdk_executor._load_settings_mcp",
+  "consumers": [
+    "claude_sdk_executor._load_settings_mcp",
+    "platform_agent_identity.mcp_server_present",
+    "mcp_readiness_probe.probe_management_mcp_tools",
+    "workspace-server/internal/handlers/registry.go#RCA2970-online-gate"
+  ],
+  "descriptor": "runtime-agnostic name->{command,args?,env?}; the plugin is the SSOT for this descriptor. The MCP-wiring PORT (InstallContext.register_mcp_server -> BaseAdapter.register_mcp_server_hook) renders the descriptor into the native config the ACTIVE runtime reads. The per-runtime `runtimes` map pins each native surface; no runtime reads the others' files.",
+  "port": {
+    "hook": "InstallContext.register_mcp_server",
+    "impl": "BaseAdapter.register_mcp_server_hook",
+    "present_probe": "BaseAdapter.management_mcp_present",
+    "dispatch": "BaseAdapter default hook dispatches on self.name() via mcp_render.render_for_runtime/mcp_settings_path_for/management_mcp_present_for; per-template adapter override NOT required.",
+    "resolver_default": "plugins_registry.resolve defaults an mcpServers-shaped plugin to MCPServerAdaptor (AdaptorSource.MCP_SERVER) for ANY runtime, so molecule-platform-mcp needs no per-runtime adapters/<runtime>.py."
+  },
+  "runtimes": {
+    "claude_code": {
+      "settings_path": "/configs/.claude/settings.json",
+      "format": "json",
+      "key": "mcpServers",
+      "renderer": "mcp_render.render_claude_settings",
+      "status": "implemented"
+    },
+    "codex": {
+      "settings_path": "~/.codex/config.toml",
+      "format": "toml",
+      "table": "mcp_servers",
+      "renderer": "mcp_render.render_codex_config",
+      "status": "implemented"
+    },
+    "hermes": {
+      "settings_path": "unverified",
+      "format": "unverified",
+      "renderer": "mcp_render.render_hermes_config",
+      "status": "todo-unverified"
+    }
+  }
+}
