@@ -56,6 +56,51 @@ providers:
     base_url: null
     auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
 
+  # Molecule platform-managed LLM proxy. This is intentionally before
+  # kimi-coding so platform-managed workspaces with MODEL=kimi-* and no
+  # explicit provider route through the Molecule proxy by default. BYOK
+  # users can still select kimi-coding/anthropic-api explicitly.
+  #
+  # The proxy speaks Anthropic protocol on /anthropic/v1 and OpenAI
+  # protocol on /openai/v1; it transparently bridges OpenAI-compatible
+  # upstreams (e.g. OpenAI, Moonshot) on the Anthropic route via
+  # proxyAnthropicViaOpenAICompatible (CP llm_proxy.go). The claude-code
+  # runtime always emits Anthropic-shape requests, so the base_url stays
+  # pointed at /anthropic/v1 regardless of the upstream vendor.
+  #
+  # model_prefixes covers the namespaces CP's inferLLMProvider routes
+  # AND that the Anthropic-protocol route (/anthropic/v1/messages) can
+  # actually reach today:
+  #   * `anthropic/` — passes through Anthropic-native.
+  #   * `moonshot/` (+ bare `kimi-` for backward-compat with existing
+  #     workspaces) — bridged to OpenAI-compat upstream via
+  #     proxyAnthropicViaOpenAICompatible.
+  #   * `minimax/` — namespaced; routes to MiniMax's own /anthropic/v1
+  #     endpoint.
+  #
+  # Bare prefixes intentionally NOT added here:
+  #   * Bare `minimax-` continues to route through the BYOK `minimax`
+  #     provider entry below — that's the historical contract; flipping
+  #     it to platform would break existing MINIMAX_API_KEY workspaces.
+  #     Users who want platform-managed MiniMax pick the namespaced
+  #     `minimax/MiniMax-...` id explicitly.
+  #   * `openai/` — claude-code emits Anthropic-shape requests but CP's
+  #     ProxyAnthropicMessages only bridges OpenAI upstream when
+  #     target.Provider == "moonshot". OpenAI on the platform belongs
+  #     on a runtime that speaks the OpenAI protocol natively (codex,
+  #     hermes); follow-up in internal#695.
+  #
+  # The price catalog (CP migrations 037 + 039) holds the canonical
+  # list of models the platform will charge for; unsupported model ids
+  # return 403 from CheckPlatformManagedLLMAllowed.
+  - name: platform
+    auth_mode: third_party_anthropic_compat
+    model_prefixes: [anthropic/, moonshot/, minimax/, kimi-]
+    model_aliases: []
+    base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1
+    auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
+    auth_token_env: ANTHROPIC_API_KEY
+
   - name: xiaomi-mimo
     auth_mode: third_party_anthropic_compat
     model_prefixes: [mimo-]
@@ -118,7 +163,13 @@ providers:
 
 runtime: claude-code
 runtime_config:
-  model: sonnet
+  # Default model for members/workers CREATED from this template. A created
+  # worker takes this value literally (only the concierge resolves the platform
+  # MOLECULE_LLM_DEFAULT_MODEL SSOT directly), so the retired moonshot/kimi-k2.6
+  # pin made every hired worker boot on moonshot and fail out-of-credits. minimax
+  # is the permanent platform default (matches the openclaw template + the
+  # platformDefaultModelFallback const); no moonshot default anywhere.
+  model: minimax/MiniMax-M2.7
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars based on the selected entry. OAuth and API-key
@@ -126,6 +177,55 @@ runtime_config:
   # the auth path matching the key they have — the claude CLI accepts
   # either and the model id is identical across both.
   models:
+    # --- Molecule platform-managed LLM proxy ---
+    # The platform owns provider keys and billing. Tenants do not bring or
+    # receive vendor API keys for this path.
+    #
+    # Every id below must have a matching row in CP's llm_price_catalog
+    # (migrations 037 + 039) and be allowlisted in the org's
+    # `organizations.llm_allowed_models` row (CheckPlatformManagedLLMAllowed
+    # enforces both). Internal RFC #695 covers the catalog expansion plan.
+    - id: moonshot/kimi-k2.6
+      name: Kimi K2.6 (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: moonshot/kimi-k2.5
+      name: Kimi K2.5 (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: anthropic/claude-opus-4-7
+      name: Claude Opus 4.7 (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: anthropic/claude-sonnet-4-6
+      name: Claude Sonnet 4.6 (Molecule platform)
+      provider: platform
+      required_env: []
+    # NOTE — claude-haiku entry pending CTO sign-off on snapshot id.
+    # CP price catalog (migration 037) lists the full snapshot id
+    # `claude-haiku-4-5-20251001` rather than the `claude-haiku-4-5`
+    # alias. Adding either id without confirming whether Anthropic's
+    # upstream accepts both would risk a charge-but-no-pricing-row
+    # billing mismatch. Hold for internal#695 follow-up.
+    #
+    # NOTE — OpenAI models on the claude-code runtime require CP to
+    # bridge OpenAI upstream through the Anthropic protocol route
+    # (today `ProxyAnthropicMessages` bridges ONLY when `target.Provider
+    # == "moonshot"`). Phase 1 evidence for internal#695 says: extending
+    # the bridge to OpenAI is a small CP change, but it's outside the
+    # "no new routes / no new dispatcher" scope of the RFC's first wave.
+    # OpenAI models on the platform belong on a runtime that speaks
+    # the OpenAI protocol natively (codex, hermes); they are not
+    # surfaced on the claude-code template until the bridge ships.
+    - id: minimax/MiniMax-M2.7
+      name: MiniMax M2.7 (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: minimax/MiniMax-M2.7-highspeed
+      name: MiniMax M2.7 High-Speed (Molecule platform)
+      provider: platform
+      required_env: []
+
     # --- OAuth (Claude Code subscription) — set CLAUDE_CODE_OAUTH_TOKEN ---
     - id: sonnet
       name: Claude Sonnet (OAuth / Claude Code subscription)

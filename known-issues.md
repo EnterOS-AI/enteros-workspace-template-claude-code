@@ -110,3 +110,37 @@ schema version before tagging a new template release.
 
 **Fix:** Once `template_schema_version` is updated, the adapter starts normally.
 No adapter code changes are required for schema-only bumps.
+
+---
+
+## 5. Image Source Switched to Local Build When `MOLECULE_IMAGE_REGISTRY` Is Unset
+
+**Severity:** Low
+**Affects:** Local development and self-hosted tenants after 2026-05-06.
+
+**Symptom:**
+`docker pull` from GHCR returns `403 Forbidden` for `molecule-ai/workspace-template-*`
+images because the upstream GitHub organization is suspended. Workspaces provisioned
+with `MOLECULE_IMAGE_REGISTRY` unset appear to hang or fail during first boot.
+
+**Root cause:**
+The workspace-server provisioner previously defaulted to GHCR for template images.
+After the suspension, it now falls back to cloning this template repository from Gitea
+and running `docker build` locally when `MOLECULE_IMAGE_REGISTRY` is unset.
+
+**Workaround:**
+- Set `MOLECULE_IMAGE_REGISTRY` to a reachable registry (e.g. ECR) to restore the
+  pre-built image path.
+- For local development, leave `MOLECULE_IMAGE_REGISTRY` unset and allow the
+  provisioner to build the image locally. The first build takes 5–10 minutes on
+  Apple Silicon; subsequent builds use the Docker cache.
+
+**Prevention:**
+Production tenants already set `MOLECULE_IMAGE_REGISTRY` to the managed ECR
+registry and are unaffected.
+
+**Fix:**
+No template code change is required. The behavior is driven by the presence or
+absence of `MOLECULE_IMAGE_REGISTRY` in the provisioner environment. See
+`molecule-core/docs/adr/ADR-002-local-build-mode-via-registry-presence.md` and
+`molecule-core/docs/development/local-development.md` for the full design.

@@ -17,7 +17,7 @@ import os
 import sys
 import textwrap
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
 import pytest
@@ -45,11 +45,29 @@ class _StubAdapterConfig:
     config_path: str = "/tmp/configs"
     system_prompt: str = ""
     heartbeat: object = None
+    # Mirror the real AdapterConfig: setup()/create_executor read these to
+    # publish + thread the SSOT prompt (build_system_prompt honors prompt_files).
+    prompt_files: list = field(default_factory=list)
+    workspace_id: str = ""
 
 
 class _StubBaseAdapter:
     async def install_plugins_via_registry(self, *_args, **_kwargs):
         pass
+
+
+def _stub_build_system_prompt(config_path, workspace_id="", *_a,
+                              prompt_files=None, **_kw):
+    """Honor prompt_files (else system-prompt.md) so setup() runs without the
+    real runtime; mirrors conftest._stub_build_system_prompt."""
+    parts = ["# You are a workspace on the Molecule AI platform"]
+    for fname in (list(prompt_files or []) or ["system-prompt.md"]):
+        fpath = os.path.join(config_path, fname)
+        if os.path.exists(fpath):
+            content = open(fpath).read().strip()
+            if content:
+                parts.append(content)
+    return "\n\n".join(parts)
 
 
 def _install_stubs():
@@ -66,10 +84,15 @@ def _install_stubs():
         # without needing the real runtime installed in the test env.
         mr.plugins = types.ModuleType("molecule_runtime.plugins")
         mr.plugins.load_plugins = lambda **_kwargs: []
+        # adapter.setup() also lazy-imports molecule_runtime.prompt.
+        # build_system_prompt to publish config.system_prompt (the SSOT).
+        mr.prompt = types.ModuleType("molecule_runtime.prompt")
+        mr.prompt.build_system_prompt = _stub_build_system_prompt
         sys.modules["molecule_runtime"] = mr
         sys.modules["molecule_runtime.adapters"] = mr.adapters
         sys.modules["molecule_runtime.adapters.base"] = mr.adapters.base
         sys.modules["molecule_runtime.plugins"] = mr.plugins
+        sys.modules["molecule_runtime.prompt"] = mr.prompt
     if "a2a" not in sys.modules:
         a2a = types.ModuleType("a2a")
         a2a.server = types.ModuleType("a2a.server")
@@ -107,6 +130,14 @@ _FIXTURE_PROVIDERS_YAML = textwrap.dedent("""
         model_aliases: []
         base_url: null
         auth_env: [ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN]
+
+      - name: platform
+        auth_mode: third_party_anthropic_compat
+        model_prefixes: [kimi-, moonshot/]
+        model_aliases: []
+        base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1
+        auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
+        auth_token_env: ANTHROPIC_API_KEY
 
       - name: xiaomi-mimo
         auth_mode: third_party_anthropic_compat
@@ -551,11 +582,11 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
     (tmp_path / "config.yaml").write_text(_FIXTURE_PROVIDERS_YAML)
     result = adapter_module._load_providers(str(tmp_path))
 
-    assert len(result) == 7
+    assert len(result) == 8
     names = [p["name"] for p in result]
     assert names == [
-        "anthropic-oauth", "anthropic-api", "xiaomi-mimo", "minimax",
-        "zai", "kimi-coding", "deepseek",
+        "anthropic-oauth", "anthropic-api", "platform", "xiaomi-mimo",
+        "minimax", "zai", "kimi-coding", "deepseek",
     ]
     # YAML lists must be normalized to tuples for downstream lookup ergonomics.
     assert isinstance(result[0]["model_aliases"], tuple)
@@ -565,8 +596,8 @@ def test_load_providers_parses_yaml_and_normalizes(tmp_path):
 @pytest.mark.parametrize("model,expected_provider,expected_url", [
     ("GLM-4.6", "zai", "https://api.z.ai/api/anthropic"),
     ("glm-4.5", "zai", "https://api.z.ai/api/anthropic"),
-    ("kimi-k2.5", "kimi-coding", "https://api.kimi.com/coding/"),
-    ("kimi-for-coding", "kimi-coding", "https://api.kimi.com/coding/"),
+    ("kimi-k2.5", "platform", "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"),
+    ("kimi-for-coding", "platform", "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"),
     ("deepseek-v4-pro", "deepseek", "https://api.deepseek.com/anthropic"),
 ])
 @pytest.mark.asyncio
@@ -587,6 +618,42 @@ async def test_setup_routes_extra_providers(
     await adapter.setup(cfg)
 
     assert os.environ.get("ANTHROPIC_BASE_URL") == expected_url
+
+
+@pytest.mark.asyncio
+async def test_setup_defaults_kimi_model_to_molecule_proxy(
+    adapter, monkeypatch, configs_dir
+):
+    """Platform-managed Kimi models route through Molecule by default."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "proxy-scoped-sentinel")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "kimi-for-coding"},
+        config_path=configs_dir,
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == (
+        "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_setup_routes_explicit_kimi_coding_byok_to_kimi_gateway(
+    adapter, monkeypatch, configs_dir
+):
+    """BYOK Kimi remains available when the provider is explicit."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-sentinel")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "kimi-for-coding", "provider": "kimi-coding"},
+        config_path=configs_dir,
+    )
+
+    await adapter.setup(cfg)
+
+    assert os.environ.get("ANTHROPIC_BASE_URL") == "https://api.kimi.com/coding/"
 
 
 def test_load_providers_falls_back_on_malformed_yaml(tmp_path, caplog, monkeypatch):
@@ -959,3 +1026,94 @@ async def test_setup_keeps_prefix_routing_oauth_for_anthropic_prefix(
     assert not auth_warnings, (
         f"OAuth users should not see API-key warnings; got {auth_warnings}"
     )
+
+
+# ---- SSOT signal: MOLECULE_RESOLVED_PROVIDER (TOP PRECEDENCE) ----
+#
+# Core's workspace provisioner resolves the provider ONCE (Go
+# manifest.DeriveProvider) and publishes the registry arm name in the single env
+# var MOLECULE_RESOLVED_PROVIDER. The adapter READS it as the top-precedence
+# explicit provider: it overrides MODEL_PROVIDER/the YAML provider/model
+# derivation and selects the named registry arm directly. It falls back to the
+# existing resolution ONLY when the signal is absent (back-compat).
+
+_PLATFORM_BASE = "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
+_MINIMAX_BASE = "https://api.minimax.io/anthropic"
+
+
+def _clear_provider_env(monkeypatch):
+    for k in ("MOLECULE_RESOLVED_PROVIDER", "MODEL", "MODEL_PROVIDER",
+              "ANTHROPIC_BASE_URL"):
+        monkeypatch.delenv(k, raising=False)
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_platform_selects_platform_arm(
+    adapter, monkeypatch, configs_dir, caplog
+):
+    """MOLECULE_RESOLVED_PROVIDER=platform selects the platform arm even though
+    the model (`sonnet`) would otherwise resolve to anthropic-oauth."""
+    import logging
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "platform")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path=configs_dir
+    )
+    with caplog.at_level(logging.INFO, logger="adapter"):
+        await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _PLATFORM_BASE
+    banner = next(
+        (r.getMessage() for r in caplog.records
+         if "Claude Code adapter starting" in r.getMessage()), "",
+    )
+    assert "provider=platform" in banner, f"banner={banner!r}"
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_beats_legacy_model_provider(
+    adapter, monkeypatch, configs_dir
+):
+    """TOP PRECEDENCE: MOLECULE_RESOLVED_PROVIDER=platform wins even when the
+    legacy MODEL_PROVIDER names a different (byok) registry arm."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "platform")
+    monkeypatch.setenv("MODEL", "MiniMax-M2")
+    monkeypatch.setenv("MODEL_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2", "provider": "minimax"},
+        config_path=configs_dir,
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _PLATFORM_BASE
+
+
+@pytest.mark.asyncio
+async def test_setup_resolved_provider_byok_arm_selected_by_name(
+    adapter, monkeypatch, configs_dir
+):
+    """A byok resolved arm (minimax) is selected by name — NOT re-derived from
+    the model. Model `sonnet` would map to anthropic-oauth, but the SSOT signal
+    routes to the minimax Anthropic-compat endpoint."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MOLECULE_RESOLVED_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "sonnet"}, config_path=configs_dir
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _MINIMAX_BASE
+
+
+@pytest.mark.asyncio
+async def test_setup_absent_signal_falls_back_to_legacy_resolution(
+    adapter, monkeypatch, configs_dir
+):
+    """Back-compat: with MOLECULE_RESOLVED_PROVIDER absent, the legacy
+    MODEL_PROVIDER=minimax slug still selects the minimax arm."""
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("MODEL", "MiniMax-M2")
+    monkeypatch.setenv("MODEL_PROVIDER", "minimax")
+    cfg = _StubAdapterConfig(
+        runtime_config={"model": "MiniMax-M2"}, config_path=configs_dir
+    )
+    await adapter.setup(cfg)
+    assert os.environ.get("ANTHROPIC_BASE_URL") == _MINIMAX_BASE

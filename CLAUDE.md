@@ -1,3 +1,16 @@
+# Coding Discipline (Karpathy 4)
+
+All code changes in this workspace follow these principles:
+
+1. **Think Before Coding** — State assumptions explicitly. If unclear, ask, don't guess.
+2. **Simplicity First** — Minimum code that solves the problem. No speculative abstractions.
+3. **Surgical Changes** — Only touch what the task requires. Match existing style exactly.
+4. **Goal-Driven Execution** — Define verifiable success criteria before implementing.
+
+For concrete anti-pattern examples, see the `coding-discipline` skill or `EXAMPLES.md` in the Karpathy guidelines repo.
+
+---
+
 # Agent Workspace
 
 You are an AI agent running inside an Molecule AI workspace container. You are part of a multi-agent organization managed by a central platform.
@@ -101,6 +114,17 @@ The `runtime_wedge` module (in `molecule_runtime`) is the universal cross-cuttin
 - **Boot smoke (`smoke_mode`)** — when the publish-image workflow boots the image with `MOLECULE_SMOKE_MODE=1`, the smoke runner consults `runtime_wedge.is_wedged()` at the end of every result path and upgrades a provisional PASS to FAIL when the flag is set. Catches PR-25-class regressions (malformed CLI argv → SDK init wedge) BEFORE the broken image ships to GHCR.
 
 The executor sets the flag in its catch arm in `claude_sdk_executor.py` (`_mark_sdk_wedged`) when `claude_agent_sdk` raises `Control request timeout: initialize` — that wedge corrupts the SDK's internal client-process state for the rest of the Python process, so every subsequent `_run_query()` call would hit the same wedge and re-throw without intervention. The flag is cleared automatically on the next successful query (`_clear_sdk_wedge_on_success`) so a transient handshake blip self-heals to `online` without a manual restart.
+
+## Context-window overflow auto-heal (the Kimi wedge)
+
+A different failure mode is NOT a runtime wedge and must NOT flip the workspace to `degraded`: **context-window overflow**. Once the accumulated claude-code session transcript grows past the model's context window, resuming it makes every dispatch overflow identically (`token limit 262144 requested 268132` on Kimi) — the agent looks stuck, but a workspace *restart wouldn't help* (it resumes the same bloated session), and the failure is recoverable in-process. So the executor self-heals instead of wedging:
+
+- **Detect** — `_is_context_overflow(text)` matches the overflow signature (`token limit`, `prompt is too long`, `context window`, `maximum context length`, …) — mirroring claude-code's own overflow regex plus the proxy's `token limit <N> requested <M>` body. Detection covers both surfaces: a raised SDK exception AND an `is_error=True` `ResultMessage` (the model-proxy 400 path, which the SDK reports as a terminal result, not a raise — `_run_query` re-raises it as `_ResultError` so detection lives in one place).
+- **Heal** — `_reset_session_for_context_overflow()` clears `self._session_id` (next `_build_options()` passes `resume=None` → fresh empty session) and best-effort purges the bloated `~/.claude/projects/**/*.jsonl` transcripts so the oversized history can't be resumed. The dispatch then retries ONCE on the fresh session.
+- **Bounded** — at most one reset per dispatch (`overflow_healed`). A second overflow on a *fresh* session means the single prompt itself exceeds the window (not stale history) — that's a hard, operator-actionable error, NOT an infinite reset loop. The overflow string also matches the broad rate-limit retry patterns, so the heal path explicitly steers a healed-but-still-overflowing error away from the transient-backoff branch.
+- **Loud** — ERROR-level `auto-heal: session reset on context-overflow` log + a best-effort `context_overflow_autoheal` activity row on the canvas feed. It does NOT call `_mark_sdk_wedged` — the workspace recovers on the retried turn, so `degraded` would be a false alarm.
+
+**Deeper (preventive) fix** — `_maybe_set_context_window_env()` pins `CLAUDE_CODE_MAX_CONTEXT_TOKENS` from `MODEL_CONTEXT_WINDOW` env or `context_window` in config.yaml. Root cause: claude-code's auto-compact threshold comes from its internal context-window resolver, which only knows Anthropic models and falls back to a hard-coded **200000** for anything reached through the molecule LLM proxy (Kimi/MiniMax/GLM/DeepSeek). Telling claude-code the model's *real* window makes auto-compact trigger at the right point — preventing the overflow rather than only recovering from it. No-op for Anthropic models (their resolver is already correct) and never clobbers an operator pin. **To activate the prevention for a proxy-routed model, set `context_window` in the workspace config or `MODEL_CONTEXT_WINDOW` in the persona env** to the model's true window (e.g. 262144 for Kimi).
 
 ## Channels CLI flag
 

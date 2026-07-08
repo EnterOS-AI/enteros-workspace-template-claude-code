@@ -50,6 +50,54 @@ def _audit_auth_env_presence() -> None:
     logger.info("auth env audit: %s", snapshot)
 
 
+# Harness model-tier env vars (internal#702). The Claude Code harness reads
+# these to pick the model for its NON-main tiers — the background/"small-fast"
+# tier (title-gen, conversation summarization, quota probes), the
+# haiku/sonnet/opus aliases, and the subagent tier. When NONE of them is set
+# the harness falls back to a literal `claude-3-5-haiku`; on a non-Anthropic
+# platform_managed workspace that `claude-*` id inherits ANTHROPIC_BASE_URL
+# (the CP proxy) and the proxy routes any `claude*` slug to real Anthropic →
+# the depleted platform key → "credit balance too low". CP now injects the
+# correct same-provider values for these (see molecule-controlplane
+# tenant_config.go `platformManagedHarnessModelEnv`); the adapter's job is
+# ONLY to make sure they survive to the spawned `claude` process.
+#
+# PASSTHROUGH CONTRACT: the adapter does NOT build the SDK options with an
+# `env=` allow-list — `ClaudeSDKExecutor._build_options` constructs
+# `ClaudeAgentOptions` without an `env` kwarg, so the claude-agent-sdk
+# subprocess transport inherits the full container `os.environ`. These names
+# are therefore forwarded automatically, exactly like ANTHROPIC_API_KEY /
+# ANTHROPIC_BASE_URL. They are listed here so (a) the boot audit reports them
+# and (b) test_harness_model_env_passthrough pins the no-allow-list contract,
+# so a future refactor that adds an `env=` filter cannot silently re-open
+# the internal#702 leak. The adapter NEVER hardcodes model ids — it forwards
+# whatever CP injected.
+_HARNESS_MODEL_ENV = (
+    "ANTHROPIC_SMALL_FAST_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ENABLE_TOOL_SEARCH",
+)
+
+
+def _audit_harness_model_env() -> None:
+    """Log a one-line snapshot of the harness model-tier env (internal#702).
+
+    Logs NAMES + presence ("set"/"unset"), never VALUES — same contract as
+    _audit_auth_env_presence. When every name reads `unset` on a
+    non-Anthropic workspace, the harness's background tier will fall back to
+    `claude-3-5-haiku` and leak to real Anthropic (internal#702); this audit
+    makes that diagnosable from one log line.
+    """
+    snapshot = ", ".join(
+        f"{name}={'set' if os.environ.get(name) else 'unset'}"
+        for name in _HARNESS_MODEL_ENV
+    )
+    logger.info("harness model-tier env audit: %s", snapshot)
+
+
 # Auth-mode constants — provider entries use one of these strings.
 # Drives validation behavior in setup() (third-party requires base_url
 # resolution; oauth/anthropic-api leave base_url=None for CLI defaults).
@@ -520,6 +568,14 @@ def _resolve_provider(
 ) -> dict:
     """Return the provider entry matching this model id.
 
+    Selection is flag-free: the ``platform`` arm (CP proxy, metered billing)
+    is chosen exactly like every other provider — by the resolved provider
+    (``explicit_provider``/``LLM_PROVIDER``/model→provider), NOT by a
+    ``MOLECULE_LLM_BILLING_MODE`` env. ``provider==platform`` is the single
+    signal that routes through the proxy (part of the org-wide
+    ``llm_billing_mode`` removal; core injects ``LLM_PROVIDER=platform`` for
+    platform-routed workspaces).
+
     If ``explicit_provider`` is given (set via the ``provider:`` field in
     workspace config.yaml or runtime_config), look up by name first. If the
     named provider is not in the registry, RAISE ``ValueError`` with an
@@ -672,9 +728,12 @@ class ClaudeCodeAdapter(BaseAdapter):
         The legacy claude-code-specific ``inject_plugins()`` override is gone:
         each plugin now ships (or has registered in the platform registry) a
         per-runtime adaptor, and ``BaseAdapter.install_plugins_via_registry``
-        routes installs through it. The Claude Code SDK still reads
-        ``CLAUDE.md`` and ``/configs/skills/`` natively, and the default
-        :class:`AgentskillsAdaptor` writes to both.
+        routes installs through it. The Claude Code SDK reads ``CLAUDE.md``
+        natively; ``/configs/skills/`` (where the default
+        :class:`AgentskillsAdaptor` writes plugin skills) reaches Claude Code
+        via the ``~/.claude/skills`` symlink created by entrypoint.sh
+        (``link_plugin_skills_into_claude_home`` — Claude Code only scans
+        its own personal-skills dir, NOT /configs/skills directly).
         """
         # Load provider registry from /configs/config.yaml — canvas reads
         # the same YAML for its Config-tab Provider dropdown so adapter +
@@ -731,6 +790,23 @@ class ClaudeCodeAdapter(BaseAdapter):
         )
         if not picked_model:
             picked_model = "sonnet"
+
+        # SSOT signal — TOP PRECEDENCE. ``MOLECULE_RESOLVED_PROVIDER`` is the
+        # single provider value core's workspace provisioner publishes after
+        # resolving the provider ONCE (Go ``manifest.DeriveProvider``). When it
+        # is set it overrides every other source here — the env
+        # MODEL_PROVIDER/MODEL convention, the YAML/runtime_config ``provider:``
+        # field, and model-prefix derivation — so claude-code selects exactly the
+        # registry arm core resolved (``platform`` for the metered proxy, a byok
+        # arm such as ``anthropic-api`` otherwise). It carries the registry arm
+        # name verbatim, so it flows straight into ``explicit_provider`` and is
+        # validated by ``_resolve_provider`` (which raises an actionable
+        # ValueError if the name is not in the registry, same as #180). The
+        # adapter falls back to the resolution above ONLY when the SSOT signal is
+        # absent (back-compat for provisioners that predate it).
+        resolved_provider = (os.environ.get("MOLECULE_RESOLVED_PROVIDER") or "").strip()
+        if resolved_provider:
+            explicit_provider_name = resolved_provider
 
         # NOTE: do NOT strip the provider prefix here. The pre-fix routing
         # behavior — `anthropic:claude-opus-4-7` falls through to
@@ -807,6 +883,16 @@ class ClaudeCodeAdapter(BaseAdapter):
         # closes that gap. See _audit_auth_env_presence above.
         _audit_auth_env_presence()
 
+        # internal#702: also report the harness model-tier env so an
+        # operator can see at a glance whether CP injected the small-fast +
+        # alias models (which it does for non-anthropic platform_managed
+        # workspaces). All-`unset` on a non-anthropic provider is the
+        # fingerprint of the haiku-leak-to-Anthropic bug. These vars are
+        # forwarded to the spawned `claude` process via plain os.environ
+        # inheritance (see _HARNESS_MODEL_ENV passthrough contract); the
+        # adapter does not resolve or rewrite them.
+        _audit_harness_model_env()
+
         # Auth check — any of the provider's accepted env vars satisfies.
         # Warning (not raise) so a workspace can still boot for non-LLM
         # work (terminal, file editing) while the operator sets the key.
@@ -844,16 +930,41 @@ class ClaudeCodeAdapter(BaseAdapter):
         )
         await self.install_plugins_via_registry(config, plugins)
 
+        # Capture plugin fragments for create_executor() so the executor's
+        # per-turn hot-reload rebuild threads the SAME plugin_rules/plugin_prompts
+        # through build_system_prompt that setup() used (#185).
+        self._plugin_rules = getattr(plugins, "rules", None)
+        self._plugin_prompts = list(getattr(plugins, "prompt_fragments", []) or [])
+
+        # --- SSOT: publish the single base-built system prompt onto config ---
+        # config.system_prompt is BASE-OWNED and None until something fills it.
+        # Build it HERE via the one canonical builder (``build_system_prompt``),
+        # which honors ``config.prompt_files`` (with the legacy
+        # ``system-prompt.md`` fallback baked in). This is the authoritative
+        # boot value the executor receives + its hot-reload fallback; the
+        # executor re-derives through the SAME builder per turn so a delivered
+        # prompt still takes effect without a restart. Plugin rules/prompts
+        # loaded above are folded in to match the base ``_common_setup`` shape.
+        from molecule_runtime.prompt import build_system_prompt
+        config.system_prompt = build_system_prompt(
+            config.config_path,
+            config.workspace_id,
+            [],  # skills: /configs/skills reaches claude-code via the
+            #     ~/.claude/skills symlink (entrypoint.sh)
+            [],  # peers: discovered live via the a2a MCP, not baked
+            prompt_files=config.prompt_files,
+            plugin_rules=self._plugin_rules,
+            plugin_prompts=self._plugin_prompts,
+        )
+
     async def create_executor(self, config: AdapterConfig) -> AgentExecutor:
         from claude_sdk_executor import ClaudeSDKExecutor
 
-        # Load system prompt if exists
+        # The base-published prompt (setup() → build_system_prompt, honoring
+        # prompt_files) is the authoritative SSOT value + the executor's
+        # hot-reload fallback. No per-runtime system-prompt.md re-read here —
+        # that re-read ignored prompt_files (the concierge-identity drift).
         system_prompt = config.system_prompt
-        if not system_prompt:
-            prompt_file = os.path.join(config.config_path, "system-prompt.md")
-            if os.path.exists(prompt_file):
-                with open(prompt_file) as f:
-                    system_prompt = f.read()
 
         # runtime_config may arrive as a dict (from main.py vars(...)) or as a
         # RuntimeConfig dataclass. Read `model` defensively from either shape.
@@ -933,6 +1044,17 @@ class ClaudeCodeAdapter(BaseAdapter):
             config_path=config.config_path,
             heartbeat=config.heartbeat,
             model=model,
+            # Thread prompt_files + workspace_id so the executor's per-turn
+            # hot-reload re-derives through the SAME single builder
+            # (build_system_prompt) that produced config.system_prompt —
+            # honoring prompt_files instead of re-reading only system-prompt.md.
+            prompt_files=config.prompt_files,
+            workspace_id=config.workspace_id,
+            # Thread plugin_rules/plugin_prompts for the same reason: without
+            # them the hot-reload path would silently drop plugin fragments
+            # (task #76 / #185).
+            plugin_rules=getattr(self, "_plugin_rules", None),
+            plugin_prompts=list(getattr(self, "_plugin_prompts", []) or []),
         )
 
     async def transcript_lines(self, since: int = 0, limit: int = 100) -> dict:

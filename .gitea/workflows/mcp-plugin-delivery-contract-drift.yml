@@ -1,0 +1,65 @@
+name: mcp-plugin-delivery-contract-drift
+
+# Cross-repo drift gate for the MCP-plugin delivery contract (core#3080).
+#
+# molecule-ai-sdk is the public SSOT for this contract. This template keeps a
+# local copy because it must render the MCP settings surface during workspace
+# bootstrap. This workflow fetches the SDK copy and byte-compares it against the
+# template's local copy. RED if they differ — the template and SDK must agree so
+# runtime bootstrap and platform-side gates read the same contract.
+#
+# ENFORCEMENT GATING: standalone workflow, NOT a job in ci.yml and NOT in
+# branch protection (soak-then-promote; mirrors molecule-core's
+# mcp-plugin-delivery-contract-drift.yml).
+#
+# AUTH: uses AUTO_SYNC_TOKEN (the existing cross-repo read token). If the
+# secret is absent on a trusted context the job fails closed; on untrusted
+# fork PRs it soft-skips.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'contracts/mcp-plugin-delivery.contract.json'
+      - '.gitea/workflows/mcp-plugin-delivery-contract-drift.yml'
+  schedule:
+    # Daily at :37 — catch a core-side contract change that landed without a
+    # paired template re-sync PR (off-zero to spread cron load).
+    - cron: '37 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-plugin-delivery-contract-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # bp-required: pending #3080 — soak-then-promote; standalone drift gate, not in branch protection yet.
+  compare:
+    name: Compare MCP plugin delivery contract against SDK canonical
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch SDK contract and byte-compare
+        env:
+          SDK_CONTRACT_URL: https://git.moleculesai.app/molecule-ai/molecule-ai-sdk/raw/branch/main/contracts/mcp/mcp-plugin-delivery.contract.json
+        run: |
+          set -euo pipefail
+          curl -fsS -A curl/8.4.0 "$SDK_CONTRACT_URL" -o /tmp/canonical-mcp-plugin-delivery.contract.json
+          LOCAL=contracts/mcp-plugin-delivery.contract.json
+          if diff -u /tmp/canonical-mcp-plugin-delivery.contract.json "$LOCAL"; then
+            echo "OK — template's contract is byte-identical to the SDK canonical."
+          else
+            echo "::error::template's mcp-plugin-delivery.contract.json DRIFTED from the SDK canonical."
+            echo "Re-sync: copy molecule-ai-sdk contracts/mcp/mcp-plugin-delivery.contract.json verbatim over $LOCAL."
+            exit 1
+          fi

@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# gitea-curl — safe curl wrapper for git.moleculesai.app.
+#
+# Refuses to pass credentials on the command line. Instead it forces curl to
+# read credentials from ~/.netrc, keeping tokens out of argv / activity logs.
+#
+# Usage: gitea-curl [curl-args...]
+#
+# Examples:
+#   gitea-curl https://git.moleculesai.app/api/v1/user
+#   gitea-curl -sS -X GET "https://git.moleculesai.app/api/v1/repos/molecule-ai/molecule-core/pulls"
+#
+# If GIT_HTTP_USERNAME/GIT_HTTP_PASSWORD are not in ~/.netrc yet, run
+# scripts/setup-gitea-netrc.sh first (ideally from agent harness startup).
+
+set -euo pipefail
+
+HOST="${GITEA_HOST:-git.moleculesai.app}"
+NETRC="${HOME}/.netrc"
+
+# fail <msg>: print message and exit 1 (fail-closed).
+fail() {
+  echo "gitea-curl: $*" >&2
+  exit 1
+}
+
+# _strip_leading_dashes <arg>: echo the argument with any leading '-' removed.
+_strip_leading_dashes() {
+  local a="$1"
+  while [[ "$a" == -* ]]; do
+    a="${a#-}"
+  done
+  printf '%s' "$a"
+}
+
+# _contains_auth <arg>: returns 0 if the argument (after stripping leading
+# dashes and splitting on the first '=' or ':') contains the substring
+# "authorization" or "proxy-authorization" case-insensitively. This is a
+# structural, form-agnostic guard that covers split/glued/equals-attached and
+# future spelling variants in one pass.
+_contains_auth() {
+  local raw="$1"
+  local norm
+  norm=$(_strip_leading_dashes "$raw")
+  # Split on first '=' or ':' and check every resulting part.
+  local parts
+  # Bash parameter expansion can split on one char at a time; use IFS for both.
+  parts="${norm%%[:=]*} ${norm#*[:=]}"
+  for part in $parts; do
+    local p="${part,,}"
+    if [[ "$p" == *authorization* ]] || [[ "$p" == *proxy-authorization* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# _is_user_flag <arg>: returns 0 if the argument is -u/-U/--user/--proxy-user
+# in any attachment form. We check the raw argument so that leading dashes are
+# preserved and we don't accidentally match unrelated substrings.
+_is_user_flag() {
+  local a="$1"
+  case "$a" in
+    -u|-u*|--user|--user=*) return 0 ;;
+    -U|-U*|--proxy-user|--proxy-user=*) return 0 ;;
+  esac
+  return 1
+}
+
+# _is_header_flag <arg>: returns 0 if the argument is a bare -H or --header.
+_is_header_flag() {
+  case "$1" in
+    -H|--header) return 0 ;;
+  esac
+  return 1
+}
+
+# Structural scan over the entire argv. For every argument (and the value
+# following a bare -H/--header), refuse any inline credential.
+args=("$@")
+i=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  arg="${args[$i]}"
+
+  # Refuse user/pass flags in any attachment form.
+  if _is_user_flag "$arg"; then
+    fail "refusing -u/--user/-U/--proxy-user; credentials must come from ~/.netrc, not argv"
+  fi
+
+  # Refuse any argument that structurally contains an Authorization header.
+  if _contains_auth "$arg"; then
+    fail "refusing inline Authorization/Proxy-Authorization header; use ~/.netrc or redirect header from a file"
+  fi
+
+  # Also scan the value following a bare -H/--header (the split form).
+  if _is_header_flag "$arg"; then
+    next=$((i + 1))
+    if [ "$next" -lt "${#args[@]}" ]; then
+      if _contains_auth "${args[$next]}"; then
+        fail "refusing inline Authorization/Proxy-Authorization header; use ~/.netrc or redirect header from a file"
+      fi
+    fi
+  fi
+
+  i=$((i + 1))
+done
+
+if [ ! -f "$NETRC" ]; then
+  fail "$NETRC not found; run setup-gitea-netrc.sh first"
+fi
+
+# --netrc makes curl read ~/.netrc for the matching host.
+# We do NOT add -u or -H Authorization here.
+exec curl --netrc "$@"

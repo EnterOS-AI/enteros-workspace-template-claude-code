@@ -90,12 +90,14 @@ def _install_stubs():
     _ensure_attr(helpers, "extract_attached_files", lambda *a, **kw: [])
     _ensure_attr(helpers, "extract_message_text", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_a2a_instructions", lambda **kw: "")
+    _ensure_attr(helpers, "get_display_instructions", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_hma_instructions", lambda *a, **kw: "")
     _ensure_attr(helpers, "get_mcp_server_path", lambda *a, **kw: "/dev/null")
     _ensure_attr(helpers, "get_system_prompt", lambda *a, **kw: "")
     _ensure_attr(helpers, "read_delegation_results", lambda *a, **kw: "")
     _ensure_attr(helpers, "recall_memories", lambda *a, **kw: "")
-    _ensure_attr(helpers, "sanitize_agent_error", lambda e: str(e))
+    _ensure_attr(helpers, "sanitize_agent_error", lambda exc=None, category=None, stderr=None: (f"Agent error ({type(exc).__name__}): {stderr}" if stderr else f"Agent error: {exc}"))
+    _ensure_attr(helpers, "error_detail_for_external", lambda exc: str(exc) or None)
     _ensure_attr(helpers, "set_current_task", lambda *a, **kw: None)
 
 
