@@ -38,11 +38,19 @@
       "renderer": "mcp_render.render_codex_config",
       "status": "implemented"
     },
+    "openclaw": {
+      "settings_path": "~/.openclaw/openclaw.json",
+      "format": "json",
+      "key_path": "mcp.servers",
+      "renderer": "mcp_render.render_openclaw_config",
+      "status": "implemented"
+    },
     "hermes": {
-      "settings_path": "unverified",
-      "format": "unverified",
+      "settings_path": "~/.hermes/config.yaml",
+      "format": "yaml",
+      "key": "mcp_servers",
       "renderer": "mcp_render.render_hermes_config",
-      "status": "todo-unverified"
+      "status": "implemented"
     }
   }
 }
