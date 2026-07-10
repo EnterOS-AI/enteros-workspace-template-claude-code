@@ -507,6 +507,119 @@ _VENDOR_KEY_NAMES = frozenset({
 })
 
 
+# ===========================================================================
+# ADAPTER-OWNED MCP-CONFIG + PERSONA SEAM (ADR-004 §Decision-1)
+# ===========================================================================
+# Per ADR-004 (SDK owns the adapter socket + registry; the shared engine holds
+# ZERO per-runtime dispatch) the claude-code per-runtime SHAPE — the native MCP
+# path, the JSON `mcpServers` renderer, its inverse reader, the present-probe,
+# and the persona materializer — lives HERE, in the adapter, not in the shared
+# engine's `_RUNTIME_SPECS` / `_RUNTIME_READERS` / `_RUNTIME_PERSONA` dispatch
+# tables. This block is a FAITHFUL, byte-identical copy of the engine's
+# claude_code renderers/readers/materializer (mcp_render.render_claude_settings /
+# _claude_path / _json_settings_has / _read_json_mcp_servers and
+# persona_render.materialize_claude_persona / _claude_persona_path). The output
+# MUST stay byte-for-byte identical to the engine's so onboarding — which works
+# TODAY through the engine dispatch — keeps producing the same native config; the
+# engine-migration phase (deleting the duplication from mcp_render/persona_render)
+# depends on this equality. Do NOT "improve" the format here.
+
+# The settings.json map key under which claude-code reads its MCP servers.
+# Mirrors mcp_render.MCPSERVERS_KEY (the cross-repo delivery-contract `key`).
+_MCPSERVERS_KEY = "mcpServers"
+
+# Claude Code's native identity file (the system-prompt fallback file its
+# create_executor reads). Mirrors persona_render.CLAUDE_PERSONA_FILE.
+_CLAUDE_PERSONA_FILE = "system-prompt.md"
+
+
+def _claude_native_mcp_path(config_path: "str | os.PathLike") -> Path:
+    """Absolute native MCP-config file claude-code reads `mcpServers` from.
+
+    ``<config_path>/.claude/settings.json``. Faithful copy of
+    ``mcp_render._claude_path`` — claude-code (unlike codex/openclaw/hermes)
+    resolves this from ``config.config_path``, NOT ``$HOME``.
+    """
+    return Path(config_path) / ".claude" / "settings.json"
+
+
+def _render_claude_settings(settings_path: Path, name: str, spec: dict) -> None:
+    """Additively merge ``name -> spec`` into the claude ``settings.json``
+    ``mcpServers`` map. Idempotent; preserves every other key + server.
+
+    Byte-identical to ``mcp_render.render_claude_settings``:
+    ``json.dumps(data, indent=2) + "\\n"``. Additive (never evicts another
+    server or a hand-written key) and idempotent (re-rendering the same
+    descriptor rewrites identical bytes).
+    """
+    settings_path = Path(settings_path)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if settings_path.is_file():
+        try:
+            data = json.loads(settings_path.read_text())
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+    else:
+        data = {}
+
+    servers = data.get(_MCPSERVERS_KEY)
+    if not isinstance(servers, dict):
+        servers = {}
+    servers[name] = dict(spec)
+    data[_MCPSERVERS_KEY] = servers
+
+    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def _claude_settings_has(settings_path: Path, name: str) -> bool:
+    """True when the claude ``settings.json`` declares ``mcpServers.<name>``.
+
+    Fail-closed by construction: a missing/unreadable/malformed/structurally-
+    unexpected config yields False. Faithful copy of
+    ``mcp_render._json_settings_has``.
+    """
+    try:
+        data = json.loads(Path(settings_path).read_text())
+    except (OSError, ValueError):
+        return False
+    servers = data.get(_MCPSERVERS_KEY) if isinstance(data, dict) else None
+    return isinstance(servers, dict) and name in servers
+
+
+def _read_claude_mcp_servers(settings_path: Path) -> dict:
+    """Read the ``mcpServers`` map from the claude JSON settings file.
+
+    Returns ``{name: spec}`` for every dict-valued entry (the inverse of the
+    renderer); fail-closed ``{}`` on a missing/unreadable/malformed/structurally-
+    unexpected file. Faithful copy of ``mcp_render._read_json_mcp_servers``.
+    """
+    try:
+        data = json.loads(Path(settings_path).read_text())
+    except (OSError, ValueError):
+        return {}
+    servers = data.get(_MCPSERVERS_KEY) if isinstance(data, dict) else None
+    return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+
+
+def _materialize_claude_persona(config_path: Path, persona: str) -> Path:
+    """Write ``persona`` to ``<config_path>/system-prompt.md`` (trailing newline).
+
+    Claude-code's system-prompt fallback file. The executor prefers the
+    base-assembled ``config.system_prompt``, so this is a no-regression native
+    mirror. Faithful copy of ``persona_render.materialize_claude_persona`` +
+    ``persona_render._write_persona_file`` (parents created, trailing newline
+    appended only when absent).
+    """
+    target = Path(config_path) / _CLAUDE_PERSONA_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+    body = persona if persona.endswith("\n") else persona + "\n"
+    target.write_text(body, encoding="utf-8")
+    return target
+
+
 def _project_vendor_auth(provider: dict) -> None:
     """Project a per-vendor API key onto the provider's auth-token env at boot.
 
@@ -721,6 +834,117 @@ class ClaudeCodeAdapter(BaseAdapter):
         consumer in a2a_proxy.dispatchA2A.
         """
         return 900  # 15 minutes
+
+    # ------------------------------------------------------------------
+    # MCP-config seam (ADR-004 §3) — claude-code OWNS its per-runtime shape.
+    # These override the BaseAdapter dispatch defaults so the adapter renders /
+    # reads / present-probes / enumerates against its OWN native config
+    # (.claude/settings.json) WITHOUT reaching into the shared engine's
+    # per-runtime dispatch tables. Byte-identical output to the engine's
+    # claude_code renderers (see the module-level `_render_claude_settings`
+    # etc.) so onboarding stays byte-stable through the engine-migration phase.
+    # ------------------------------------------------------------------
+    def mcp_settings_path(self, config: "AdapterConfig") -> str:
+        """Absolute native MCP-config file claude-code reads `mcpServers` from
+        (``<config_path>/.claude/settings.json``). Always absolute; never another
+        runtime's file."""
+        return str(_claude_native_mcp_path(config.config_path))
+
+    def register_mcp_server_hook(
+        self, config: "AdapterConfig", name: str, spec: dict
+    ) -> None:
+        """Wire ``name -> spec`` into claude-code's native ``.claude/settings.json``
+        ``mcpServers`` map (the MCP-wiring PORT).
+
+        Additive + idempotent (never evicts another server or a hand-written key;
+        re-rendering the same descriptor rewrites identical bytes), and writes
+        ONLY the file claude-code reads (the #3159 guard). Enriches the privileged
+        management-MCP spec via ``inject_privileged_env`` first — no-op for
+        non-management names, idempotent, descriptor-wins — matching the base
+        funnel so a direct caller (the self-heal path) is enriched too.
+        """
+        from molecule_runtime.privileged_mcp_env import inject_privileged_env
+
+        spec = inject_privileged_env(name, spec)
+        target = _claude_native_mcp_path(config.config_path)
+        _render_claude_settings(target, name, spec)
+        logger.info(
+            "register_mcp_server_hook: wired MCP %r into %s (runtime=%s)",
+            name, target, self.name(),
+        )
+
+    def management_mcp_present(self, config: "AdapterConfig") -> bool:
+        """True when the privileged management MCP (``molecule-platform``) is
+        declared in claude-code's ``.claude/settings.json``.
+
+        The runtime-agnostic answer to the RCA#2970 online gate's "is the
+        management MCP wired?" question, judged against the file claude-code
+        actually reads. Fail-CLOSED: a missing/unreadable/malformed/structurally-
+        unexpected config yields False."""
+        from molecule_runtime.platform_agent_identity import MANAGEMENT_MCP_NAME
+
+        return _claude_settings_has(
+            _claude_native_mcp_path(config.config_path), MANAGEMENT_MCP_NAME
+        )
+
+    async def enumerate_loaded_mcp_tools(
+        self, config: "AdapterConfig"
+    ) -> "list[str] | None":
+        """Enumerate the LOADED MCP tool ids claude-code actually has, or None.
+
+        Reads claude-code's OWN native config (``.claude/settings.json``
+        ``mcpServers``) via the adapter's reader, then hands the resolved
+        ``{name: spec}`` map to the shared boot-safe stdio probe engine
+        (``loaded_mcp_tools_probe.enumerate_from_specs_async``) — the runtime
+        agnostic engine that STAYS in the shared runtime. This is the same
+        adapter-owns-discovery pattern hermes uses, so the engine's per-runtime
+        reader switch is never consulted for claude-code.
+
+        TRI-STATE (identical to the loaded_mcp_tools producer contract):
+          * ``None``  — nothing observed (no servers declared, or every probe
+            failed/stalled/unreadable). Heartbeat omits the field → grace window.
+          * ``[]``    — a server genuinely connected and advertised zero tools.
+          * ``[ids]`` — deduped/sorted union of ``mcp__<server>__<tool>`` ids.
+
+        BOOT-SAFE + NEVER-RAISES: ``enumerate_from_specs_async`` bounds the whole
+        probe by the enumeration deadline and maps every failure to ``None``.
+        """
+        from molecule_runtime.loaded_mcp_tools_probe import enumerate_from_specs_async
+
+        servers = _read_claude_mcp_servers(_claude_native_mcp_path(config.config_path))
+        return await enumerate_from_specs_async(servers)
+
+    # ------------------------------------------------------------------
+    # Persona seam (ADR-004 §4) — claude-code OWNS its native identity file.
+    # ------------------------------------------------------------------
+    def materialize_persona(self, config: "AdapterConfig") -> "Path | None":
+        """Materialize the workspace's CANONICAL PERSONA into claude-code's native
+        identity file (``<config_path>/system-prompt.md``).
+
+        Reads the persona runtime-agnostically from ``config.prompt_files`` via
+        the shared ``persona_render.read_canonical_persona`` generic helper (the
+        one runtime-name-free helper the engine keeps), then writes it into
+        claude-code's own convention. Best-effort: returns ``None`` (no-op) when
+        no persona is delivered, so claude-code's baked default is never clobbered
+        with an empty identity. Returns the path written otherwise."""
+        from molecule_runtime import persona_render
+
+        persona = persona_render.read_canonical_persona(
+            config.config_path, config.prompt_files
+        )
+        if not (persona or "").strip():
+            logger.info(
+                "materialize_persona: no canonical persona delivered for runtime "
+                "%s — leaving the runtime's native default untouched",
+                self.name(),
+            )
+            return None
+        target = _materialize_claude_persona(Path(config.config_path), persona)
+        logger.info(
+            "materialize_persona: wrote %s persona (%d chars) to %s",
+            self.name(), len(persona), target,
+        )
+        return target
 
     async def setup(self, config: AdapterConfig) -> None:
         """Install plugins via the per-runtime adaptor registry.

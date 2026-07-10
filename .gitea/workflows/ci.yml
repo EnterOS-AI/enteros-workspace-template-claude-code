@@ -458,3 +458,25 @@ jobs:
       # discovery and can't be satisfied without molecule_runtime
       # installed). See tests/pytest.ini for the full rationale.
       - run: python3 -m pytest tests/ -v
+
+  conformance:
+    name: Adapter conformance (ADR-004 socket)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The ADR-004 conformance suite (tests_conformance/) is the OPPOSITE of the
+      # unit `tests/` job: it drives the adapter through the REAL
+      # molecule_runtime.adapter_base.BaseAdapter + the real boot-safe MCP probe
+      # and inherits the SDK-owned battery
+      # molecule_plugin.adapter_conformance.AdapterConformance. So it needs the
+      # real runtime wheel AND molecule-ai-sdk (which ships molecule_plugin)
+      # installed — NOT the stubbed molecule_runtime the tests/conftest.py fakes.
+      # Both resolve from the Gitea PyPI registry (same index the image build
+      # uses); pytest-asyncio drives the async socket tests.
+      - run: pip install -q pytest pytest-asyncio pyyaml
+      - run: pip install -q -r requirements.txt
+      - run: pip install -q molecule-ai-sdk
+      # tests_conformance/ has its OWN conftest (no stubbing) + pytest.ini
+      # (importlib import-mode, auto asyncio) that anchors rootdir there.
+      - run: python3 -m pytest tests_conformance/ -v
