@@ -475,8 +475,13 @@ jobs:
       # Both resolve from the Gitea PyPI registry (same index the image build
       # uses); pytest-asyncio drives the async socket tests.
       - run: pip install -q pytest pytest-asyncio pyyaml
-      - run: pip install -q -r requirements.txt
-      - run: pip install -q molecule-ai-sdk
+      # requirements.txt pulls molecules-workspace-runtime (private-only) and
+      # molecule-ai-sdk ships molecule_plugin (private-only) — both are ABSENT
+      # from public PyPI, so route each through the private index explicitly
+      # (same --extra-index-url the validate-runtime job uses). Public tooling
+      # above resolves from the default index per the hermetic dep policy.
+      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
+      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecule-ai-sdk
       # tests_conformance/ has its OWN conftest (no stubbing) + pytest.ini
       # (importlib import-mode, auto asyncio) that anchors rootdir there.
       - run: python3 -m pytest tests_conformance/ -v
