@@ -30,6 +30,9 @@ name: publish-image
 # that file and forwards the version as a RUNTIME_VERSION docker build-arg so
 # pip install resolves the exact fresh version.
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 on:
   push:
     branches: [main]
