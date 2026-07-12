@@ -79,32 +79,47 @@ WORKDIR /app
 
 # RUNTIME_VERSION is forwarded from the reusable publish workflow as
 # a docker build-arg. When set (cascade-triggered builds), it's the
-# exact runtime version PyPI just published. Including it as an ARG
+# exact runtime version the private registry just published. Including it
+# as an ARG
 # changes the cache key for the pip install layer below — without
 # this, identical Dockerfile + identical requirements.txt content
 # would let docker reuse the cached layer with the previous version
 # baked in (the cache trap that bit us 5x on 2026-04-27).
 # Empty default = falls back to whatever requirements.txt resolves to.
 ARG RUNTIME_VERSION=
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
-# Public deps (python-multipart, a2a-sdk, claude-agent-sdk, and the private
-# runtime's public transitive deps) live on PyPI, not the private Gitea PyPI
-# index. Add pypi.org as an --extra-index-url (NOT --index-url) so the PRIVATE
-# Gitea index stays the PRIMARY resolver for the private molecules-workspace-
-# runtime dist. Matches the accepted pattern already shipped in the hermes/
-# openclaw/langgraph templates (RFC internal#596). Without this the docker
-# build dies with "No matching distribution found for python-multipart" — a
-# real build-arg bug, NOT a runner-egress issue (robot-1 reaches pypi.org).
-ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
+ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
-# Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
-# the RUN command itself but its presence as a declared ARG above
-# means buildx hashes it into the cache key.
+# Parse and remove the runtime requirement before the public solve so a direct
+# reference can never bypass private acquisition. Public requirements and
+# runtime transitive dependencies are then resolved together from pip's
+# default public source; the local wheel fixes the runtime candidate for that
+# single solve. --isolated keeps ambient pip configuration and index
+# environment variables out of both operations.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" -r requirements.txt && \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --extra-index-url "${PIP_EXTRA_INDEX_URL}" --upgrade "molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi
+COPY scripts/prepare_runtime_requirements.py /tmp/prepare_runtime_requirements.py
+RUN set -eu; \
+    runtime_project="molecules-workspace-runtime"; \
+    rm -rf /tmp/molecule-runtime; \
+    rm -f /tmp/template-requirements.txt; \
+    mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \
+      requirements.txt /tmp/template-requirements.txt \
+      --runtime-version "${RUNTIME_VERSION}")"; \
+    if [ "${runtime_requirement#${runtime_project}}" = "${runtime_requirement}" ]; then \
+      echo "ERROR: runtime requirement was not canonicalized" >&2; \
+      exit 1; \
+    fi; \
+    pip download --isolated --only-binary=:all: --no-deps \
+      --index-url "$MOLECULE_RUNTIME_INDEX" \
+      --dest /tmp/molecule-runtime "${runtime_requirement}"; \
+    set -- /tmp/molecule-runtime/*.whl; \
+    if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then \
+      echo "ERROR: private runtime acquisition did not produce exactly one wheel" >&2; \
+      exit 1; \
+    fi; \
+    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl \
+      -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
