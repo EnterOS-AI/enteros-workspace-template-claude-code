@@ -36,7 +36,6 @@ def test_runtime_is_acquired_as_one_private_only_wheel() -> None:
         for instruction in instructions
         if instruction.startswith("RUN ")
         and re.search(r"\bpip\s+download\b", instruction)
-        and "molecules-workspace-runtime" in instruction
     ]
     assert len(downloads) == 1
 
@@ -44,12 +43,9 @@ def test_runtime_is_acquired_as_one_private_only_wheel() -> None:
     assert "pip download --isolated --only-binary=:all: --no-deps" in download
     assert '--index-url "$MOLECULE_RUNTIME_INDEX"' in download
     assert "--extra-index-url" not in download
-    assert 'runtime_requirement="$(sed ' in download
-    assert "requirements.txt" in download
-    assert (
-        'runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"'
-        in download
-    )
+    assert "python3 /tmp/prepare_runtime_requirements.py" in download
+    assert "requirements.txt /tmp/template-requirements.txt" in download
+    assert '--runtime-version "${RUNTIME_VERSION}"' in download
     assert "set -- /tmp/molecule-runtime/*.whl" in download
     assert 'if [ "$#" -ne 1 ] || [ ! -f "$1" ]' in download
 
@@ -66,6 +62,10 @@ def test_runtime_wheel_and_public_requirements_share_one_isolated_solve() -> Non
     assert len(installs) == 1
     install = installs[0]
     assert "pip install --isolated" in install
-    assert re.search(r"(?:^|\s)-r\s+requirements\.txt(?:\s|;|$)", install)
     assert "/tmp/molecule-runtime/*.whl" in install
+    assert re.search(
+        r"(?:^|\s)-r\s+/tmp/template-requirements\.txt(?:\s|;|$)",
+        install,
+    )
+    assert not re.search(r"(?:^|\s)-r\s+requirements\.txt(?:\s|;|$)", install)
     assert "--extra-index-url" not in install

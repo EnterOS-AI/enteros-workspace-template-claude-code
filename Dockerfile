@@ -89,23 +89,26 @@ WORKDIR /app
 ARG RUNTIME_VERSION=
 ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
-# Acquire the private runtime wheel without exposing its project name to a
-# public index. Public requirements and runtime transitive dependencies are
-# then resolved together from pip's default public source; the local wheel
-# fixes the runtime candidate for that single solve. --isolated keeps ambient
-# pip configuration and index environment variables out of both operations.
+# Parse and remove the runtime requirement before the public solve so a direct
+# reference can never bypass private acquisition. Public requirements and
+# runtime transitive dependencies are then resolved together from pip's
+# default public source; the local wheel fixes the runtime candidate for that
+# single solve. --isolated keeps ambient pip configuration and index
+# environment variables out of both operations.
 COPY requirements.txt .
+COPY scripts/prepare_runtime_requirements.py /tmp/prepare_runtime_requirements.py
 RUN set -eu; \
-    runtime_requirement="$(sed -n 's/^[[:space:]]*\(molecules-workspace-runtime[^[:space:]#]*\).*$/\1/p' requirements.txt | head -n 1)"; \
-    if [ -z "${runtime_requirement}" ]; then \
-      echo "ERROR: requirements.txt has no molecules-workspace-runtime requirement" >&2; \
+    runtime_project="molecules-workspace-runtime"; \
+    rm -rf /tmp/molecule-runtime; \
+    rm -f /tmp/template-requirements.txt; \
+    mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \
+      requirements.txt /tmp/template-requirements.txt \
+      --runtime-version "${RUNTIME_VERSION}")"; \
+    if [ "${runtime_requirement#${runtime_project}}" = "${runtime_requirement}" ]; then \
+      echo "ERROR: runtime requirement was not canonicalized" >&2; \
       exit 1; \
     fi; \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      runtime_requirement="molecules-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi; \
-    rm -rf /tmp/molecule-runtime; \
-    mkdir -p /tmp/molecule-runtime; \
     pip download --isolated --only-binary=:all: --no-deps \
       --index-url "$MOLECULE_RUNTIME_INDEX" \
       --dest /tmp/molecule-runtime "${runtime_requirement}"; \
@@ -114,8 +117,9 @@ RUN set -eu; \
       echo "ERROR: private runtime acquisition did not produce exactly one wheel" >&2; \
       exit 1; \
     fi; \
-    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl -r requirements.txt; \
-    rm -rf /tmp/molecule-runtime
+    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl \
+      -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
 
 # --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
 # The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
