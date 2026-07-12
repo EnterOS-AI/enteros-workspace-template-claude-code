@@ -6,18 +6,16 @@
 # resolution crashes adapter.setup() with
 # `ImportError: cannot import name 'get_display_instructions'` (-32603).
 # The exact build pin is forwarded by publish-image.yml as the RUNTIME_VERSION
-# build-arg sourced from .runtime-version (currently 0.3.10); this floor is the
+# build-arg sourced from .runtime-version; this floor is the
 # defensive contract for any resolution that does NOT carry that override.
 molecules-workspace-runtime>=0.3.11
 
 # P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"
 # (task #256; forensic a5bb950f). Starlette `Request.form()` raises
 # AssertionError parsing multipart bodies when python-multipart is absent.
-# Pinned in molecule-core mc#1578 (SSOT, MERGED 2026-05-19T21:41Z) but the
-# PyPI publish of the updated runtime wheel is gated on the Gitea middleman
-# rename + PyPI abuse-block recovery. This direct pin in each template is
-# REDUNDANT (and harmless) once mc#1578's runtime tag publishes — at that
-# point the runtime wheel itself will carry python-multipart as a transitive.
+# The runtime wheel carries this dependency transitively. Keep the direct floor
+# as defense in depth for local tooling that reads this file without installing
+# the runtime wheel first.
 python-multipart>=0.0.27
 
 # Claude Code adapter specific deps

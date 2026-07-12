@@ -291,7 +291,7 @@ def _load_providers(config_path: str) -> tuple:
     raw = None
     chosen_path = None
     try:
-        import yaml  # transitive dep via molecule-ai-workspace-runtime
+        import yaml  # transitive dep via molecules-workspace-runtime
     except ImportError:
         logger.warning("providers: yaml import failed; using builtins")
         return _BUILTIN_PROVIDERS
@@ -376,7 +376,7 @@ def _resolve_model_and_provider_from_env(
       * ``MODEL_PROVIDER`` — the provider slug (e.g. ``minimax``,
         ``claude-code``, ``anthropic``).
 
-    The legacy ``workspace/config.py`` (in molecule-ai-workspace-runtime)
+    The shared ``molecule_runtime/config.py`` (in molecules-workspace-runtime)
     historically interpreted ``MODEL_PROVIDER`` as the *model id* — a name
     chosen before there was a separate ``MODEL`` env var. When both env vars
     are set with the persona convention, the legacy code reads
@@ -468,11 +468,11 @@ def _resolve_model_and_provider_from_env(
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Strip LangChain-style "<provider>:<model>" prefix from a model id.
+    """Strip a known "<provider>:<model>" prefix from a model id.
 
     The molecule-runtime wheel's config.py defaults model to
-    "anthropic:claude-opus-4-7" so langchain/crewai consumers get a uniform
-    LangChain-style provider:model string out of the box. The claude CLI's
+    "anthropic:claude-opus-4-7" so runtime consumers get a uniform
+    provider:model string out of the box. The claude CLI's
     --model arg expects the bare model id and silently exits 1 (no stderr)
     on prefixed strings — root cause of the 2026-05-01 claude-code adapter
     "Agent error (Exception)" bug.
@@ -742,10 +742,9 @@ def _resolve_provider(
             f"            base_url: https://...   # provider's Anthropic-compat endpoint\n"
             f"            auth_env: [{explicit_provider.upper()}_API_KEY]\n"
             f"            model_prefixes: [...]\n"
-            f"  (b) Switch the workspace runtime template to one that "
-            f"natively supports {explicit_provider} (CrewAI, LangGraph, or "
-            f"DeepAgents read provider/model from runtime_config and route "
-            f"directly without needing an Anthropic-compat shim).\n"
+            f"  (b) Switch to an official runtime whose provider registry "
+            f"supports {explicit_provider} and routes it "
+            f"without an Anthropic-compat shim.\n"
             f"\n"
             f"Note: claude-code SDK speaks the Anthropic API protocol. "
             f"Providers that only expose OpenAI-compatible endpoints "
@@ -984,7 +983,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         if not yaml_provider_name:
             yaml_path = os.path.join(config.config_path, "config.yaml")
             try:
-                import yaml  # transitive dep via molecule-ai-workspace-runtime
+                import yaml  # transitive dep via molecules-workspace-runtime
                 with open(yaml_path, "r") as f:
                     data = yaml.safe_load(f) or {}
                 if isinstance(data, dict):

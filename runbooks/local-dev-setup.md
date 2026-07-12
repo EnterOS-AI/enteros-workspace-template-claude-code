@@ -16,7 +16,7 @@ common problems.
 | Docker | 24+ | |
 | Docker Compose | v2 (standalone or compose plugin) | |
 | Git | 2.40+ | |
-| `gh` CLI | 2.40+ | Required for agent autonomy features (git, gh operations) |
+| Gitea access | Current | Required for repository and package downloads |
 | Molecule platform access | Token with `workspace:dev` scope | |
 
 ---
@@ -40,19 +40,22 @@ git checkout -b feat/your-feature-name
 
 ## Step 2 — Install Dependencies
 
-```bash
-pip install -r requirements.txt
-```
-
-If you encounter dependency conflicts with an existing virtual environment, create an
-isolated one:
+Create an isolated virtual environment so local dependencies do not modify the
+system Python:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate        # Linux/macOS
 # .\.venv\Scripts\Activate.ps1  # Windows PowerShell
-pip install -r requirements.txt
+python -m pip install packaging
+git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+python .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing
 ```
+
+The canonical installer acquires `molecules-workspace-runtime` from the private
+Gitea index only, then resolves the remaining public dependencies with the local
+runtime wheel already selected. Do not add a second package index to a general
+`pip install` command.
 
 Verify the adapter is importable:
 
@@ -200,7 +203,7 @@ docker compose down -v
 | `anthropic.AuthenticationError` | Wrong token or token lacks required scopes | Verify token has `model:read` and `agent:invoke` scopes |
 | Adapter starts but never receives tasks | Wrong `MOLECULE_PLATFORM_URL` or token expired | Check URL; refresh token |
 | Platform shows "silent" after ~60s | No HEARTBEAT configured; platform timed out the workspace | Set `HEARTBEAT_INTERVAL_SECONDS=30`; upgrade adapter |
-| `docker build` fails with `Step N/12: RUN pip install...` | Network / pip index issue | Proxy through corporate firewall or mirror: `pip install --index-url https://pypi.org/simple/ -r requirements.txt` |
+| `docker build` fails during dependency installation | Gitea package or public dependency source is unreachable | Verify access to `git.moleculesai.app` and the public Python index, then rerun the canonical installer |
 | `docker run` exits immediately with code 0 | `CLAUDE_CODE_OAUTH_TOKEN` not set | Pass `-e CLAUDE_CODE_OAUTH_TOKEN` or `--env-file .env.local` |
 | `ValidationError: template schema version '1' not supported` | Platform minimum schema version increased | Update `template_schema_version` in `config.yaml` to match platform minimum |
 

@@ -69,24 +69,14 @@ env:
   # but pinning at the workflow level protects against a runner
   # regenerated without the config file.
   GITHUB_SERVER_URL: https://git.moleculesai.app
-  # HERMETIC dep policy (CI-robustness): do NOT set PIP_INDEX_URL=private —
-  # it force-routes EVERY pip install (pytest, pyyaml, jsonschema, …) at the
-  # private index, which serves only molecules-workspace-runtime → 404s all
-  # public tooling (the Adapter-unit-tests / Template-validation reds). Public
-  # tooling resolves from the default (PyPI) index; the private runtime — which
-  # is ABSENT from public PyPI, so no dependency-confusion — is pulled via an
-  # EXPLICIT --extra-index-url on the runtime install only. The legacy name
-  # molecule-ai-workspace-runtime IS squatted on public PyPI (0.1.999999); we
-  # install the CURRENT dist name molecules-workspace-runtime (private-only).
-  MOLECULE_PRIVATE_INDEX: https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+  # Public test tooling resolves normally. The molecule-ci installer acquires
+  # the runtime wheel from the private Gitea index only, then supplies that
+  # local wheel while resolving public dependencies. The SDK conformance job
+  # installs its SDK source from an immutable Gitea commit.
 
-# Defense-in-depth on the GITHUB_TOKEN scope. The validate-runtime job
-# runs untrusted-by-design code from the calling repo — pip-installs
-# requirements.txt (post-install hooks), imports adapter.py, and
-# docker-builds the Dockerfile. Each primitive can execute arbitrary
-# code with the token in env. Pinning `contents: read` means the worst
-# a malicious template PR can do with the token is read public repo
-# state — no write to issues, no push to branches, no comment-spam.
+# Defense-in-depth on the GITHUB_TOKEN scope. Dynamic validation is disabled
+# for fork PRs; internal PRs still install requirements, import adapter.py, and
+# docker-build the Dockerfile. Keep the token read-only for those steps.
 permissions:
   contents: read
 
@@ -120,7 +110,7 @@ jobs:
               re.compile(r'''ghp_[a-zA-Z0-9]{36,}'''),
               re.compile(r'''sk-ant-[a-zA-Z0-9]{50,}'''),
           ]
-          SKIP_DIRS = {'.molecule-ci', '.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
+          SKIP_DIRS = {'.molecule-ci-canonical', '.git', 'node_modules', '__pycache__'}
           EXTENSIONS = {'.yaml', '.yml', '.md', '.py', '.sh'}
 
           def is_false_positive(line):
@@ -162,7 +152,7 @@ jobs:
   # pc2-safe: false — needs docker for Docker build smoke; routes to docker-host only
   # (task #390 B-lite — PC2 native runners advertise `ubuntu-latest` but cannot
   # docker due to npipe→Linux-container bridging gap; AND-match on both labels
-  # excludes them while keeping the Linux operator-host runners eligible.)
+  # excludes them while keeping the Linux Docker-host runners eligible.)
   validate-runtime:
     name: Template validation (runtime)
     runs-on: [ubuntu-latest, docker-host]
@@ -174,26 +164,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
-      - run: pip install pyyaml jsonschema -q
+      - run: pip install pyyaml jsonschema packaging -q
       # Install the template's runtime dependencies so the validator's
       # check_adapter_runtime_load() can import adapter.py the same way
       # the workspace container does at boot. Without this, a
       # syntactically-valid adapter that ImportErrors on a missing
       # transitive dep would build clean and crash on first user prompt.
-      - if: hashFiles('requirements.txt') != ''
-        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
-      - if: hashFiles('requirements.txt') == ''
-        run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecules-workspace-runtime
-      - run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
+      - name: Fork PR dynamic-validation notice
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: echo "::notice::fork PR — static validation ran; dependency install, adapter import, and Docker execution are disabled"
+      - name: Install workspace dependencies through molecule-ci
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
+      - name: Run canonical dynamic validator
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: python3 .molecule-ci-canonical/scripts/validate-workspace-template.py
       - name: entrypoint restore-from-secondary unit test (cp#326)
         # Container-runnable bash unit test for entrypoint.sh's
         # restore_from_secondary_volume(). Mocks blkid/mount/mountpoint/
         # rsync so it runs without a real blockdev or docker daemon —
         # pure logic coverage (idempotency, device-absent no-op, happy-
         # path data landing, rsync-failure exit-code handling). The
-        # wire-level contract against real AWS lives in the CP repo's
+        # wire-level contract against real provisioned infrastructure lives in
+        # the CP repo's
         # Stage C smoke (stage-c-workspace-backup-smoke.sh step 6b).
-        if: hashFiles('tests/test_entrypoint_restore.sh') != ''
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('tests/test_entrypoint_restore.sh') != '' }}
         run: bash tests/test_entrypoint_restore.sh
       - name: Entrypoint plugin-skills link unit test
         # Container-runnable bash unit test for entrypoint.sh's
@@ -203,10 +198,10 @@ jobs:
         # (live-diagnosed 2026-07-05: lark-connect invisible on the
         # agents-team platform agent until the symlink existed). Pure
         # filesystem logic in a mktemp sandbox; chown is mocked.
-        if: hashFiles('tests/test_entrypoint_skills_link.sh') != ''
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('tests/test_entrypoint_skills_link.sh') != '' }}
         run: bash tests/test_entrypoint_skills_link.sh
       - name: Docker build smoke test
-        if: hashFiles('Dockerfile') != ''
+        if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('Dockerfile') != '' }}
         run: |
           # Graceful skip when the runner's job-container can't reach the
           # Docker daemon (e.g. /var/run/docker.sock not mounted into the
@@ -265,6 +260,9 @@ jobs:
     runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 20
     needs: validate-static
+    # Never execute fork-controlled Dockerfiles with host PID, /:/host, and
+    # docker.sock. The aggregate job explicitly accepts this fork-only skip.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
     env:
       # The molecule-core ref the contract YAML is generated from.
       # Default `main` floats with the latest contract; pin to a SHA
@@ -398,6 +396,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: [validate-static, validate-runtime, t4-conformance, tests]
     timeout-minutes: 1
+    # A fork PR intentionally skips the privileged T4 job. Always aggregate so
+    # that fork-only skip is evaluated below instead of propagating as a skip.
+    if: ${{ always() }}
     steps:
       - name: Aggregate
         run: |
@@ -445,7 +446,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # pyyaml is the runtime dep that adapter.py's _load_providers reads
       # /configs/config.yaml through. In production it arrives transitively
-      # via molecule-ai-workspace-runtime; in this minimal test env we
+      # via molecules-workspace-runtime; in this minimal test env we
       # install it explicitly so the YAML-loading code path is actually
       # exercised (without it, _load_providers' broad except-Exception
       # swallows the ImportError and silently falls back to _BUILTIN_PROVIDERS,
@@ -465,6 +466,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Fetch molecule-ci canonical scripts
+        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       # The ADR-004 conformance suite (tests_conformance/) is the OPPOSITE of the
       # unit `tests/` job: it drives the adapter through the REAL
       # molecule_runtime.adapter_base.BaseAdapter + the real boot-safe MCP probe
@@ -472,16 +475,19 @@ jobs:
       # molecule_plugin.adapter_conformance.AdapterConformance. So it needs the
       # real runtime wheel AND molecule-ai-sdk (which ships molecule_plugin)
       # installed — NOT the stubbed molecule_runtime the tests/conftest.py fakes.
-      # Both resolve from the Gitea PyPI registry (same index the image build
-      # uses); pytest-asyncio drives the async socket tests.
-      - run: pip install -q pytest pytest-asyncio pyyaml
-      # requirements.txt pulls molecules-workspace-runtime (private-only) and
-      # molecule-ai-sdk ships molecule_plugin (private-only) — both are ABSENT
-      # from public PyPI, so route each through the private index explicitly
-      # (same --extra-index-url the validate-runtime job uses). Public tooling
-      # above resolves from the default index per the hermetic dep policy.
-      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" -r requirements.txt
-      - run: pip install -q --extra-index-url "$MOLECULE_PRIVATE_INDEX" molecule-ai-sdk
+      # pytest-asyncio drives the async socket tests. packaging is required by
+      # molecule-ci's canonical dependency installer.
+      - run: pip install -q pytest pytest-asyncio pyyaml packaging
+      - name: Fork PR conformance notice
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: echo "::notice::fork PR — dependency installation and executable conformance tests are disabled"
+      - name: Install workspace dependencies through molecule-ci
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
+      - name: Install SDK from reviewed immutable source
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: python3 -m pip install --isolated --disable-pip-version-check --quiet --break-system-packages "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@c58c6697b2455540c515c9a3c6656a34ab286e66"
       # tests_conformance/ has its OWN conftest (no stubbing) + pytest.ini
       # (importlib import-mode, auto asyncio) that anchors rootdir there.
-      - run: python3 -m pytest tests_conformance/ -v
+      - if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: python3 -m pytest tests_conformance/ -v
