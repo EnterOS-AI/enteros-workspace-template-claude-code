@@ -236,7 +236,7 @@ _RETRYABLE_PATTERNS = (
 # strands, while the workspace heartbeat still reports "online" (the wedge is
 # invisible).
 #
-# Mirror the guard the NATIVE LangGraph runtime already ships
+# Match the guard in the shared native executor
 # (molecule_runtime.a2a_executor, gated on A2A_COMPLETION_IDLE_TIMEOUT_SECONDS):
 # cap the idle gap BETWEEN streamed messages — NOT the whole turn — so a long
 # but legitimately-progressing tool turn is never killed, while a stream that
@@ -1753,7 +1753,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         # Claude Code reads files through its own Read/Glob tools by path —
         # as long as the prompt names the path, the CLI will open them on
         # demand. Same contract every platform runtime uses so the UX is
-        # identical across hermes / langgraph / claude-code.
+        # identical across official runtimes.
         attached = extract_attached_files(context.message)
         if attached:
             manifest = "\n\nAttached files:\n" + "\n".join(

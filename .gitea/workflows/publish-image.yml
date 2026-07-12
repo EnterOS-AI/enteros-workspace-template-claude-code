@@ -9,11 +9,9 @@ name: publish-image
 # github.com, which always 404s even for same-instance repos.
 # (feedback_gitea_cross_repo_uses_blocked)
 #
-# Registry: production uses ECR (MOLECULE_IMAGE_REGISTRY env var on EC2 /
-# Railway) backed by org-level AWS creds. The OSS default in registry.go is
-# ghcr.io/molecule-ai but the ECR repo `molecule-ai/workspace-template-claude-code`
-# already exists (created by the migration sweep). No GHCR token is in the
-# credentials store — Gitea's GITHUB_TOKEN cannot authenticate to ghcr.io.
+# Registry: images publish to the Gitea OCI backend. The canonical pull host is
+# registry.moleculesai.app; the co-located runner pushes through localhost:3200
+# to bypass Cloudflare's request-body limit for large layers.
 #
 # Gitea 1.22.6 hostile-shape checklist applied:
 #   - No workflow_dispatch.inputs (silently rejected on 1.22.6)
@@ -119,13 +117,25 @@ jobs:
         # Fallback module list mirrors the runtime build script's published
         # top-level module list as of 2026-04-27.
         shell: bash
+        env:
+          RUNTIME_VERSION: ${{ needs.resolve-version.outputs.version }}
         run: |
           set -eu
           FALLBACK_MODULES='plugins|adapter_base|config|main|preflight|prompt|coordinator|consolidation|events|heartbeat|transcript_auth|runtime_wedge|watcher|skill_loader|policies|adapters|builtin_tools|executor_helpers|a2a_executor|a2a_client|a2a_tools|a2a_cli|a2a_mcp_server|agent|agents_md|initial_prompt|molecule_ai_status|platform_auth|shared_runtime'
           RUNTIME_MODULES=""
-          mkdir -p /tmp/runtime-wheel
-          if pip download --quiet molecule-ai-workspace-runtime --no-deps -d /tmp/runtime-wheel 2>/dev/null; then
-            WHEEL=$(ls /tmp/runtime-wheel/*.whl 2>/dev/null | head -1)
+          MOLECULE_RUNTIME_INDEX="https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/"
+          RUNTIME_REQUIREMENT="molecules-workspace-runtime"
+          if [ -n "$RUNTIME_VERSION" ]; then
+            RUNTIME_REQUIREMENT="molecules-workspace-runtime==${RUNTIME_VERSION}"
+          fi
+          RUNTIME_WHEEL_DIR=$(mktemp -d)
+          trap 'rm -rf "$RUNTIME_WHEEL_DIR"' EXIT
+          if python3 -m pip download --quiet --isolated --disable-pip-version-check \
+            --only-binary=:all: --no-deps \
+            --index-url "$MOLECULE_RUNTIME_INDEX" \
+            --dest "$RUNTIME_WHEEL_DIR" "$RUNTIME_REQUIREMENT" 2>/dev/null; then
+            WHEEL=$(find "$RUNTIME_WHEEL_DIR" -maxdepth 1 -type f \
+              -name 'molecules_workspace_runtime-*.whl' -print -quit)
             if [ -n "$WHEEL" ]; then
               RUNTIME_MODULES=$(unzip -p "$WHEEL" molecule_runtime/_runtime_modules.json 2>/dev/null \
                 | python3 -c "import sys,json; m=json.load(sys.stdin); print('|'.join(sorted(set(m['top_level_modules']) | set(m['subpackages']))))" 2>/dev/null || echo "")
@@ -137,17 +147,18 @@ jobs:
             RUNTIME_MODULES="$FALLBACK_MODULES"
             echo "::warning::could not read _runtime_modules.json from wheel — using inline fallback"
           fi
-          if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" *.py 2>/dev/null); then
+          if HITS=$(grep -nE "^\s*from (${RUNTIME_MODULES}) import" ./*.py 2>/dev/null); then
             echo "::error::Bare imports of runtime modules found — use 'from molecule_runtime.<module> import'"
-            echo "$HITS" | sed 's/^/  /'
+            while IFS= read -r hit; do
+              printf '  %s\n' "$hit"
+            done <<< "$HITS"
             exit 1
           fi
           echo "::notice::no bare imports of runtime modules in *.py files"
 
       - name: Log in to our container registry (Gitea OCI - CF-bypass local push endpoint)
-        # ECR retired (operator directive: use our own registry). Push to the
-        # Gitea-backed OCI registry at registry.moleculesai.app. The push
-        # credential is the Gitea package-publisher, fetched from the Infisical
+        # Push to the Gitea-backed OCI registry at registry.moleculesai.app.
+        # Its credential is the Gitea package-publisher, fetched from Infisical
         # SSOT via the CI bootstrap trio (INFISICAL_CI_*) — never hardcoded.
         # FORK SAFETY: this workflow has no pull_request trigger (push:[main] +
         # workflow_dispatch only) so the trio is never exposed to a fork; the

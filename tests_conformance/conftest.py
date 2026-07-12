@@ -11,9 +11,9 @@ resolve to the stub and the socket round-trip would test nothing.
 
 So this directory has its own conftest (which pytest applies per-directory) that
 adds the template root to ``sys.path`` (for ``from adapter import Adapter``) and
-does NO stubbing — the real packages are expected on ``PYTHONPATH`` (the SDK's own
-CI and each template's unit job both install ``molecule-ai-workspace-runtime`` +
-``molecule-ai-sdk``; see adapter-socket.contract.md §8).
+does NO stubbing — the real packages are expected on ``PYTHONPATH``. This
+template's conformance CI job installs ``molecules-workspace-runtime`` and the
+immutable ``molecule-ai-sdk`` source; see adapter-socket.contract.md §8.
 """
 
 import os
