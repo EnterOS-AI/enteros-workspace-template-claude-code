@@ -11,7 +11,7 @@ CI_WORKFLOW = ROOT / ".gitea" / "workflows" / "ci.yml"
 PUBLISH_WORKFLOW = ROOT / ".gitea" / "workflows" / "publish-image.yml"
 # Keep the public commit readable without tripping the repo's generic
 # quoted-40-character credential heuristic.
-SDK_REF = "3474157daca56e3de5b7" + "cffd2a2f84b78bf63b68"
+SDK_REF = "da42c7f2dae122aaa6f3" + "4a74c13e598a87870586"
 TRUSTED_REF = (
     "github.event_name != 'pull_request' || "
     "github.event.pull_request.head.repo.fork == false"

@@ -537,7 +537,7 @@ jobs:
         run: python3 .molecule-ci-canonical/scripts/install_workspace_dependencies.py --allow-missing --break-system-packages
       - name: Install SDK from reviewed immutable source
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
-        run: python3 -m pip install --isolated --disable-pip-version-check --quiet --break-system-packages "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@3474157daca56e3de5b7cffd2a2f84b78bf63b68"
+        run: python3 -m pip install --isolated --disable-pip-version-check --quiet --break-system-packages "molecule-ai-sdk @ git+https://git.moleculesai.app/molecule-ai/molecule-ai-sdk.git@da42c7f2dae122aaa6f34a74c13e598a87870586"
       # tests_conformance/ has its OWN conftest (no stubbing) + pytest.ini
       # (importlib import-mode, auto asyncio) that anchors rootdir there.
       - if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
