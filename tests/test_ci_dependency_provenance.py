@@ -11,7 +11,7 @@ CI_WORKFLOW = ROOT / ".gitea" / "workflows" / "ci.yml"
 PUBLISH_WORKFLOW = ROOT / ".gitea" / "workflows" / "publish-image.yml"
 # Keep the public commit readable without tripping the repo's generic
 # quoted-40-character credential heuristic.
-SDK_REF = "c58c6697b2455540c51" + "5c9a3c6656a34ab286e66"
+SDK_REF = "3474157daca56e3de5b7" + "cffd2a2f84b78bf63b68"
 TRUSTED_REF = (
     "github.event_name != 'pull_request' || "
     "github.event.pull_request.head.repo.fork == false"
@@ -112,3 +112,13 @@ def test_retired_runtime_comparisons_are_not_in_claude_guidance() -> None:
     ):
         assert stale_name not in adapter
         assert stale_name not in executor
+
+
+def test_static_ci_rejects_legacy_declared_plugin_installer() -> None:
+    workflow = CI_WORKFLOW.read_text()
+    static_job = _job(workflow, "validate-static")
+
+    assert "Reject legacy declared-plugin installer" in static_job
+    assert "entrypoint.sh" in static_job
+    assert ".runtime-version" in static_job
+    assert "0.4.0" in static_job
