@@ -6,6 +6,24 @@
   "required_tool": "provision_workspace",
   "loaded_mcp_tools_field": "loaded_mcp_tools",
   "legacy_binary_path": "/opt/molecule-mcp-server",
+  "management_mcp_server": {
+    "npm_package": "@molecule-ai/mcp-server",
+    "pinned_version": "1.8.3",
+    "compatible_range": "^1.8.0",
+    "registry": "https://git.moleculesai.app/api/packages/molecule-ai/npm/",
+    "registry_scope": "@molecule-ai",
+    "launch": "npx -y --prefer-offline @molecule-ai/mcp-server@<compatible_range>",
+    "pin_ssot": "TWO decoupled SSOT values, so a version bump NEVER fail-closes a not-yet-rebuilt image (the npm/pypi semver-range model). (1) `compatible_range` is what the LAUNCH resolves: the plugin fragment + boot launch use `@molecule-ai/mcp-server@<compatible_range>`, and `npx --prefer-offline` resolves it to the HIGHEST in-range version already baked in THAT image's npm cache, ENTIRELY OFFLINE, whatever concrete version that image happens to hold. (2) `pinned_version` is the ONE concrete in-range version the CURRENT release's prebake bakes (a deterministic build target). Guard D is now DRIFT-TOLERANT: baked == pinned_version (this release bakes exactly this) AND pinned_version satisfies compatible_range AND the fragment launch arg == compatible_range. Bumping pinned_version + re-baking is therefore a ROLLING update — an older image that baked an EARLIER in-range version keeps launching fine because its baked version still satisfies compatible_range, so there is NO fleet-wide fail-close window (local/staging/prod each launch whatever they baked). Only a BREAKING (major) change moves compatible_range (e.g. `^2.0.0`) and warrants a coordinated rebuild.",
+    "prebake": {
+      "required": true,
+      "owner": "base runtime (molecule_runtime prebake helper) \u2014 the default EVERY runtime image inherits; a template adapter overrides ONLY for a divergent node location, and usually should not need to (ADR-004: SDK contract -> base-runtime default -> per-adapter override-if-needed).",
+      "cache_home": "/home/agent",
+      "rationale": "The kind=platform concierge launches the mgmt-MCP via `npx --prefer-offline @molecule-ai/mcp-server@<pinned_version>` inside the runtime boot enumeration spawn (a HARD deadline). The runtime image MUST pre-bake this EXACT version into the agent npm cache (/home/agent/.npm) at build time so the launch resolves ENTIRELY OFFLINE. A missing/stale bake -> cold pull -> ETARGET / CF-WAF throttle -> #1027 'management MCP FAILED TO LAUNCH' -> fail-close (the launch-side of RCA #2970; the fetch-side is the git-native plugin source).",
+      "conformance": "In the built image, BOTH `npx -y --offline @molecule-ai/mcp-server@<pinned_version>` (the exact version this release baked) AND `npx -y --offline @molecule-ai/mcp-server@<compatible_range>` (the RANGE the launch actually uses \u2014 it MUST resolve OFFLINE to the baked version) with MOLECULE_MCP_MODE=management MUST return a tools/list containing `required_tool` (provision_workspace) with ZERO network, AND MUST resolve under a FOREIGN HOME (not only the build HOME) \u2014 see home_independent. The range check is the one that mirrors the real boot launch; the build FAILS otherwise.",
+      "home_independent": "The scoped-registry + npm cache config MUST be applied GLOBALLY (node-prefix etc/npmrc via `npm config set --global`), NOT a per-user ${HOME}/.npmrc. The runtime spawns the mgmt-MCP under a launch HOME that is NOT guaranteed to be the agent home (observed HOME=/root in the local docker provisioner), so a HOME-local config is MISSED and npx falls through to the public registry -> ETARGET on the private @molecule-ai scope -> #1027 fail-close even though the version is correctly baked. The prebake self-check MUST therefore verify offline resolution under a FOREIGN HOME so this can never regress.",
+      "lockstep": "Guard D (drift-TOLERANT, semver-range): (a) image-baked version == pinned_version (this release bakes exactly one concrete version); (b) pinned_version satisfies compatible_range; (c) the plugin fragment launch arg == compatible_range (the RANGE, NOT the exact version) so every image launches whatever in-range version it baked. Enforced ONCE centrally (SDK conformance / base runtime), never duplicated per template. This REPLACES the old exact-equality lockstep, whose bump-ahead-of-rebuild created a fleet-wide ETARGET fail-close window."
+    }
+  },
   "runtime_present_field": "mcp_server_present",
   "producer": "MCPServerAdaptor",
   "consumer": "claude_sdk_executor._load_settings_mcp",
@@ -20,7 +38,7 @@
     "hook": "InstallContext.register_mcp_server",
     "impl": "BaseAdapter.register_mcp_server_hook",
     "present_probe": "BaseAdapter.management_mcp_present",
-    "dispatch": "BaseAdapter default hook dispatches on self.name() via mcp_render.render_for_runtime/mcp_settings_path_for/management_mcp_present_for; per-template adapter override NOT required.",
+    "dispatch": "ADR-004: the BaseAdapter default hook is NAME-AGNOSTIC (writes the generic JSON mcpServers map via mcp_render.render_json_mcp_servers on the default settings path; management_mcp_present via mcp_render.json_mcp_servers_has) \u2014 no self.name() dispatch, no engine per-runtime table. Each official adapter (claude-code/codex/hermes/openclaw) OVERRIDES register_mcp_server_hook + management_mcp_present to render/read its OWN native file; a not-yet-migrated adapter uses the base JSON default.",
     "resolver_default": "plugins_registry.resolve defaults an mcpServers-shaped plugin to MCPServerAdaptor (AdaptorSource.MCP_SERVER) for ANY runtime, so molecule-platform-mcp needs no per-runtime adapters/<runtime>.py."
   },
   "runtimes": {
@@ -28,28 +46,28 @@
       "settings_path": "/configs/.claude/settings.json",
       "format": "json",
       "key": "mcpServers",
-      "renderer": "mcp_render.render_claude_settings",
+      "renderer": "ClaudeCodeAdapter.register_mcp_server_hook",
       "status": "implemented"
     },
     "codex": {
       "settings_path": "~/.codex/config.toml",
       "format": "toml",
       "table": "mcp_servers",
-      "renderer": "mcp_render.render_codex_config",
+      "renderer": "CodexAdapter.register_mcp_server_hook",
       "status": "implemented"
     },
     "openclaw": {
       "settings_path": "~/.openclaw/openclaw.json",
       "format": "json",
       "key_path": "mcp.servers",
-      "renderer": "mcp_render.render_openclaw_config",
+      "renderer": "OpenClawAdapter.register_mcp_server_hook",
       "status": "implemented"
     },
     "hermes": {
       "settings_path": "~/.hermes/config.yaml",
       "format": "yaml",
       "key": "mcp_servers",
-      "renderer": "mcp_render.render_hermes_config",
+      "renderer": "HermesAgentAdapter.register_mcp_server_hook",
       "status": "implemented"
     }
   }

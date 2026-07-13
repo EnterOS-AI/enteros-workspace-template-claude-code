@@ -265,12 +265,11 @@ if [ "$(id -u)" = "0" ]; then
     # 401-poison class (RCA #2970) that the former per-template shell fork here
     # (an archive-REST curl that sent a token to public repos) tripped.
     #
-    # The shell fork was REMOVED to complete the cutover the Python module was
-    # built for ("EVERY runtime gets the boot-install uniformly — no per-template
-    # fork", main.py). hermes/codex/openclaw already rely on the Python path;
-    # claude-code was the last holdout. Runtime pin (.runtime-version) carries the
-    # git-native install, so there is exactly one implementation and zero
-    # shell/python drift. Do NOT re-introduce a shell fetch block here.
+    # The shell fork was removed so every template uses one implementation.
+    # Runtime 0.4 validates the resolved install destination and rejects unsafe
+    # dot/path names before copying. The version floor in requirements.txt and
+    # .runtime-version makes that validation part of this template's boot
+    # contract. Do not reintroduce a privileged shell fetch block here.
 
     # /workspace handling — only chown when the contents are root-owned
     # (typical on Docker Desktop on Windows where host uid maps to 0).

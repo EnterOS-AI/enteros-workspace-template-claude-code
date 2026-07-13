@@ -1,5 +1,8 @@
 # Molecule AI workspace runtime — shared infrastructure.
-# Phase-2 floor (>=0.3.9): the platform-agent / concierge needs
+# The 0.4 floor includes the provider-neutral channel contract and the hardened
+# declared-plugin installer. Earlier installers did not fail closed on dot-path
+# install names, so this security floor must stay aligned with .runtime-version.
+# The platform-agent / concierge also needs
 # get_display_instructions (molecule_runtime/executor_helpers.py) + the
 # config-driven extra-MCP support. Those symbols first ship in runtime 0.3.x;
 # 0.2.x LACKS get_display_instructions, so an image built against a 0.2.x
@@ -8,7 +11,7 @@
 # The exact build pin is forwarded by publish-image.yml as the RUNTIME_VERSION
 # build-arg sourced from .runtime-version; this floor is the
 # defensive contract for any resolution that does NOT carry that override.
-molecules-workspace-runtime>=0.3.11
+molecules-workspace-runtime>=0.4.0
 
 # P0 band-aid for canvas-chat upload 400 "failed to parse multipart form"
 # (task #256; forensic a5bb950f). Starlette `Request.form()` raises
