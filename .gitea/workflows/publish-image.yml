@@ -384,3 +384,32 @@ jobs:
             exit 1
           fi
           echo "::notice::${ENV_NAME} runtime_image_pins.${TEMPLATE_NAME} bumped to ${IMAGE_DIGEST}"
+
+  verify-pin:
+    # Fail closed unless staging's runtime_image_pins row reads back as the
+    # exact digest emitted by this workflow's publish job. Production remains
+    # outside the matrix while the production freeze is active.
+    name: Verify runtime_image_pins moved (fail-loud)
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [resolve-version, publish, promote-pin]
+    if: ${{ success() && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env_name: staging
+            cp_host: staging-api.moleculesai.app
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Verify runtime_image_pins[ claude-code, ${{ matrix.env_name }} ]
+        env:
+          CP_HOST: ${{ matrix.cp_host }}
+          CP_ADMIN_API_TOKEN: ${{ secrets.CP_STAGING_ADMIN_API_TOKEN }}
+          TEMPLATE_NAME: claude-code
+          EXPECTED_DIGEST: ${{ needs.publish.outputs.digest }}
+          ENV_NAME: ${{ matrix.env_name }}
+          TOKEN_SECRET_NAME: CP_STAGING_ADMIN_API_TOKEN
+        run: bash .gitea/scripts/verify-runtime-pin.sh
