@@ -21,9 +21,8 @@
 #
 # Exit 0 = all tests pass. Non-zero = at least one assertion failed.
 #
-# This is the watch-it-fail-red unit-test layer for PR 2; the wire-
-# level contract against real AWS is asserted by the matching CP
-# Stage C smoke (stage-c-workspace-backup-smoke.sh step 6b).
+# This test covers the shell orchestration only. Device attachment and
+# snapshot availability are control-plane integration responsibilities.
 
 set -u
 

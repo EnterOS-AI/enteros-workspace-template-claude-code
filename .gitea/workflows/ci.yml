@@ -1,25 +1,8 @@
 name: CI
 
-# Ported from .github/workflows/ci.yml on 2026-05-11 per internal#326
-# (Class-A root: cross-repo `uses:` blocker for Gitea 1.22.6 —
-# feedback_gitea_cross_repo_uses_blocked).
-#
-# Root cause of the main-red CI on this repo:
-#   The .github/ original used
-#     uses: molecule-ai/molecule-ci/.gitea/workflows/validate-workspace-template.yml@main
-#   which Gitea 1.22.6 rejects (DEFAULT_ACTIONS_URL=github → 404 against
-#   the remote repo even though it lives on the same Gitea instance).
-#   Gitea reads .github/ as a fallback when .gitea/ is absent
-#   (reference_per_repo_gitea_vs_github_actions_dir), so the .github/
-#   workflow was firing on Gitea and failing in 1s.
-#
-# Fix shape: inline the validation logic directly. The canonical
-# validator in molecule-ai/molecule-ci already self-clones into the
-# runner via a direct HTTPS `git clone` step (validate-workspace-template.yml
-# does this verbatim) — so the inline port is just "do that clone +
-# invoke the validator script in-place", preserving the
-# single-source-of-truth property (each CI run still fetches the
-# canonical validator fresh).
+# Repository-local validation pipeline. It clones the canonical validator
+# from molecule-ci on each run, while keeping this repository's protected
+# context names and runner requirements explicit.
 #
 # Four-surface migration audit (feedback_gitea_actions_migration_audit_pattern):
 #   1. YAML — no `workflow_dispatch.inputs`; no `merge_group`; preserved
@@ -32,8 +15,8 @@ name: CI
 #   4. Docs — anonymous git-clone of molecule-ci (no token in URL); the
 #      molecule-ci repo is public on the Gitea instance.
 #
-# Gitea 1.22.6 can leave protected jobs with job-level `if:` guards
-# pending as 'Blocked by required conditions'. Runtime validation runs
+# Avoid job-level `if:` guards on protected contexts: skipped required jobs
+# can remain pending in the branch-protection view. Runtime validation runs
 # after static validation via `needs:` so protected contexts complete.
 #
 # Cross-links:
@@ -209,8 +192,8 @@ jobs:
     runs-on: [ubuntu-latest, docker-host]
     timeout-minutes: 15
     needs: validate-static
-    # Runs after static validation. Avoid job-level if: guards here because
-    # Gitea 1.22.6 can leave the protected context pending instead of skipped.
+    # Runs after static validation. Avoid job-level if: guards here so the
+    # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Fetch molecule-ci canonical scripts

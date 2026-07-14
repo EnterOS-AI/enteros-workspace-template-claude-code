@@ -313,7 +313,7 @@ async def _aiter_with_idle_cap(stream: Any) -> AsyncIterator[Any]:
 #      run_executor_smoke consults runtime_wedge.is_wedged() at the end
 #      of every result path and upgrades a provisional PASS to FAIL when
 #      the flag is set. Catches PR-25-class regressions (malformed CLI
-#      argv → SDK init wedge) BEFORE the broken image ships to GHCR.
+#      argv → SDK init wedge) BEFORE the broken image ships to Gitea OCI.
 #
 # Module scope (not instance scope) is deliberate: the wedge is a
 # property of the Python process, not the executor. A future per-org
