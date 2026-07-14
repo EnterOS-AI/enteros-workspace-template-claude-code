@@ -3,18 +3,15 @@ name: publish-image
 # Builds the claude-code workspace template Dockerfile and pushes it to the Gitea registry (registry.moleculesai.app) as
 # `<REGISTRY>/workspace-template-claude-code:latest` + `:sha-<7>`.
 #
-# Ported/inlined from molecule-ci's publish-template-image.yml reusable
-# workflow. Cross-repo `uses:` is BLOCKED on Gitea 1.22.6 because
-# DEFAULT_ACTIONS_URL=github causes the runner to attempt the lookup against
-# github.com, which always 404s even for same-instance repos.
-# (feedback_gitea_cross_repo_uses_blocked)
+# The publish flow remains repository-local because its co-located registry
+# endpoint, smoke gate, and pin promotion are template-specific.
 #
 # Registry: images publish to the Gitea OCI backend. The canonical pull host is
 # registry.moleculesai.app; the co-located runner pushes through localhost:3200
 # to bypass Cloudflare's request-body limit for large layers.
 #
-# Gitea 1.22.6 hostile-shape checklist applied:
-#   - No workflow_dispatch.inputs (silently rejected on 1.22.6)
+# Workflow compatibility choices:
+#   - No workflow_dispatch.inputs
 #   - No merge_group: trigger
 #   - No cross-repo uses:
 #   - GITHUB_SERVER_URL pinned at workflow level
@@ -288,10 +285,9 @@ jobs:
 
   promote-pin:
     # RFC internal#529 Layer A — auto-promote the just-pushed digest to
-    # runtime_image_pins via the control-plane admin endpoint. Gitea 1.22.6
-    # has no `workflow_run`, so promotion has to be a job in this same
-    # workflow (cannot be a separate workflow listening on publish-image
-    # success). Gated on `if: success()` so a failed publish (smoke red,
+    # runtime_image_pins via the control-plane admin endpoint. Promotion stays
+    # in this workflow so it consumes the exact published digest across the
+    # `needs:` edge. Gated on `if: success()` so a failed publish (smoke red,
     # push red) never bumps any pin — promotion only ever runs AFTER a
     # green build/push.
     #

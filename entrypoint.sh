@@ -40,37 +40,27 @@ log_boot_context() {
 log_boot_context
 
 # ---------------------------------------------------------------------
-# Restore-on-recreate from secondary EBS volume (cp#326 Option D).
+# Legacy secondary-volume restore compatibility (cp#326).
 #
-# Contract with CP: when ProvisionWorkspace finds a non-expired backup
-# snapshot for this WorkspaceID, it attaches the snapshot as a SECONDARY
-# EBS volume at /dev/xvdb at launch (DeleteOnTermination=true). This
-# function mounts that volume on first container boot and rsyncs the
-# restore set (/configs, /workspace, /home/agent/.claude) from it back
-# into the root filesystem, then drops a marker so subsequent container
-# restarts (within the same EC2's lifetime) skip the restore.
-#
-# Why cp#326 needs this: AWS rejects ANY SnapshotId on the ROOT device
-# at RunInstances time with "InvalidBlockDeviceMapping: snapshotId
-# cannot be modified on root device". The cp#301 architecture (override
-# the AMI's root snapshot) is impossible per AWS spec. Option D works
-# WITH AWS's model — secondary volumes accept SnapshotId — and rsync
-# bridges the data-plane gap.
+# Existing restored workspaces may still surface a Linux block device at
+# /dev/xvdb. When present, this function mounts it on first container boot
+# and rsyncs the restore set (/configs, /workspace, /home/agent/.claude)
+# into the container root. Current provisioning must not assume a particular
+# cloud vendor; absence of the device is the normal no-restore path.
 #
 # Operational contract:
 #   - Idempotent: a marker at /configs/.restore-completed gates re-runs.
-#     If the container restarts in the same EC2 (DOT=true so the volume
-#     persists across container restarts but NOT EC2 terminate), the
-#     restore skips. If the EC2 is terminated + replaced, /configs is
-#     fresh and the marker is gone — restore runs on the new EC2.
+#     Container restarts on the same workspace host skip the restore. If
+#     the workspace host is replaced, /configs is fresh and the marker is
+#     gone, so restore runs again if the secondary device is present.
 #   - Best-effort: any failure (volume absent, fs unreadable, rsync
 #     error) is LOGGED with MOLECULE-RESTORE: prefix but does NOT abort
 #     the boot. The workspace comes up with empty state — the explicit
 #     no-restore branch the user already accepts on first-time provision.
 #   - Read-only mount on the secondary at /mnt/restore so a defective
 #     filesystem can't corrupt our root.
-#   - All log lines prefixed `MOLECULE-RESTORE:` so `docker logs <id>
-#     2>&1 | grep MOLECULE-RESTORE` is the operator's one-liner debug.
+#   - All log lines use the `MOLECULE-RESTORE:` prefix so the workspace
+#     log surface can isolate restore diagnostics without host access.
 #
 # Path allowlist (NOT a blanket /mnt/restore -> / rsync — that would
 # also restore /etc/passwd, /var/lib/docker, etc. which are container-
@@ -88,10 +78,10 @@ restore_from_secondary_volume() {
     local MOUNT_POINT="/mnt/restore"
     local MARKER="/configs/.restore-completed"
 
-    # Marker present = restore already done for this EC2's lifetime.
+    # Marker present = restore already done for this workspace-host lifetime.
     # Cheapest possible idempotency check; runs before any blockdev probe.
     if [ -f "$MARKER" ]; then
-        echo "MOLECULE-RESTORE: marker $MARKER present — skipping (already restored on this EC2)"
+        echo "MOLECULE-RESTORE: marker $MARKER present — skipping (already restored on this workspace host)"
         return 0
     fi
 
@@ -134,9 +124,8 @@ restore_from_secondary_volume() {
     # prior workspace is also removed from the new one); -x stays on
     # one filesystem (defensive against bind-mounts on the source).
     #
-    # Source paths on the snapshot must match prod root layout. The
-    # workspace EC2's root filesystem mirrors a normal Linux root, so
-    # /configs lives at $MOUNT_POINT/configs and so on.
+    # Source paths on the snapshot must match the workspace's Linux root
+    # layout, so /configs lives at $MOUNT_POINT/configs and so on.
     local RESTORE_PATHS="configs workspace home/agent/.claude"
     local rsync_failed=0
     for rel in $RESTORE_PATHS; do

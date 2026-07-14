@@ -20,12 +20,11 @@ FROM python:3.11-slim
 #   uid and does NOT change /configs token ownership (still uid-1000,
 #   enforced by entrypoint.sh + the Layer-3 conformance gate).
 #
-# rsync (added cp#326 2026-05-26):
-#   entrypoint.sh's restore_from_secondary_volume() rsyncs the prior
-#   workspace's /configs, /workspace, and /home/agent/.claude back
-#   into root on first boot from the snapshot-restored secondary
-#   volume CP attaches at /dev/xvdb. Without rsync the restore path
-#   silently no-ops and the workspace boots with empty state.
+# rsync (legacy restore compatibility, cp#326):
+#   when a restored secondary device is present at /dev/xvdb,
+#   entrypoint.sh copies /configs, /workspace, and /home/agent/.claude
+#   into the container root on first boot. Without rsync that optional
+#   compatibility path would silently no-op.
 #
 # e2fsprogs (added cp#326 2026-05-26):
 #   provides /sbin/blkid + /sbin/e2label so the restore code can
@@ -77,7 +76,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from the reusable publish workflow as
+# RUNTIME_VERSION is forwarded from this repository's publish-image workflow as
 # a docker build-arg. When set (cascade-triggered builds), it's the
 # exact runtime version the private registry just published. Including it
 # as an ARG
@@ -151,7 +150,7 @@ RUN python3 /tmp/patch_claude_sdk_2_1_150.py && rm /tmp/patch_claude_sdk_2_1_150
 COPY adapter.py .
 COPY __init__.py .
 # Provider registry. The adapter's _load_providers walks 4 paths:
-#   1. /opt/adapter/config.yaml          — provisioner-managed canonical
+#   1. /opt/adapter/config.yaml          — legacy/self-managed compatibility
 #   2. os.path.dirname(__file__)/config.yaml  — alongside adapter.py (this image)
 #   3. ${WORKSPACE_CONFIG_PATH}/config.yaml   — workspace per-instance overrides
 #   4. _BUILTIN_PROVIDERS                — oauth + anthropic-api only
@@ -168,8 +167,8 @@ COPY config.yaml .
 # Python's import system picks the local /app/claude_sdk_executor.py
 # before the same-named module that older molecule-runtime versions
 # also shipped under site-packages. Once molecule-core drops the file
-# from its workspace/ package and bumps the runtime PyPI version, the
-# template will be the sole source of truth.
+# from its workspace package and publishes the next runtime version to
+# the internal Gitea package registry, the template is the sole source.
 COPY claude_sdk_executor.py .
 
 # Set the adapter module for runtime discovery
