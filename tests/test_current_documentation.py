@@ -39,3 +39,11 @@ def test_active_documentation_has_no_retired_operational_guidance():
 
 def test_retired_ecr_lifecycle_helper_is_absent():
     assert not (ROOT / "scripts" / "ensure-ecr-lifecycle.sh").exists()
+
+
+def test_auth_support_note_matches_warn_then_first_call_failure():
+    support_notes = (ROOT / "known-issues.md").read_text(encoding="utf-8")
+    support_notes = re.sub(r"\s+", " ", support_notes)
+
+    assert "setup logs a warning and continues" in support_notes
+    assert "first LLM call fails with `AuthenticationError`" in support_notes

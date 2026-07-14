@@ -18,10 +18,12 @@ path.
 ## Authentication failures
 
 At setup, `adapter.py` resolves the selected provider and checks the accepted
-credential variables for that route. If none is available, setup fails with the
-accepted variable names; secret values are not logged. Check the selected model,
-resolved provider, and secret binding together rather than assuming every model
-uses `CLAUDE_CODE_OAUTH_TOKEN`.
+credential variables for that route. If none is available, setup logs a warning
+and continues so non-LLM terminal and file work remains available; the first LLM
+call fails with `AuthenticationError` until an accepted credential is configured.
+The warning names accepted variables without logging secret values. Check the
+selected model, resolved provider, and secret binding together rather than
+assuming every model uses `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Runtime and image validation
 
