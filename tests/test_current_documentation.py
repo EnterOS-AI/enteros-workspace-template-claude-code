@@ -41,6 +41,8 @@ RETIRED_RUNTIME_GUIDANCE = {
     r"operator[- ]host": "the retired operator-host access model",
     r"Gitea 1\.22": "the retired Gitea server-version guidance",
     r"provisioner is contracted to clone|provisioner clones.*?/opt/adapter": "the retired adapter clone contract",
+    r"reusable publish workflow": "the old reusable-publish description",
+    r"runtime PyPI version": "the retired public-PyPI runtime description",
 }
 
 

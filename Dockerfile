@@ -76,7 +76,7 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from the reusable publish workflow as
+# RUNTIME_VERSION is forwarded from this repository's publish-image workflow as
 # a docker build-arg. When set (cascade-triggered builds), it's the
 # exact runtime version the private registry just published. Including it
 # as an ARG
@@ -167,8 +167,8 @@ COPY config.yaml .
 # Python's import system picks the local /app/claude_sdk_executor.py
 # before the same-named module that older molecule-runtime versions
 # also shipped under site-packages. Once molecule-core drops the file
-# from its workspace/ package and bumps the runtime PyPI version, the
-# template will be the sole source of truth.
+# from its workspace package and publishes the next runtime version to
+# the internal Gitea package registry, the template is the sole source.
 COPY claude_sdk_executor.py .
 
 # Set the adapter module for runtime discovery
