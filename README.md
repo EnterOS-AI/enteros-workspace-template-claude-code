@@ -1,35 +1,59 @@
-# template-claude-code-default
+# Molecule AI workspace template — Claude Code
 
-Molecule AI workspace template for the **claude-code-default** runtime.
+This repository builds the `claude-code` workspace image used by Molecule AI.
+The canonical source is this Gitea repository; the canvas template picker is the
+supported way to create a workspace from it.
 
-## Usage
+## Runtime shape
 
-### In Molecule AI canvas
-Select this template when creating a new workspace — it appears in the template picker automatically.
+- `entrypoint.sh` prepares the mounted workspace/config directories, exposes
+  plugin-provided skills to Claude Code, drops to the `agent` user, and executes
+  `molecule-runtime`.
+- `adapter.py` resolves the configured model/provider and creates the
+  Claude Code executor.
+- `claude_sdk_executor.py` owns the Claude Agent SDK session, recovery, and
+  channel behavior.
+- `config.yaml` is the template's model/provider source. The copy under
+  `internal/providers/` is a CI-checked projection of the control-plane
+  registry, not a second runtime configuration.
 
-### From a URL (community install)
-Paste this URL when creating a workspace:
-```
-github://Molecule-AI/template-claude-code-default
-```
+## Authentication
 
-## Files
-- `config.yaml` — workspace configuration (runtime, model, skills, etc.)
-- `system-prompt.md` — agent system prompt (if present)
+Authentication follows the selected provider. Claude subscription workspaces
+can use `CLAUDE_CODE_OAUTH_TOKEN`; direct or compatible provider routes use the
+credential names declared in `config.yaml` (for example
+`ANTHROPIC_API_KEY`). `MOLECULE_RESOLVED_PROVIDER`, when injected by the
+platform, has precedence over heuristic provider selection.
 
-## Auth paths
+`adapter.py` applies provider-specific endpoint routing. An explicitly supplied
+`ANTHROPIC_BASE_URL` remains an override and is not replaced at boot.
 
-| Path | Env var(s) | Where to get the key |
-|---|---|---|
-| OAuth (Claude Code subscription) | `CLAUDE_CODE_OAUTH_TOKEN` | `claude login` |
-| Anthropic API (direct) | `ANTHROPIC_API_KEY` | console.anthropic.com |
-| Third-party Anthropic-compat (e.g. Xiaomi MiMo pay-as-you-go) | `ANTHROPIC_API_KEY` (provider's key) | provider console |
-| Xiaomi MiMo Token Plan | `ANTHROPIC_API_KEY` (Token Plan key), `ANTHROPIC_BASE_URL` (Token Plan endpoint) | token-plan dashboard |
+Never commit credentials or put them in command-line examples. Configure them
+through the workspace/platform secret surfaces.
 
-For third-party providers, `entrypoint.sh` rewrites `ANTHROPIC_BASE_URL` based on the selected `MODEL` so the `claude` CLI routes there. Currently auto-routes `mimo-*` models to `https://api.xiaomimimo.com/anthropic` (pay-as-you-go). **Token Plan users** should set `ANTHROPIC_BASE_URL=https://token-plan-sgp.xiaomimimo.com/anthropic` as a workspace or org-level secret — the shell mapping is the fallback and operator-set values always win. Other Token Plan endpoints (e.g. `token-plan-hk.xiaomimimo.com`) can be used by setting the secret explicitly.
+## Important files
 
-## Schema version
-`template_schema_version: 1` — compatible with Molecule AI platform v1.x.
+| Path | Purpose |
+|---|---|
+| `Dockerfile` | Builds the runtime image and installs the private runtime wheel from the Gitea package registry |
+| `entrypoint.sh` | Container boot and privilege-drop path |
+| `adapter.py` | Provider resolution and runtime adapter |
+| `claude_sdk_executor.py` | Claude Agent SDK execution/session behavior |
+| `config.yaml` | Template metadata, providers, models, and runtime settings |
+| `tests/` | Adapter, entrypoint, provenance, and documentation contracts |
+| `tests_conformance/` | SDK-owned adapter conformance suite |
+
+The current file contains `template_schema_version: 1`; change it only with a
+corresponding platform contract change and validation.
+
+## Development and delivery
+
+See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for commands
+that mirror CI. Pull requests run validation and tests. A push to `main` invokes
+the repository's `publish-image` workflow, which builds the image in the Gitea
+OCI registry and applies the configured pin checks. Do not substitute a manual
+registry or direct-main-push procedure.
 
 ## License
+
 Business Source License 1.1 — © Molecule AI.
