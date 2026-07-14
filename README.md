@@ -50,9 +50,9 @@ corresponding platform contract change and validation.
 
 See [`runbooks/local-dev-setup.md`](runbooks/local-dev-setup.md) for commands
 that mirror CI. Pull requests run validation and tests. A push to `main` invokes
-the repository's `publish-image` workflow, which builds the image in the Gitea
-OCI registry and applies the configured pin checks. Do not substitute a manual
-registry or direct-main-push procedure.
+the repository's `publish-image` workflow, which builds the image, pushes it to
+the Gitea OCI registry, and applies the configured pin checks. Do not substitute
+a manual registry or direct-main-push procedure.
 
 ## License
 
