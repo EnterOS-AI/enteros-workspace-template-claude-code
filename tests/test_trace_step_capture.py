@@ -199,3 +199,40 @@ async def test_accumulate_message_builds_ordered_steps(tmp_path, monkeypatch):
     # (thinking text is also folded into assistant_chunks by pre-existing
     # behavior; the reply text is present — we don't over-assert on that here.)
     assert "Here's who's around." in acc.assistant_chunks
+
+
+@pytest.mark.asyncio
+async def test_accumulate_message_captures_tool_use_after_thinking_same_message(
+    tmp_path, monkeypatch
+):
+    """Regression: a single AssistantMessage carrying [thinking, tool_use] must
+    capture BOTH — a prior `return` (vs `continue`) after the thinking block
+    exited the message early and dropped the following tool_use (its step, its
+    tool_uses entry, and its _report_tool_use telemetry). Aligns
+    _accumulate_message with the fast _run_query path."""
+    mod = _load_executor()
+    sdk = sys.modules["claude_agent_sdk"]
+    ex = _make_executor(mod, tmp_path)
+
+    reported: list = []
+
+    async def _spy(block):
+        reported.append(getattr(block, "name", ""))
+
+    monkeypatch.setattr(mod, "_report_tool_use", _spy)
+
+    acc = ex._StreamAccumulator()
+    await ex._accumulate_message(
+        sdk.AssistantMessage(content=[
+            _ThinkingBlock(thinking="I'll check first"),
+            ToolUseBlock(name="delegate_task", input={"task": "x"}),
+        ]),
+        acc,
+    )
+
+    assert acc.steps == [
+        {"kind": "thinking", "text": "I'll check first"},
+        {"kind": "tool_call", "name": "delegate_task", "input": "{'task': 'x'}"},
+    ]
+    assert acc.tool_uses == ["delegate_task"]      # was dropped before the fix
+    assert reported == ["delegate_task"]           # telemetry no longer skipped

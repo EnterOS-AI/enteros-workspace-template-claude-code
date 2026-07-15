@@ -1389,7 +1389,15 @@ class ClaudeSDKExecutor(AgentExecutor):
                         thinking_text = block.get("thinking")
                     if thinking_text:
                         acc.assistant_chunks.append(thinking_text)
-                        return
+                        # `continue`, not `return`: a `return` here exits the
+                        # whole message, dropping any block that FOLLOWS a
+                        # thinking block in the same AssistantMessage (e.g. a
+                        # `[thinking, tool_use]` content list would lose the
+                        # tool_use — its tool_uses/step/telemetry all skipped).
+                        # The sibling fast path (`_run_query`) already uses
+                        # `continue`; align them so the two stream paths capture
+                        # identically.
+                        continue
                     # ToolUseBlock / ServerToolUseBlock are present
                     # on the real SDK but not on the conftest stub —
                     # check by class name to avoid an isinstance()
