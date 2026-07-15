@@ -864,6 +864,36 @@ def _result_error_detail(
     return detail or "engine error with no detail (is_error result, empty result/subtype)"
 
 
+def _block_to_step(block: Any) -> "dict | None":
+    """Map one AssistantMessage content block to an ordered AgentTrace step
+    (SSOT contract: workspace-comms/agent-trace `steps`), or None for a plain
+    TextBlock / unrecognized block.
+
+    Mirrors the thinking + tool_use duck-typing the stream loops already use,
+    so the Langfuse trace shows HOW the turn decided (reasoning + tool calls in
+    sequence), not just the final text. Tool RESULTS are absent BY CONTRACT: the
+    Agent SDK executes tools inside the CLI and never returns the result block to
+    the runtime, so a `tool_call` step carries `name` + `input` only (the schema
+    allows an absent `result`). Pure — no side effects.
+    """
+    # thinking / reasoning block (real SDK objects expose `.thinking`;
+    # Anthropic-compatible upstreams may emit dict-shaped `type: "thinking"`).
+    thinking_text = None
+    if hasattr(block, "thinking"):
+        thinking_text = getattr(block, "thinking", None)
+    elif isinstance(block, dict) and block.get("type") == "thinking":
+        thinking_text = block.get("thinking")
+    if thinking_text:
+        return {"kind": "thinking", "text": str(thinking_text)}
+    if type(block).__name__ in ("ToolUseBlock", "ServerToolUseBlock"):
+        step = {"kind": "tool_call", "name": str(getattr(block, "name", "") or "")}
+        tool_input = getattr(block, "input", None)
+        if tool_input:
+            step["input"] = str(tool_input)[:500]
+        return step
+    return None
+
+
 @dataclass
 class QueryResult:
     """Outcome of a single `query()` stream.
@@ -874,10 +904,13 @@ class QueryResult:
     — used as a UX-friendly fallback when `text` is empty (the agent did
     only tool calls and no final text block, common for autonomous-tick
     ticks that delegate or send_message_to_user without explanation).
+    `steps` is the ordered thinking + tool_call sequence (SSOT AgentTrace.steps)
+    the Langfuse tracer surfaces on the Traces tab.
     """
     text: str
     session_id: str | None
     tool_uses: list[str] = field(default_factory=list)
+    steps: list = field(default_factory=list)
 
 
 class ClaudeSDKExecutor(AgentExecutor):
@@ -1313,6 +1346,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         def __init__(self) -> None:
             self.assistant_chunks: list[str] = []
             self.tool_uses: list[str] = []
+            self.steps: list = []  # ordered thinking + tool_call (AgentTrace.steps)
             self.result_text: str | None = None
             self.session_id: str | None = None
             self.result_is_error: bool = False
@@ -1336,6 +1370,12 @@ class ClaudeSDKExecutor(AgentExecutor):
                 if isinstance(block, sdk.TextBlock):
                     acc.assistant_chunks.append(block.text)
                 else:
+                    # Record the ordered trace step (thinking or tool_call)
+                    # BEFORE the existing text/tool-use handling; pure, so it
+                    # never perturbs the control flow below.
+                    _step = _block_to_step(block)
+                    if _step is not None:
+                        acc.steps.append(_step)
                     # Handle thinking/reasoning blocks from Anthropic-
                     # compatible upstreams (MiniMax M2/M2.7, Moonshot
                     # K2.6) so reasoning-only output doesn't surface as
@@ -1594,7 +1634,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         text = acc.result_text if acc.result_text is not None else "".join(acc.assistant_chunks)
         if acc.result_text is not None or acc.assistant_chunks:
             _clear_sdk_wedge_on_success()
-        return QueryResult(text=text, session_id=acc.session_id, tool_uses=acc.tool_uses)
+        return QueryResult(text=text, session_id=acc.session_id, tool_uses=acc.tool_uses, steps=acc.steps)
 
     async def _run_query(self, prompt: str, options: Any) -> QueryResult:
         """Drive the SDK query stream and return a QueryResult.
@@ -1620,6 +1660,7 @@ class ClaudeSDKExecutor(AgentExecutor):
 
         assistant_chunks: list[str] = []
         tool_uses: list[str] = []
+        steps: list = []  # ordered thinking + tool_call (AgentTrace.steps)
         result_text: str | None = None
         session_id: str | None = None
         result_is_error: bool = False
@@ -1635,6 +1676,12 @@ class ClaudeSDKExecutor(AgentExecutor):
                             if isinstance(block, sdk.TextBlock):
                                 assistant_chunks.append(block.text)
                             else:
+                                # Record the ordered trace step (thinking or
+                                # tool_call) BEFORE the existing handling; pure,
+                                # so it never perturbs the control flow below.
+                                _step = _block_to_step(block)
+                                if _step is not None:
+                                    steps.append(_step)
                                 # Handle thinking/reasoning blocks from Anthropic-
                                 # compatible upstreams (MiniMax M2/M2.7, Moonshot
                                 # K2.6) so reasoning-only output doesn't surface as
@@ -1736,7 +1783,7 @@ class ClaudeSDKExecutor(AgentExecutor):
         # AssistantMessage TextBlock (populates assistant_chunks).
         if result_text is not None or assistant_chunks:
             _clear_sdk_wedge_on_success()
-        return QueryResult(text=text, session_id=session_id, tool_uses=tool_uses)
+        return QueryResult(text=text, session_id=session_id, tool_uses=tool_uses, steps=steps)
 
     # ------------------------------------------------------------------
     # AgentExecutor interface
@@ -1949,6 +1996,11 @@ class ClaudeSDKExecutor(AgentExecutor):
 
         response_text: str = ""
         tool_uses_for_turn: list[str] = []
+        # Reset per-turn trace capture (read by molecule_runtime.tracing off the
+        # wrapped inner) so a turn inherits nothing from the previous one.
+        self._last_tool_uses = []
+        self._last_tool_calls = []
+        self._last_steps = []
         try:
             # set_current_task INSIDE the try so active_tasks is always
             # decremented by the finally block even if CancelledError hits
@@ -1972,6 +2024,16 @@ class ClaudeSDKExecutor(AgentExecutor):
                         self._session_id = result.session_id
                     response_text = result.text
                     tool_uses_for_turn = result.tool_uses
+                    # Stash the ordered steps for the Langfuse tracer (read off
+                    # the wrapped inner by molecule_runtime.tracing). Tool
+                    # results are absent by contract on this runtime.
+                    self._last_steps = result.steps
+                    self._last_tool_uses = result.tool_uses
+                    self._last_tool_calls = [
+                        {"name": s.get("name", ""), "input": s.get("input", ""),
+                         "output": s.get("result", "")}
+                        for s in result.steps if s.get("kind") == "tool_call"
+                    ]
                     break  # success
                 except Exception as exc:
                     formatted = _format_process_error(exc)
