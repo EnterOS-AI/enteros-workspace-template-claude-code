@@ -264,7 +264,7 @@ jobs:
           # only advance the floating :latest AFTER the sha publish + digest are
           # confirmed. A partial publish (latest ok, sha/digest fails) must never
           # leave :latest ahead of a promoted sha pin. (review #201/#141)
-          PUSHOUT="$(docker push "${SHA_REF}")"
+          PUSHOUT="$(timeout 480 docker push "${SHA_REF}")"
           printf '%s\n' "${PUSHOUT}"
           # docker push stdout is not a stable API: prefer its digest line, but
           # fall back to an inspect of the just-pushed immutable ref so a missing/
@@ -279,7 +279,7 @@ jobs:
             exit 1
           fi
           docker tag "${SHA_REF}" "${LATEST_REF}"
-          docker push "${LATEST_REF}"
+          timeout 480 docker push "${LATEST_REF}"
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "::notice::pushed ${SHA_REF} (digest ${DIGEST}) then :latest to ${PUSH_HOST} (pins as ${IMAGE_NAME}@${DIGEST})"
 
