@@ -68,7 +68,7 @@ def test_docker_host_jobs_do_not_execute_fork_pr_code() -> None:
 def test_publish_inspection_download_is_private_only() -> None:
     workflow = PUBLISH_WORKFLOW.read_text()
     lint_step = workflow[workflow.index("      - name: Lint") : workflow.index(
-        "      - name: Log in"
+        "      - name: Prepare writable HOME"
     )]
 
     assert "molecule-ai-workspace-runtime" not in lint_step
