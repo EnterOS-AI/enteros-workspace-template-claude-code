@@ -78,8 +78,8 @@ def test_publish_workflow_reads_back_exact_pushed_digest_after_staging_promote()
     workflow = PUBLISH_WORKFLOW.read_text()
     verify_job = _job(workflow, "verify-pin")
 
-    assert "needs: [resolve-version, publish, promote-pin]" in verify_job
-    assert "if: ${{ success() && github.ref == 'refs/heads/main' }}" in verify_job
+    assert "needs: [resolve-version, publish, promote-pin, detect-image-change]" in verify_job
+    assert "if: ${{ success() && github.ref == 'refs/heads/main' && needs.detect-image-change.outputs.image_changed == 'true' }}" in verify_job
     assert "env_name: staging" in verify_job
     assert "cp_host: staging-api.moleculesai.app" in verify_job
     assert "token_secret:" not in verify_job
