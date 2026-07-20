@@ -8,7 +8,7 @@
   "legacy_binary_path": "/opt/molecule-mcp-server",
   "management_mcp_server": {
     "npm_package": "@molecule-ai/mcp-server",
-    "pinned_version": "1.9.4",
+    "pinned_version": "1.9.5",
     "compatible_range": "^1.8.0",
     "registry": "https://git.moleculesai.app/api/packages/molecule-ai/npm/",
     "registry_scope": "@molecule-ai",
