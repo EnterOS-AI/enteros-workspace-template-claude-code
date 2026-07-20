@@ -123,6 +123,18 @@ def _load_platform_mcp_required_tool() -> str:
 
 _PLATFORM_MCP_REQUIRED_TOOL = _load_platform_mcp_required_tool()
 
+# The child-env marker the runtime injector writes AUTHORITATIVELY for a
+# self-audience MCP server (privileged_mcp_env: ``MOLECULE_MCP_MODE=self``). The
+# readiness gate keys on this to EXEMPT self-audience servers (e.g.
+# ``molecule-self``, the scheduler plugin's self-schedule MCP now delivered to
+# every workspace) from the management required-tool check: a self server ships
+# the workspace's own schedule verbs, NOT provision_workspace, so it is READY once
+# connected. Keying on the mode env — not a server name — stays robust to the
+# management MCP's dual delivery name (``platform`` baked vs ``molecule-platform``
+# plugin) and never mis-classifies the concierge.
+_SELF_MCP_MODE = "self"
+_MCP_MODE_ENV = "MOLECULE_MCP_MODE"
+
 
 def _tool_names_from_mcp_server_status(server: dict) -> set[str]:
     """Normalize the optional ``tools`` field on an SDK McpServerStatus dict.
@@ -1087,11 +1099,39 @@ class ClaudeSDKExecutor(AgentExecutor):
         channel here, a plugin-delivered server would load but the turn could
         start before its handshake completes.
         """
+        return list(self._declared_extra_mcp_specs())
+
+    def _declared_extra_mcp_specs(self) -> dict:
+        """Merged ``{name: spec}`` for every declared non-``a2a`` MCP server,
+        across all three delivery channels (config.yaml, mcp fragment, plugin
+        settings.json). ``_declared_extra_mcp_names`` and
+        ``_self_audience_mcp_names`` both derive from this so they stay in
+        lockstep with what is actually launched. Each spec is
+        ``{command, args, env?}`` (the merge helpers preserve ``env``)."""
         merged: dict = {"a2a": {}}
         _apply_extra_mcp_servers(merged, self._load_config_dict())
         _apply_extra_mcp_servers(merged, self._load_mcp_fragment())
         _apply_settings_mcp_servers(merged, self._load_settings_mcp())
-        return [name for name in merged if name != "a2a"]
+        merged.pop("a2a", None)
+        return merged
+
+    def _self_audience_mcp_names(self) -> set[str]:
+        """Declared servers delivered as the SELF audience — child env carries
+        ``MOLECULE_MCP_MODE=self`` (e.g. ``molecule-self``, the scheduler plugin's
+        self-schedule MCP, now delivered to EVERY workspace via the native-plugins
+        registry). The readiness gate EXEMPTS these from the management
+        required-tool (``provision_workspace``) check: a self-audience server ships
+        the workspace's own schedule verbs, not the management verb, so it is READY
+        once connected. Keyed on the injector-authoritative mode env rather than a
+        name, so it never depends on the management MCP's dual delivery name."""
+        out: set[str] = set()
+        for name, spec in self._declared_extra_mcp_specs().items():
+            if not isinstance(spec, dict):
+                continue
+            env = spec.get("env")
+            if isinstance(env, dict) and str(env.get(_MCP_MODE_ENV, "")).strip().lower() == _SELF_MCP_MODE:
+                out.add(name)
+        return out
 
     def _maybe_set_context_window_env(self) -> None:
         """Tell claude-code the model's REAL context window (deeper fix).
@@ -1467,15 +1507,24 @@ class ClaudeSDKExecutor(AgentExecutor):
         return [s for s in (servers or []) if isinstance(s, dict)]
 
     async def _await_mcp_ready(self, client: Any, declared: list[str]) -> None:
-        """Block (bounded) until every declared MCP server is `connected` AND
-        exposes the SSOT-required management tool in its callable tool list.
+        """Block (bounded) until every declared MCP server is `connected`, AND
+        every NON-self-audience server additionally exposes the SSOT-required tool.
 
         Polls `client.get_mcp_status()` up to `_MCP_READY_MAX_POLLS` times.
-        Returns as soon as all `declared` servers report `connected` and their
-        `tools` list includes `_PLATFORM_MCP_REQUIRED_TOOL`. Raises
-        `_McpNotReadyError` if any declared server hits a TERMINAL failure
-        status, if the poll budget is exhausted, or if a server is connected
-        but missing the required callable tool.
+        Returns as soon as all `declared` servers report `connected` — and, for
+        every server NOT in `_self_audience_mcp_names()`, its `tools` list
+        includes `_PLATFORM_MCP_REQUIRED_TOOL`. Raises `_McpNotReadyError` if any
+        declared server hits a TERMINAL failure status, if the poll budget is
+        exhausted, or if a non-self server is connected but missing the required
+        callable tool.
+
+        The required-tool check EXEMPTS self-audience servers on purpose: a
+        self-audience server (`molecule-self`, now delivered to every workspace by
+        the scheduler plugin's self-schedule MCP) ships schedule verbs, not
+        provision_workspace, so it is READY once connected. Applying the
+        management required-tool to it would false-fail the gate on every ordinary
+        workspace (connected-missing-provision_workspace). We still WAIT for every
+        declared server to connect so its tools appear in the turn's tool list.
 
         This is THE fix for the stuck-`platform`-MCP bug: it holds the CLI
         subprocess open through the `node` server's slow handshake so the
@@ -1483,6 +1532,10 @@ class ClaudeSDKExecutor(AgentExecutor):
         actually live and will appear in the model's tool list.
         """
         declared_set = set(declared)
+        # Self-audience servers (MOLECULE_MCP_MODE=self, e.g. molecule-self) are
+        # exempt from the management required-tool check — they are READY once
+        # connected. Computed once per gate call from the declared specs.
+        self_audience = self._self_audience_mcp_names()
         last_status: dict[str, Any] = {}
         for _poll in range(_MCP_READY_MAX_POLLS):
             try:
@@ -1512,11 +1565,18 @@ class ClaudeSDKExecutor(AgentExecutor):
                 if server.get("status") != _MCP_READY_STATUS:
                     all_ready = False
                     break
-                tool_names = _tool_names_from_mcp_server_status(server)
-                if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
-                    raise _McpNotReadyError(
-                        name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
-                    )
+                # A self-audience server (MOLECULE_MCP_MODE=self, e.g.
+                # molecule-self, delivered to EVERY workspace by the scheduler
+                # plugin) is READY once connected — it ships schedule verbs, not
+                # the management provision_workspace verb. Exempt it: without this,
+                # delivering molecule-self to ordinary workspaces false-fails this
+                # gate (connected-missing-provision_workspace) and errors every turn.
+                if name not in self_audience:
+                    tool_names = _tool_names_from_mcp_server_status(server)
+                    if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
+                        raise _McpNotReadyError(
+                            name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
+                        )
             if all_ready:
                 logger.debug(
                     "MCP readiness gate: all declared servers connected with "
@@ -1532,11 +1592,12 @@ class ClaudeSDKExecutor(AgentExecutor):
             server = last_status.get(name) or {}
             if server.get("status") != _MCP_READY_STATUS:
                 raise _McpNotReadyError(name, server.get("status", "pending"))
-            tool_names = _tool_names_from_mcp_server_status(server)
-            if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
-                raise _McpNotReadyError(
-                    name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
-                )
+            if name not in self_audience:
+                tool_names = _tool_names_from_mcp_server_status(server)
+                if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
+                    raise _McpNotReadyError(
+                        name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
+                    )
         # Defensive: loop exited without all-ready yet no name flagged
         # (e.g. empty status). Treat as not-ready on the first declared name.
         raise _McpNotReadyError(declared[0], "unknown")
