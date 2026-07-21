@@ -368,6 +368,12 @@ CONCIERGE_PLUS_SELF_MGMT_MISSING = [
 # A self-audience server stuck `pending` — it never connects. The gate must NOT
 # wedge the turn on it (#5): the turn proceeds degraded (schedule tools absent).
 SELF_PENDING = [{"name": "molecule-self", "status": "pending"}]
+# A self-audience server CONNECTED but whose tools have NOT enumerated yet (empty
+# `tools` list). This is the distinctive #9 branch (issue #330): connected alone
+# is NOT settled — the gate must keep polling so the turn doesn't start with the
+# self-schedule verbs missing. `SELF_CONNECTED` (above) is the enumerated form it
+# settles to.
+SELF_CONNECTED_NO_TOOLS = [{"name": "molecule-self", "status": "connected", "tools": []}]
 # A THIRD (non-self, non-management) server connected WITHOUT provision_workspace.
 # The allowlist gate must treat it as READY — it is never asked for a management
 # verb it does not ship (#6/#11).
@@ -704,6 +710,85 @@ async def test_self_never_connects_proceeds_degraded_not_wedged(tmp_path):
     # Degraded, NOT wedged — and no reconnect heal was needed.
     assert not mod.is_wedged()
     assert client.reconnects == []
+
+
+def test_self_server_connected_empty_tools_not_settled(tmp_path):
+    """#9 (issue #330): the DISTINCTIVE branch of `_self_server_settled` — a self
+    server that is CONNECTED but whose `tools` list is still EMPTY is NOT settled.
+    Only once its tools enumerate does it settle; a terminal-failure status also
+    settles (it won't ever list tools — don't hold the turn for it).
+
+    NEGATIVE CONTROL: pre-#329 the gate treated a self server as ready on
+    `connected` ALONE (no tools check), so a connected-empty-tools spec read as
+    settled. The `is False` assertions below therefore fail against pre-fix
+    behavior — verified by re-implementing the pre-#329 predicate:
+
+        def _pre329_settled(server):
+            return server.get("status", "pending") == "connected"
+
+    which returns True for the connected-empty-tools spec, flipping both
+    assertions red.
+    """
+    mod = _load_executor()
+    settled = mod.ClaudeSDKExecutor._self_server_settled  # staticmethod
+    # Connected but tools not yet enumerated → NOT settled (keep polling, #9).
+    assert settled({"name": "molecule-self", "status": "connected", "tools": []}) is False
+    # `tools` key absent behaves the same (normalized to empty).
+    assert settled({"name": "molecule-self", "status": "connected"}) is False
+    # Still handshaking → NOT settled.
+    assert settled({"name": "molecule-self", "status": "pending"}) is False
+    # Once its own schedule verbs enumerate → SETTLED.
+    assert settled(
+        {"name": "molecule-self", "status": "connected", "tools": ["list_schedules"]}
+    ) is True
+    # Terminal failure → settled (won't ever list tools; don't hold the turn).
+    assert settled({"name": "molecule-self", "status": "disabled"}) is True
+
+
+@pytest.mark.asyncio
+async def test_gate_waits_for_self_tools_to_enumerate_then_sends_prompt(tmp_path):
+    """#9 (issue #330): an ORDINARY workspace declares ONLY the molecule-self MCP,
+    which reports `connected` with an EMPTY tools list for the first polls, THEN
+    enumerates its schedule verbs. The gate must WAIT (bounded by the poll budget)
+    across the empty-tools polls — NOT start the turn while the self-schedule verbs
+    are missing — and send the prompt only once the tools appear.
+
+    NEGATIVE CONTROL: pre-#329 a connected self server was ready the instant it
+    reported `connected`, so the gate would have returned on the FIRST poll (with
+    zero self tools live) and `client._poll` would be 1. The `_poll >= 3` assertion
+    below — the gate polled through both empty-tools snapshots before settling —
+    fails against pre-fix code.
+    """
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    # connected-empty-tools for 2 polls, then tools enumerate.
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[
+                SELF_CONNECTED_NO_TOOLS,
+                SELF_CONNECTED_NO_TOOLS,
+                SELF_CONNECTED,
+            ],
+            response=[mod_RM(result="scheduled", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("schedule a daily digest", ex._build_options())
+    assert res.text == "scheduled"
+    client = _StubClient.instances[0]
+    assert client.queried == "schedule a daily digest", (
+        "prompt must be sent once the self server's tools enumerate (#9)"
+    )
+    # The gate waited through both empty-tools polls before settling on poll 3 —
+    # it did NOT start the turn on `connected` alone.
+    assert client._poll >= 3, (
+        "gate must keep polling while a connected self server's tools are empty (#9)"
+    )
+    # Healthy enumeration path — no reload, no wedge.
+    assert client.reconnects == []
+    assert not mod.is_wedged()
 
 
 @pytest.mark.asyncio
