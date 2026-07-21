@@ -123,17 +123,29 @@ def _load_platform_mcp_required_tool() -> str:
 
 _PLATFORM_MCP_REQUIRED_TOOL = _load_platform_mcp_required_tool()
 
-# The child-env marker the runtime injector writes AUTHORITATIVELY for a
-# self-audience MCP server (privileged_mcp_env: ``MOLECULE_MCP_MODE=self``). The
-# readiness gate keys on this to EXEMPT self-audience servers (e.g.
-# ``molecule-self``, the scheduler plugin's self-schedule MCP now delivered to
-# every workspace) from the management required-tool check: a self server ships
-# the workspace's own schedule verbs, NOT provision_workspace, so it is READY once
-# connected. Keying on the mode env — not a server name — stays robust to the
-# management MCP's dual delivery name (``platform`` baked vs ``molecule-platform``
-# plugin) and never mis-classifies the concierge.
+# The child-env marker the runtime injector writes AUTHORITATIVELY for each MCP
+# audience (privileged_mcp_env ``MOLECULE_MCP_MODE``): ``self`` for the
+# self-schedule surface, ``management`` for the org concierge's platform MCP
+# (contract audiences.self.mcp_mode / audiences.org.mcp_mode).
+#
+# The readiness gate uses an ALLOWLIST: the SSOT-required tool
+# (``provision_workspace``) is enforced ONLY on the MANAGEMENT-audience server —
+# never on a self-audience server (it ships the workspace's own schedule verbs)
+# nor on any other declared MCP (a third plugin-delivered server needn't expose
+# a management verb it lacks). Classification is robust to the delivery channel:
+# a server is management if its mode env is ``management`` OR its name is a known
+# management name (``molecule-platform`` plugin / ``platform`` baked); a server
+# is self if its mode env is ``self`` OR its name is ``molecule-self`` — so a
+# changed env-delivery channel can't silently mis-classify either one, and a
+# management server takes precedence over a mis-injected ``MODE=self``.
 _SELF_MCP_MODE = "self"
+_MANAGEMENT_MCP_MODE = "management"
 _MCP_MODE_ENV = "MOLECULE_MCP_MODE"
+# The management MCP's dual delivery name (``platform`` baked into config.yaml vs
+# ``molecule-platform`` delivered as a plugin — see contract mcp_server_name).
+_KNOWN_MANAGEMENT_MCP_NAMES = ("molecule-platform", "platform")
+# The known self-schedule MCP server name (native-plugins registry).
+_KNOWN_SELF_MCP_NAME = "molecule-self"
 
 
 def _tool_names_from_mcp_server_status(server: dict) -> set[str]:
@@ -959,6 +971,13 @@ class ClaudeSDKExecutor(AgentExecutor):
         self.plugin_prompts = list(plugin_prompts or [])
         self._session_id: str | None = None
         self._active_stream: AsyncIterator[Any] | None = None
+        # Per-turn memoization of the merged declared MCP specs (#8). The three
+        # config files that declare extra MCP servers can't change mid-turn, so
+        # we read + merge them ONCE and reuse the result across the readiness
+        # gate's heal retries and the per-attempt options build instead of doing
+        # 3 disk passes per helper call. Reset at the start of every turn
+        # (`_execute_locked`) so a hot-reloaded config is still picked up.
+        self._declared_specs_cache: dict | None = None
         # Serializes concurrent execute() calls on the same executor so
         # session_id / _active_stream mutations stay race-free.
         self._run_lock = asyncio.Lock()
@@ -1104,32 +1123,75 @@ class ClaudeSDKExecutor(AgentExecutor):
     def _declared_extra_mcp_specs(self) -> dict:
         """Merged ``{name: spec}`` for every declared non-``a2a`` MCP server,
         across all three delivery channels (config.yaml, mcp fragment, plugin
-        settings.json). ``_declared_extra_mcp_names`` and
-        ``_self_audience_mcp_names`` both derive from this so they stay in
-        lockstep with what is actually launched. Each spec is
-        ``{command, args, env?}`` (the merge helpers preserve ``env``)."""
+        settings.json). ``_declared_extra_mcp_names``,
+        ``_self_audience_mcp_names`` and ``_management_audience_mcp_names`` all
+        derive from this so they stay in lockstep with what is actually launched.
+        Each spec is ``{command, args, env?}`` (the merge helpers preserve
+        ``env``).
+
+        Memoized per turn (#8): the config files can't change mid-turn, so the
+        3-file read+merge runs ONCE and is reused across the readiness gate's
+        heal retries and the per-attempt options build. `_execute_locked` clears
+        the cache at the start of every turn so a hot-reloaded config is picked
+        up next turn."""
+        # getattr guard: some unit tests construct the executor via
+        # object.__new__ and never run __init__, so the cache attr may be absent.
+        if getattr(self, "_declared_specs_cache", None) is not None:
+            return self._declared_specs_cache
         merged: dict = {"a2a": {}}
         _apply_extra_mcp_servers(merged, self._load_config_dict())
         _apply_extra_mcp_servers(merged, self._load_mcp_fragment())
         _apply_settings_mcp_servers(merged, self._load_settings_mcp())
         merged.pop("a2a", None)
+        self._declared_specs_cache = merged
         return merged
 
-    def _self_audience_mcp_names(self) -> set[str]:
-        """Declared servers delivered as the SELF audience — child env carries
-        ``MOLECULE_MCP_MODE=self`` (e.g. ``molecule-self``, the scheduler plugin's
-        self-schedule MCP, now delivered to EVERY workspace via the native-plugins
-        registry). The readiness gate EXEMPTS these from the management
-        required-tool (``provision_workspace``) check: a self-audience server ships
-        the workspace's own schedule verbs, not the management verb, so it is READY
-        once connected. Keyed on the injector-authoritative mode env rather than a
-        name, so it never depends on the management MCP's dual delivery name."""
+    def _mcp_mode_env(self, spec: object) -> str:
+        """Normalized ``MOLECULE_MCP_MODE`` value from a merged MCP spec's env,
+        or ``""`` when absent/malformed."""
+        if not isinstance(spec, dict):
+            return ""
+        env = spec.get("env")
+        if not isinstance(env, dict):
+            return ""
+        return str(env.get(_MCP_MODE_ENV, "")).strip().lower()
+
+    def _management_audience_mcp_names(self) -> set[str]:
+        """Declared servers delivered as the MANAGEMENT (org) audience — the
+        concierge's platform MCP that ships the org-admin verbs including
+        ``provision_workspace``. The readiness gate enforces the SSOT-required
+        tool ONLY on these (allowlist): child env carries
+        ``MOLECULE_MCP_MODE=management`` OR the name is a known management name
+        (``molecule-platform`` plugin / ``platform`` baked). Name-OR-env keeps the
+        hard gate even if the mode env arrives by a changed channel (#8), and lets
+        a mis-injected ``MODE=self`` on the management server NOT exempt it (#7)."""
         out: set[str] = set()
         for name, spec in self._declared_extra_mcp_specs().items():
-            if not isinstance(spec, dict):
+            if self._mcp_mode_env(spec) == _MANAGEMENT_MCP_MODE or name in _KNOWN_MANAGEMENT_MCP_NAMES:
+                out.add(name)
+        return out
+
+    def _self_audience_mcp_names(self) -> set[str]:
+        """Declared servers delivered as the SELF audience — the scheduler
+        plugin's self-schedule MCP (``molecule-self``), now delivered to EVERY
+        workspace via the native-plugins registry. Ships the workspace's own
+        schedule verbs, NOT ``provision_workspace``.
+
+        Classified robustly by ``MOLECULE_MCP_MODE=self`` OR the known name
+        ``molecule-self`` (name-OR-env, not env alone — a changed env-delivery
+        channel can't silently break classification, #8). A MANAGEMENT-audience
+        server takes precedence: a management server mis-injected with
+        ``MODE=self`` is NOT treated as self (#7), so the hard gate still applies.
+
+        The readiness gate treats these as NON-BLOCKING (#5): a self-audience
+        server that never reaches ready degrades the turn (schedule tools absent)
+        rather than wedging it, and is never asked for the management verb."""
+        management = self._management_audience_mcp_names()
+        out: set[str] = set()
+        for name, spec in self._declared_extra_mcp_specs().items():
+            if name in management:
                 continue
-            env = spec.get("env")
-            if isinstance(env, dict) and str(env.get(_MCP_MODE_ENV, "")).strip().lower() == _SELF_MCP_MODE:
+            if self._mcp_mode_env(spec) == _SELF_MCP_MODE or name == _KNOWN_SELF_MCP_NAME:
                 out.add(name)
         return out
 
@@ -1269,28 +1331,21 @@ class ClaudeSDKExecutor(AgentExecutor):
                 "args": [get_mcp_server_path()],
             }
         }
-        # Merge any config-declared MCP servers (e.g. the platform-management
-        # MCP for the org-level platform agent). No-op for ordinary workspaces.
-        _apply_extra_mcp_servers(mcp_servers, self._load_config_dict())
-        # Overlay fragment (core#2522): the provisioner ships the concierge's
-        # platform-MCP declaration as a standalone /configs/mcp_servers.yaml,
-        # because on the SaaS restart-provision path no base config.yaml is
-        # resolvable to append onto (the pilot's TOOLS-FAIL RCA, 2026-06-10).
-        # Applied AFTER config.yaml so the platform-authored fragment wins on
-        # a same-name entry. Absent file -> {} -> no-op for every ordinary
-        # workspace.
-        _apply_extra_mcp_servers(mcp_servers, self._load_mcp_fragment())
-        # Plugin channel (core#3079 / core#3082): when the platform-management MCP is
-        # delivered as a PLUGIN (RFC#3045), the MCPServerAdaptor writes it into
-        # /configs/.claude/settings.json `mcpServers`. The CLI runs with
-        # --strict-mcp-config and ignores that on-disk file, so fold those
-        # servers into the SDK options here or they never load. Applied LAST so
-        # a plugin-authored server is authoritative on a same-name entry.
-        #
-        # Log the on-disk names so operators can see what --strict-mcp-config
+        # Merge the declared extra MCP servers across all three delivery
+        # channels — config.yaml `mcp_servers` (the org-level platform agent's
+        # platform-management MCP), the standalone /configs/mcp_servers.yaml
+        # overlay fragment (core#2522, the SaaS restart-provision path where no
+        # base config.yaml is resolvable), and the plugin-delivered
+        # /configs/.claude/settings.json `mcpServers` map (core#3079 / core#3082,
+        # which the --strict-mcp-config CLI would otherwise ignore on disk).
+        # `_declared_extra_mcp_specs` performs that merge with the SAME last-wins
+        # precedence (config -> fragment -> settings) and is MEMOIZED per turn,
+        # so this reuses the single read the readiness gate already did instead of
+        # re-reading the 3 files here (#8). No-op for ordinary workspaces.
+        mcp_servers.update(self._declared_extra_mcp_specs())
+        # Log the on-disk plugin names so operators can see what --strict-mcp-config
         # would silently swallow if the executor did not fold it (core#3082).
-        settings_mcp = self._load_settings_mcp()
-        settings_mcp_servers = settings_mcp.get("mcpServers") or {}
+        settings_mcp_servers = self._load_settings_mcp().get("mcpServers") or {}
         if settings_mcp_servers:
             settings_path = os.path.join(self.config_path, ".claude", "settings.json")
             logger.info(
@@ -1299,7 +1354,6 @@ class ClaudeSDKExecutor(AgentExecutor):
                 settings_path,
                 sorted(settings_mcp_servers.keys()),
             )
-        _apply_settings_mcp_servers(mcp_servers, settings_mcp)
 
         create_kwargs: dict = dict(
             model=self.model,
@@ -1507,35 +1561,46 @@ class ClaudeSDKExecutor(AgentExecutor):
         return [s for s in (servers or []) if isinstance(s, dict)]
 
     async def _await_mcp_ready(self, client: Any, declared: list[str]) -> None:
-        """Block (bounded) until every declared MCP server is `connected`, AND
-        every NON-self-audience server additionally exposes the SSOT-required tool.
+        """Block (bounded) until the turn's BLOCKING MCP servers are ready,
+        letting self-audience servers degrade rather than wedge the turn.
 
         Polls `client.get_mcp_status()` up to `_MCP_READY_MAX_POLLS` times.
-        Returns as soon as all `declared` servers report `connected` — and, for
-        every server NOT in `_self_audience_mcp_names()`, its `tools` list
-        includes `_PLATFORM_MCP_REQUIRED_TOOL`. Raises `_McpNotReadyError` if any
-        declared server hits a TERMINAL failure status, if the poll budget is
-        exhausted, or if a non-self server is connected but missing the required
-        callable tool.
 
-        The required-tool check EXEMPTS self-audience servers on purpose: a
-        self-audience server (`molecule-self`, now delivered to every workspace by
-        the scheduler plugin's self-schedule MCP) ships schedule verbs, not
-        provision_workspace, so it is READY once connected. Applying the
-        management required-tool to it would false-fail the gate on every ordinary
-        workspace (connected-missing-provision_workspace). We still WAIT for every
-        declared server to connect so its tools appear in the turn's tool list.
+        Two classes of declared server:
+
+          * BLOCKING — every server that is NOT self-audience (the management
+            concierge MCP plus any other declared plugin MCP). Its `connected`
+            handshake is a HARD gate: a terminal-failure status, or the poll
+            budget exhausting before it connects, raises `_McpNotReadyError` so
+            the heal path reloads it. The SSOT-required tool
+            (`_PLATFORM_MCP_REQUIRED_TOOL`) is enforced ONLY on the
+            MANAGEMENT-audience server (`_management_audience_mcp_names()`) — an
+            ALLOWLIST (#6): a connected management server missing the tool raises,
+            but any OTHER declared server needn't expose a management verb it
+            never ships (#11).
+
+          * SELF-AUDIENCE (`_self_audience_mcp_names()`, e.g. `molecule-self`,
+            now delivered to EVERY workspace) — NON-BLOCKING (#5). A self server
+            that never reaches ready no longer wedges the turn: once the blocking
+            set is ready and the poll budget is spent, the turn PROCEEDS DEGRADED
+            (its schedule tools are simply absent this turn). Within the budget we
+            DO wait for a self server to connect and enumerate its own tools (#9)
+            so a healthy self server's schedule verbs are live before the prompt;
+            we just never let a slow/broken one raise.
 
         This is THE fix for the stuck-`platform`-MCP bug: it holds the CLI
-        subprocess open through the `node` server's slow handshake so the
-        prompt is only sent once the required `mcp__platform__*` tool is
-        actually live and will appear in the model's tool list.
+        subprocess open through the `node` server's slow handshake so the prompt
+        is only sent once the required `mcp__platform__*` tool is actually live
+        and will appear in the model's tool list — while the now-universal
+        self-schedule MCP can never turn an ordinary workspace's every turn into a
+        wedge just by failing to connect.
         """
         declared_set = set(declared)
-        # Self-audience servers (MOLECULE_MCP_MODE=self, e.g. molecule-self) are
-        # exempt from the management required-tool check — they are READY once
-        # connected. Computed once per gate call from the declared specs.
-        self_audience = self._self_audience_mcp_names()
+        # Computed once per gate call from the (memoized) declared specs.
+        self_audience = self._self_audience_mcp_names() & declared_set
+        management = self._management_audience_mcp_names() & declared_set
+        # Blocking servers gate the turn; self-audience servers do not (#5).
+        blocking = declared_set - self_audience
         last_status: dict[str, Any] = {}
         for _poll in range(_MCP_READY_MAX_POLLS):
             try:
@@ -1548,59 +1613,90 @@ class ClaudeSDKExecutor(AgentExecutor):
                 continue
             servers = self._mcp_servers_from_status(status)
             last_status = {s.get("name", ""): s for s in servers}
-            # Terminal failure on any declared server → stop early, heal/retry.
-            for name in declared_set:
+            # Terminal failure on a BLOCKING server → stop early, heal/retry. A
+            # self-audience server's terminal failure is swallowed (degraded, #5).
+            for name in blocking:
                 server = last_status.get(name) or {}
                 st = server.get("status", "pending")
                 if st in _MCP_TERMINAL_FAIL_STATUSES:
                     raise _McpNotReadyError(name, st)
-            # Success only when every declared server is connected AND the
-            # SSOT-required tool is present in its callable tool list. A server
-            # can be "connected" but still not expose the management tool (e.g.
-            # the mgmt-MCP is status=failed internally); that must NOT read as
-            # ready.
-            all_ready = True
-            for name in declared_set:
+            # The blocking set is ready when every blocking server is connected
+            # AND every MANAGEMENT server additionally exposes the SSOT-required
+            # tool. A server can be "connected" but not expose the management tool
+            # (e.g. the mgmt-MCP is status=failed internally); that must NOT read
+            # as ready.
+            blocking_ready = True
+            for name in blocking:
                 server = last_status.get(name) or {}
                 if server.get("status") != _MCP_READY_STATUS:
-                    all_ready = False
+                    blocking_ready = False
                     break
-                # A self-audience server (MOLECULE_MCP_MODE=self, e.g.
-                # molecule-self, delivered to EVERY workspace by the scheduler
-                # plugin) is READY once connected — it ships schedule verbs, not
-                # the management provision_workspace verb. Exempt it: without this,
-                # delivering molecule-self to ordinary workspaces false-fails this
-                # gate (connected-missing-provision_workspace) and errors every turn.
-                if name not in self_audience:
+                if name in management:
                     tool_names = _tool_names_from_mcp_server_status(server)
                     if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
                         raise _McpNotReadyError(
                             name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
                         )
-            if all_ready:
+            # Wait (bounded by the budget) for self-audience servers to settle so
+            # their schedule verbs are live before the prompt (#9) — but never let
+            # them block: settled means connected-with-tools OR won't-settle.
+            self_settled = all(
+                self._self_server_settled(last_status.get(name) or {})
+                for name in self_audience
+            )
+            if blocking_ready and self_settled:
                 logger.debug(
-                    "MCP readiness gate: all declared servers connected with "
-                    "%s callable (%s)",
+                    "MCP readiness gate: blocking servers ready (%s callable on "
+                    "management), self-audience settled (%s)",
                     _PLATFORM_MCP_REQUIRED_TOOL,
                     declared,
                 )
                 return
             await asyncio.sleep(_MCP_READY_POLL_INTERVAL_S)
-        # Budget exhausted — surface the first still-unconnected server so the
-        # heal path can reload it.
-        for name in declared:
+        # Budget exhausted. A still-unready BLOCKING server is a hard failure —
+        # surface it so the heal path can reload it.
+        for name in blocking:
             server = last_status.get(name) or {}
             if server.get("status") != _MCP_READY_STATUS:
                 raise _McpNotReadyError(name, server.get("status", "pending"))
-            if name not in self_audience:
+            if name in management:
                 tool_names = _tool_names_from_mcp_server_status(server)
                 if _PLATFORM_MCP_REQUIRED_TOOL not in tool_names:
                     raise _McpNotReadyError(
                         name, f"connected-missing-{_PLATFORM_MCP_REQUIRED_TOOL}"
                     )
-        # Defensive: loop exited without all-ready yet no name flagged
-        # (e.g. empty status). Treat as not-ready on the first declared name.
-        raise _McpNotReadyError(declared[0], "unknown")
+        # The blocking set IS ready; only self-audience servers failed to settle
+        # in time → proceed DEGRADED (schedule tools absent this turn) rather than
+        # wedge the turn (#5).
+        unsettled_self = sorted(
+            name
+            for name in self_audience
+            if not self._self_server_settled(last_status.get(name) or {})
+        )
+        if unsettled_self:
+            logger.warning(
+                "MCP readiness gate: self-audience server(s) %s did not reach "
+                "ready within the poll budget — proceeding DEGRADED (their "
+                "schedule tools are absent this turn); NOT wedging the turn",
+                unsettled_self,
+            )
+        return
+
+    @staticmethod
+    def _self_server_settled(server: dict) -> bool:
+        """Whether a self-audience server has SETTLED for the readiness gate.
+
+        Settled = connected AND its own tools have enumerated (#9, so the turn
+        doesn't start before the self-schedule verbs are listed), OR it hit a
+        terminal-failure status (it won't settle — don't hold the turn for it).
+        A server still `pending`/connecting is NOT settled, so the gate keeps
+        polling for it up to the budget before degrading (#5)."""
+        st = server.get("status", "pending")
+        if st in _MCP_TERMINAL_FAIL_STATUSES:
+            return True
+        if st != _MCP_READY_STATUS:
+            return False
+        return bool(_tool_names_from_mcp_server_status(server))
 
     async def _run_query_gated(self, prompt: str, options: Any, declared: list[str]) -> QueryResult:
         """Readiness-gated variant of `_run_query` for the platform agent.
@@ -2070,6 +2166,10 @@ class ClaudeSDKExecutor(AgentExecutor):
         self._last_tool_uses = []
         self._last_tool_calls = []
         self._last_steps = []
+        # Refresh the per-turn MCP-spec memo (#8) so a config hot-reloaded since
+        # the previous turn is picked up, then read+merged exactly once for this
+        # whole turn (options build + every readiness-gate heal retry).
+        self._declared_specs_cache = None
         try:
             # set_current_task INSIDE the try so active_tasks is always
             # decremented by the finally block even if CancelledError hits

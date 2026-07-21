@@ -191,6 +191,60 @@ def _write_concierge_plus_self_config(tmp_path) -> str:
     return str(tmp_path)
 
 
+def _write_other_plugin_config(tmp_path) -> str:
+    """A THIRD MCP delivered via the new plugins channel: NEITHER self-audience
+    (no MOLECULE_MCP_MODE=self, name != molecule-self) NOR management-audience (no
+    MOLECULE_MCP_MODE=management, name not a known management name). It ships its
+    own verbs, NOT provision_workspace. The allowlist gate must NOT force the
+    management required-tool onto it (#6/#11)."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: ordinary-ws\n"
+        "mcp_servers:\n"
+        "  - name: acme-tools\n"
+        "    command: npx\n"
+        "    args:\n"
+        "      - '@acme/mcp'\n"
+    )
+    return str(tmp_path)
+
+
+def _write_mgmt_misinjected_self_config(tmp_path) -> str:
+    """The management MCP (molecule-platform) MIS-injected with MODE=self (#7).
+    Management classification by NAME must win over the bogus mode env, so it is
+    still enforced for provision_workspace, not exempted."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: concierge\n"
+        "mcp_servers:\n"
+        "  - name: molecule-platform\n"
+        "    command: node\n"
+        "    args:\n"
+        "      - /opt/molecule-mcp-server/dist/index.js\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: self\n"
+    )
+    return str(tmp_path)
+
+
+def _write_mgmt_by_mode_env_config(tmp_path) -> str:
+    """A management MCP delivered under a NON-standard name but carrying the
+    injector-authoritative MOLECULE_MCP_MODE=management. Classification by env
+    must still enforce the required tool (#8: env channel, not name alone)."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: concierge\n"
+        "mcp_servers:\n"
+        "  - name: org-mcp\n"
+        "    command: node\n"
+        "    args:\n"
+        "      - /opt/molecule-mcp-server/dist/index.js\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: management\n"
+    )
+    return str(tmp_path)
+
+
 def _make_executor(mod, config_path, model="sonnet"):
     ex = mod.ClaudeSDKExecutor(
         system_prompt=None,
@@ -310,6 +364,18 @@ CONCIERGE_PLUS_SELF_READY = [
 CONCIERGE_PLUS_SELF_MGMT_MISSING = [
     {"name": "molecule-platform", "status": "connected", "tools": ["other"]},
     {"name": "molecule-self", "status": "connected", "tools": ["list_schedules"]},
+]
+# A self-audience server stuck `pending` — it never connects. The gate must NOT
+# wedge the turn on it (#5): the turn proceeds degraded (schedule tools absent).
+SELF_PENDING = [{"name": "molecule-self", "status": "pending"}]
+# A THIRD (non-self, non-management) server connected WITHOUT provision_workspace.
+# The allowlist gate must treat it as READY — it is never asked for a management
+# verb it does not ship (#6/#11).
+OTHER_CONNECTED = [{"name": "acme-tools", "status": "connected", "tools": ["do_thing"]}]
+# molecule-platform mis-injected MODE=self, connected but WITHOUT provision_workspace.
+# Management-by-name must still enforce → raise (#7).
+MGMT_MISINJECTED_MISSING = [
+    {"name": "molecule-platform", "status": "connected", "tools": ["do_thing"]}
 ]
 
 
@@ -600,6 +666,150 @@ async def test_heal_does_not_mark_wedge(tmp_path):
     ])
     await ex._execute_locked("create a workspace")
     assert not mod.is_wedged()
+
+
+@pytest.mark.asyncio
+async def test_self_never_connects_proceeds_degraded_not_wedged(tmp_path):
+    """#5 (NON-BLOCKING self): an ORDINARY workspace declares ONLY the now-
+    universal self-schedule molecule-self MCP, and it never connects (slow box /
+    install failure / handshake timeout). The turn must PROCEED DEGRADED — the
+    prompt is sent, no wedge — instead of exhausting the heal retries and wedging
+    EVERY turn on a workspace that previously completed fine without schedule
+    tools.
+
+    NEGATIVE CONTROL: before the fix a self server's connect was a hard gate, so
+    a stuck-pending molecule-self raised _McpNotReadyError, the heal loop
+    exhausted, and `_run_query` RAISED + marked the workspace wedged. This test's
+    `res.text` / `not is_wedged()` assertions therefore fail against pre-fix code.
+    """
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 3
+    # molecule-self stuck pending for the whole (short) budget.
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[SELF_PENDING],
+            response=[mod_RM(result="degraded-ok", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("schedule a daily digest", ex._build_options())
+    assert res.text == "degraded-ok"
+    client = _StubClient.instances[0]
+    assert client.queried == "schedule a daily digest", (
+        "prompt must be sent even though the self server never connected (#5)"
+    )
+    # Degraded, NOT wedged — and no reconnect heal was needed.
+    assert not mod.is_wedged()
+    assert client.reconnects == []
+
+
+@pytest.mark.asyncio
+async def test_non_self_non_management_server_not_forced_to_expose_required_tool(tmp_path):
+    """#6/#11 (allowlist): a THIRD MCP that is neither self- nor management-
+    audience is connected but exposes only its own verbs (no provision_workspace).
+    The gate must NOT force the management required-tool onto it — the turn
+    proceeds once it is connected.
+
+    NEGATIVE CONTROL: the pre-fix gate scoped the required-tool check by a
+    self-audience BLOCKLIST (`name not in self_audience`), so this non-self
+    server was forced to expose provision_workspace, raised
+    connected-missing-provision_workspace, and wedged. The `res.text` assertion
+    fails against pre-fix code."""
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_other_plugin_config(tmp_path))
+    assert ex._declared_extra_mcp_names() == ["acme-tools"]
+    assert ex._self_audience_mcp_names() == set()
+    assert ex._management_audience_mcp_names() == set()
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 2
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[OTHER_CONNECTED],
+            response=[mod_RM(result="did-thing", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("use acme", ex._build_options())
+    assert res.text == "did-thing"
+    assert _StubClient.instances[0].queried == "use acme"
+    assert not mod.is_wedged()
+
+
+def test_management_classified_by_name_or_mode_env(tmp_path):
+    """#6/#7/#8: management-audience classification is robust — by known NAME
+    (molecule-platform / platform) OR by MOLECULE_MCP_MODE=management. A
+    management server MIS-injected with MODE=self is still management (name wins),
+    never exempted."""
+    mod = _load_executor()
+    # By env, non-standard name.
+    ex_env = _make_executor(mod, _write_mgmt_by_mode_env_config(tmp_path))
+    assert ex_env._management_audience_mcp_names() == {"org-mcp"}
+    assert ex_env._self_audience_mcp_names() == set()
+    # Mis-injected MODE=self on molecule-platform → management by name wins (#7).
+    other = tmp_path / "misinjected"
+    other.mkdir()
+    ex_mis = _make_executor(mod, _write_mgmt_misinjected_self_config(other))
+    assert ex_mis._management_audience_mcp_names() == {"molecule-platform"}
+    assert ex_mis._self_audience_mcp_names() == set(), (
+        "a management server must NOT be classified self-audience even with a "
+        "mis-injected MODE=self (#7)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_misinjected_self_on_management_still_enforces_required_tool(tmp_path):
+    """#7 (gated): molecule-platform mis-injected with MODE=self, connected but
+    missing provision_workspace, must STILL raise — the mis-injected mode env
+    cannot exempt the management server from the hard gate.
+
+    NEGATIVE CONTROL: the pre-fix gate keyed the exemption on MODE=self alone, so
+    this server was exempted and the turn wrongly proceeded; the pytest.raises
+    below does not fire against pre-fix code."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_mgmt_misinjected_self_config(tmp_path))
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 1
+    _install_client_scripts(mod, [
+        _ClientScript(status_sequence=[MGMT_MISINJECTED_MISSING], response=[]),
+    ])
+    client = _StubClient()
+    await client.connect()  # loads the scripted status sequence
+    with pytest.raises(mod._McpNotReadyError) as ei:
+        await ex._await_mcp_ready(client, ["molecule-platform"])
+    assert ei.value.server == "molecule-platform"
+    assert "missing-provision_workspace" in ei.value.status
+
+
+def test_declared_specs_memoized_per_turn(tmp_path):
+    """#8 (perf): the 3 config files backing the MCP-spec helpers are read+merged
+    ONCE per turn and reused, not re-read on every helper call / heal retry. The
+    memo refreshes across turns so a hot-reloaded config is still picked up."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_concierge_plus_self_config(tmp_path))
+    # Count real disk reads via the loaders the merge calls.
+    calls = {"n": 0}
+    orig = ex._load_config_dict
+
+    def _counting_load():
+        calls["n"] += 1
+        return orig()
+
+    ex._load_config_dict = _counting_load  # type: ignore[assignment]
+    # Several helper calls within one turn → config.yaml read at most once.
+    ex._declared_extra_mcp_names()
+    ex._self_audience_mcp_names()
+    ex._management_audience_mcp_names()
+    ex._declared_extra_mcp_specs()
+    assert calls["n"] == 1, "declared specs must be memoized within a turn (#8)"
+    # New turn boundary refreshes the memo.
+    calls["n"] = 0
+    ex._declared_specs_cache = None  # what _execute_locked does at turn start
+    ex._declared_extra_mcp_names()
+    ex._declared_extra_mcp_names()
+    assert calls["n"] == 1, "the memo must refresh once per turn, then hold"
 
 
 def test_tool_names_from_mcp_server_status_handles_object_name_attr():
