@@ -1,8 +1,8 @@
 name: CI
 
-# Repository-local validation pipeline. It clones the canonical validator
-# from molecule-ci on each run, while keeping this repository's protected
-# context names and runner requirements explicit.
+# Repository-local validation pipeline. It fetches the canonical validator
+# from molecule-ci at a reviewed immutable commit on each run, while keeping
+# this repository's protected context names and runner requirements explicit.
 #
 # Four-surface migration audit (feedback_gitea_actions_migration_audit_pattern):
 #   1. YAML — no `workflow_dispatch.inputs`; no `merge_group`; preserved
@@ -12,8 +12,8 @@ name: CI
 #      no runtime dependency is fetched from PyPI/GitHub in CI.
 #   3. Token — uses auto-injected GITHUB_TOKEN (Gitea-aliased). Validator
 #      job needs only `contents: read` (no write to issues/PRs).
-#   4. Docs — anonymous git-clone of molecule-ci (no token in URL); the
-#      molecule-ci repo is public on the Gitea instance.
+#   4. Docs — anonymous exact-SHA fetch of public molecule-ci with credential
+#      helpers disabled.
 #
 # Avoid job-level `if:` guards on protected contexts: skipped required jobs
 # can remain pending in the branch-protection view. Runtime validation runs
@@ -52,6 +52,8 @@ env:
   # but pinning at the workflow level protects against a runner
   # regenerated without the config file.
   GITHUB_SERVER_URL: https://git.moleculesai.app
+  # Canonical validation tooling is reviewed and content-addressed.
+  MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
   # Public test tooling resolves normally. The molecule-ci installer acquires
   # the runtime wheel from the private Gitea index only, then supplies that
   # local wheel while resolving public dependencies. The SDK conformance job
@@ -72,11 +74,33 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      # Canonical validator script lives in molecule-ci, fetched fresh on
-      # every run. Anonymous fetch of the public molecule-ci repo — no
-      # token needed; no actions/checkout cross-repo idiosyncrasies.
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      # Canonical validator script lives in molecule-ci. Fetch the reviewed
+      # commit anonymously without consulting runner credential helpers.
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       # Secret scan — the most important check. Always runs, including
       # on fork PRs (no third-party code executes here).
       - name: Check for secrets
@@ -220,8 +244,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       - run: pip install pyyaml jsonschema packaging -q
       # Install the template's runtime dependencies so the validator's
       # check_adapter_runtime_load() can import adapter.py the same way
@@ -667,8 +714,31 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-      - name: Fetch molecule-ci canonical scripts
-        run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
+      - name: Fetch immutable molecule-ci canonical scripts
+        run: |
+          set -euo pipefail
+          CI_ROOT=".molecule-ci-canonical"
+          mkdir "$CI_ROOT"
+          git -C "$CI_ROOT" init -q
+          git -C "$CI_ROOT" remote add origin https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 git -c credential.helper= -c http.userAgent=curl/8.4.0 -C "$CI_ROOT" fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci validator fetch failed"
+            exit 1
+          fi
+          git -C "$CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci validator ref mismatch"
+            exit 1
+          fi
       # The ADR-004 conformance suite (tests_conformance/) is the OPPOSITE of the
       # unit `tests/` job: it drives the adapter through the REAL
       # molecule_runtime.adapter_base.BaseAdapter + the real boot-safe MCP probe
