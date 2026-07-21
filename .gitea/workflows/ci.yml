@@ -70,6 +70,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       # Canonical validator script lives in molecule-ci, fetched fresh on
       # every run. Anonymous fetch of the public molecule-ci repo — no
       # token needed; no actions/checkout cross-repo idiosyncrasies.
@@ -216,6 +218,8 @@ jobs:
     # protected context always reaches a terminal state.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       - run: pip install pyyaml jsonschema packaging -q
@@ -257,6 +261,7 @@ jobs:
       - name: Docker build smoke test
         if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && hashFiles('Dockerfile') != '' }}
         run: |
+          set -euo pipefail
           # Graceful skip when the runner's job-container can't reach the
           # Docker daemon (e.g. /var/run/docker.sock not mounted into the
           # act job container, or the in-container uid not in the docker
@@ -267,7 +272,27 @@ jobs:
             echo "::warning::docker daemon unreachable from runner job container — skipping Docker build smoke (runner-config gap, not a template issue)."
             exit 0
           fi
-          docker build -t template-test . --no-cache 2>&1 | tail -5 && echo "Docker build succeeded"
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          if [ -z "${GITHUB_RUN_ID:-}" ] || [ -z "${GITHUB_RUN_ATTEMPT:-}" ]; then
+            echo "::error::GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required for an isolated Docker tag"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          SMOKE_TAG="molecule-ai-workspace-claude-code-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker image rm -f "$SMOKE_TAG" >/dev/null 2>&1 || true' EXIT
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$SMOKE_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          echo "Docker build succeeded with exact runtime $ACTUAL_RUNTIME_VERSION"
 
   # --- Layer-3: real T4 tier-4 conformance gate (RFC internal#456 §11) ---
   # NOT a string-match. Builds the actual image, runs it under the EXACT
@@ -325,6 +350,8 @@ jobs:
       MOLECULE_CORE_REF: main
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - run: pip install -q pyyaml
       - name: Fetch generated t4_capabilities.yaml from the uniform contract
         run: |
@@ -342,12 +369,34 @@ jobs:
           grep '^  - name:' t4_capabilities.yaml
       - name: Build the runtime image
         run: |
+          set -euo pipefail
           if ! docker info >/dev/null 2>&1; then
             echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
             exit 1
           fi
+          if [ ! -s .runtime-version ]; then
+            echo "::error::.runtime-version is missing or empty"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          docker build -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
+          ACTUAL_RUNTIME_VERSION="$(
+            docker run --rm --entrypoint python3 "$T4_TAG" \
+              -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
+          )"
+          if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
+            echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          KEEP_T4_IMAGE=1
       - name: Run under EXACT tier-4 provisioner flags + iterate contract capabilities
         env:
           # Per-run-unique probe-id. Used by individual capability
@@ -363,6 +412,7 @@ jobs:
           set -euo pipefail
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           T4_PROBE="$T4_PROBE_NAME"
+          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
           docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true
           docker run -d \
             --name "$T4_PROBE" \
@@ -375,7 +425,6 @@ jobs:
             -e MOLECULE_T4_EGRESS_TARGETS="https://git.moleculesai.app/api/v1/version" \
             --entrypoint /bin/sh \
             "$T4_TAG" -c 'sleep 600' >/dev/null
-          trap 'docker rm -f "$T4_PROBE" >/dev/null 2>&1 || true; docker rmi -f "$T4_TAG" >/dev/null 2>&1 || true' EXIT
 
           # ----- Reproduce SaaS-mode token agent-ownership pre-state -----
           # The real entrypoint chowns /configs:agent before gosu; in this
@@ -498,6 +547,11 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Skip executable tests for external forks
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true }}
+        run: echo "::notice::dependency installation and repository tests are disabled for external forks"
       # pyyaml is the runtime dep that adapter.py's _load_providers reads
       # /configs/config.yaml through. In production it arrives transitively
       # via molecules-workspace-runtime; in this minimal test env we
@@ -507,12 +561,14 @@ jobs:
       # which is exactly the behavior that bit us 2026-04-30 when CI
       # claimed green on a build that couldn't route any third-party model).
       - run: pip install -q pytest pytest-asyncio pyyaml packaging
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
       # Tests live under tests/ with their own pytest.ini that anchors
       # rootdir there — keeps pytest from importing the package
       # __init__.py (which does `from .adapter import ...` for runtime
       # discovery and can't be satisfied without molecule_runtime
       # installed). See tests/pytest.ini for the full rationale.
       - run: python3 -m pytest tests/ -v
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
 
   conformance:
     name: Adapter conformance (ADR-004 socket)
@@ -520,6 +576,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
       - name: Fetch molecule-ci canonical scripts
         run: git clone --depth 1 https://git.moleculesai.app/molecule-ai/molecule-ci.git .molecule-ci-canonical
       # The ADR-004 conformance suite (tests_conformance/) is the OPPOSITE of the
