@@ -384,7 +384,9 @@ jobs:
             https://git.moleculesai.app/molecule-ai/molecule-ci.git
           fetched=false
           for attempt in 1 2 3; do
-            if git -c http.userAgent=curl/8.4.0 -C "$MOLECULE_CI_ROOT" \
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 \
+              git -c credential.helper= -c http.userAgent=curl/8.4.0 \
+              -C "$MOLECULE_CI_ROOT" \
               fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
               fetched=true
               break
@@ -420,14 +422,27 @@ jobs:
         run: |
           set -euo pipefail
           : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
-          if ! docker info >/dev/null 2>&1; then
-            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
-            exit 1
-          fi
           RUN_SUFFIX="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           MOLECULE_CI_ROOT="$RUNNER_TEMP/molecule-ci-mcp-e2e-$RUN_SUFFIX"
           MCP_ATTESTATION="$RUNNER_TEMP/mcp-lockstep-$RUN_SUFFIX.json"
           RUNTIME_VERSION_FILE="$RUNNER_TEMP/mcp-runtime-version-$RUN_SUFFIX"
+          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MCP_VERIFY_LOG="$RUNNER_TEMP/mcp-built-image-e2e-$RUN_SUFFIX.log"
+          MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          KEEP_T4_IMAGE=0
+          cleanup_t4_build() {
+            docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+            rm -rf -- "$MOLECULE_CI_ROOT"
+            rm -f -- "$MCP_ATTESTATION" "$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"
+            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
+              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_t4_build EXIT
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+            exit 1
+          fi
           if [ ! -s "$MCP_ATTESTATION" ] || [ ! -s "$RUNTIME_VERSION_FILE" ]; then
             echo "::error::immutable management-MCP attestation is missing"
             exit 1
@@ -442,17 +457,6 @@ jobs:
             echo "::error::attested runtime version disagrees with .runtime-version"
             exit 1
           fi
-          T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          MCP_VERIFY_LOG="$RUNNER_TEMP/mcp-built-image-e2e-$RUN_SUFFIX.log"
-          MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
-          KEEP_T4_IMAGE=0
-          cleanup_t4_build() {
-            docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
-            if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
-              docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
-            fi
-          }
-          trap cleanup_t4_build EXIT
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \

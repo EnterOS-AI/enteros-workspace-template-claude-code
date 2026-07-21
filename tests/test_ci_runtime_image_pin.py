@@ -66,7 +66,10 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     )
 
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
-        "docker build"
+        "docker info"
+    )
+    assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
+        "immutable management-MCP attestation is missing"
     )
     cleanup_body = build_script[
         build_script.index("cleanup_t4_build() {") : build_script.index(
@@ -74,6 +77,11 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
         )
     ]
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
+    assert 'rm -rf -- "$MOLECULE_CI_ROOT"' in cleanup_body
+    assert (
+        'rm -f -- "$MCP_ATTESTATION" "$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"'
+        in cleanup_body
+    )
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker create --interactive --name"
     )
@@ -124,6 +132,8 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     assert FORK_RUN in prepare_step["if"]
     assert FORK_RUN in build_step["if"]
     assert prepare_step["env"]["MOLECULE_CI_REF"] == MOLECULE_CI_REF
+    assert "GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0" in prepare
+    assert "credential.helper=" in prepare
     assert "http.userAgent=curl/8.4.0" in prepare
     assert "for attempt in 1 2 3" in prepare
     assert 'if [ "$fetched" != true ]' in prepare
