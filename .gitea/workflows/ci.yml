@@ -367,26 +367,96 @@ jobs:
           head -40 t4_capabilities.yaml
           echo "=== capability names ==="
           grep '^  - name:' t4_capabilities.yaml
-      - name: Build the runtime image
+      - name: Prepare immutable management-MCP attestation
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        env:
+          MOLECULE_CI_REF: 11b8598e5c0b3f0b1031733a8d5f6bc238f146a4
         run: |
           set -euo pipefail
-          if ! docker info >/dev/null 2>&1; then
-            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          RUN_SUFFIX="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MOLECULE_CI_ROOT="$RUNNER_TEMP/molecule-ci-mcp-e2e-$RUN_SUFFIX"
+          MCP_ATTESTATION="$RUNNER_TEMP/mcp-lockstep-$RUN_SUFFIX.json"
+          RUNTIME_VERSION_FILE="$RUNNER_TEMP/mcp-runtime-version-$RUN_SUFFIX"
+          mkdir "$MOLECULE_CI_ROOT"
+          git -C "$MOLECULE_CI_ROOT" init -q
+          git -C "$MOLECULE_CI_ROOT" remote add origin \
+            https://git.moleculesai.app/molecule-ai/molecule-ci.git
+          fetched=false
+          for attempt in 1 2 3; do
+            if GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0 \
+              git -c credential.helper= -c http.userAgent=curl/8.4.0 \
+              -C "$MOLECULE_CI_ROOT" \
+              fetch --no-tags --depth 1 origin "$MOLECULE_CI_REF"; then
+              fetched=true
+              break
+            fi
+            sleep "$attempt"
+          done
+          if [ "$fetched" != true ]; then
+            echo "::error::immutable molecule-ci verifier fetch failed"
             exit 1
           fi
-          if [ ! -s .runtime-version ]; then
-            echo "::error::.runtime-version is missing or empty"
+          git -C "$MOLECULE_CI_ROOT" checkout -q --detach FETCH_HEAD
+          ACTUAL_CI_REF="$(git -C "$MOLECULE_CI_ROOT" rev-parse HEAD)"
+          if [ "$ACTUAL_CI_REF" != "$MOLECULE_CI_REF" ]; then
+            echo "::error::immutable molecule-ci verifier ref mismatch"
             exit 1
           fi
-          EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          python3 "$MOLECULE_CI_ROOT/scripts/mcp_pin_lockstep.py" \
+            --repo-root . --json > "$MCP_ATTESTATION"
+          EXPECTED_RUNTIME_VERSION="$(python3 - "$MOLECULE_CI_ROOT" "$MCP_ATTESTATION" <<'PY'
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, str(Path(sys.argv[1]) / "scripts"))
+          from mcp_built_image_e2e import load_attestation
+
+          with Path(sys.argv[2]).open("rb") as stream:
+              sys.stdout.write(load_attestation(stream).runtime_version)
+          PY
+          )"
+          printf '%s\n' "$EXPECTED_RUNTIME_VERSION" > "$RUNTIME_VERSION_FILE"
+      - name: Build the runtime image
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          RUN_SUFFIX="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MOLECULE_CI_ROOT="$RUNNER_TEMP/molecule-ci-mcp-e2e-$RUN_SUFFIX"
+          MCP_ATTESTATION="$RUNNER_TEMP/mcp-lockstep-$RUN_SUFFIX.json"
+          RUNTIME_VERSION_FILE="$RUNNER_TEMP/mcp-runtime-version-$RUN_SUFFIX"
           T4_TAG="t4-conformance-test:${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
+          MCP_VERIFY_LOG="$RUNNER_TEMP/mcp-built-image-e2e-$RUN_SUFFIX.log"
+          MCP_VERIFY_CONTAINER="mcp-built-image-e2e-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-1}"
           KEEP_T4_IMAGE=0
           cleanup_t4_build() {
+            docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+            rm -rf -- "$MOLECULE_CI_ROOT"
+            rm -f -- "$MCP_ATTESTATION" "$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"
             if [ "$KEEP_T4_IMAGE" -ne 1 ]; then
               docker image rm -f "$T4_TAG" >/dev/null 2>&1 || true
             fi
           }
           trap cleanup_t4_build EXIT
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::docker daemon unreachable — T4 conformance gate CANNOT verify host-root reach. This is a hard gate; failing closed (do NOT treat as skip). Fix runner-config (internal#222) to unblock."
+            exit 1
+          fi
+          if [ ! -s "$MCP_ATTESTATION" ] || [ ! -s "$RUNTIME_VERSION_FILE" ]; then
+            echo "::error::immutable management-MCP attestation is missing"
+            exit 1
+          fi
+          if [ ! -f "$MOLECULE_CI_ROOT/scripts/mcp_built_image_e2e.py" ]; then
+            echo "::error::immutable final-image verifier is missing"
+            exit 1
+          fi
+          EXPECTED_RUNTIME_VERSION="$(<"$RUNTIME_VERSION_FILE")"
+          DECLARED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
+          if [ "$EXPECTED_RUNTIME_VERSION" != "$DECLARED_RUNTIME_VERSION" ]; then
+            echo "::error::attested runtime version disagrees with .runtime-version"
+            exit 1
+          fi
           docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$T4_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
             docker run --rm --entrypoint python3 "$T4_TAG" \
@@ -394,6 +464,25 @@ jobs:
           )"
           if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
             echo "::error::T4 image runtime $ACTUAL_RUNTIME_VERSION does not match .runtime-version $EXPECTED_RUNTIME_VERSION"
+            exit 1
+          fi
+          rm -f "$MCP_VERIFY_LOG"
+          docker rm -f "$MCP_VERIFY_CONTAINER" >/dev/null 2>&1 || true
+          docker create --interactive --name "$MCP_VERIFY_CONTAINER" \
+            --network none \
+            --user 1000:1000 --workdir /tmp \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 128 --memory 768m --cpus 1 \
+            --tmpfs /tmp:size=64m \
+            --entrypoint python3 "$T4_TAG" \
+            /mcp_built_image_e2e.py >/dev/null
+          docker cp "$MOLECULE_CI_ROOT/scripts/mcp_built_image_e2e.py" \
+            "$MCP_VERIFY_CONTAINER:/mcp_built_image_e2e.py"
+          docker start --attach --interactive "$MCP_VERIFY_CONTAINER" \
+            < "$MCP_ATTESTATION" | tee "$MCP_VERIFY_LOG"
+          docker rm "$MCP_VERIFY_CONTAINER" >/dev/null
+          if ! grep -qxF 'mcp-built-image-e2e:sentinel:executed' "$MCP_VERIFY_LOG"; then
+            echo "::error::final-image management-MCP verifier sentinel is missing"
             exit 1
           fi
           KEEP_T4_IMAGE=1
