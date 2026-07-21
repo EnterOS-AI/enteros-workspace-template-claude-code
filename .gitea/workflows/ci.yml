@@ -272,10 +272,16 @@ jobs:
             echo "::error::.runtime-version is missing or empty"
             exit 1
           fi
+          if [ -z "${GITHUB_RUN_ID:-}" ] || [ -z "${GITHUB_RUN_ATTEMPT:-}" ]; then
+            echo "::error::GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT are required for an isolated Docker tag"
+            exit 1
+          fi
           EXPECTED_RUNTIME_VERSION="$(tr -d '[:space:]' < .runtime-version)"
-          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t template-test . --no-cache 2>&1 | tail -5
+          SMOKE_TAG="molecule-ai-workspace-claude-code-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker image rm -f "$SMOKE_TAG" >/dev/null 2>&1 || true' EXIT
+          docker build --build-arg RUNTIME_VERSION="$EXPECTED_RUNTIME_VERSION" -t "$SMOKE_TAG" . --no-cache 2>&1 | tail -5
           ACTUAL_RUNTIME_VERSION="$(
-            docker run --rm --entrypoint python3 template-test \
+            docker run --rm --entrypoint python3 "$SMOKE_TAG" \
               -c 'from importlib.metadata import version; print(version("molecules-workspace-runtime"))'
           )"
           if [ "$ACTUAL_RUNTIME_VERSION" != "$EXPECTED_RUNTIME_VERSION" ]; then
