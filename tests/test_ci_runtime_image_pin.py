@@ -79,8 +79,8 @@ def test_t4_image_cleanup_covers_build_and_probe_failures() -> None:
     assert 'docker rm -f "$MCP_VERIFY_CONTAINER"' in cleanup_body
     assert 'rm -rf -- "$MOLECULE_CI_ROOT"' in cleanup_body
     assert (
-        'rm -f -- "$MCP_ATTESTATION" "$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"'
-        in cleanup_body
+        'rm -f -- "$MCP_ATTESTATION" "$MCP_ATTESTATION_SHA256" '
+        '"$RUNTIME_VERSION_FILE" "$MCP_VERIFY_LOG"' in cleanup_body
     )
     assert build_script.index("trap cleanup_t4_build EXIT") < build_script.index(
         "docker create --interactive --name"
@@ -121,7 +121,8 @@ def test_fork_prs_do_not_execute_repository_tests() -> None:
 
 
 def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> None:
-    steps = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["t4-conformance"]["steps"]
+    job = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["t4-conformance"]
+    steps = job["steps"]
     prepare_step = next(
         step for step in steps if "mcp_pin_lockstep.py" in step.get("run", "")
     )
@@ -131,7 +132,7 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
 
     assert FORK_RUN in prepare_step["if"]
     assert FORK_RUN in build_step["if"]
-    assert prepare_step["env"]["MOLECULE_CI_REF"] == MOLECULE_CI_REF
+    assert job["env"]["MOLECULE_CI_REF"] == MOLECULE_CI_REF
     assert "GIT_ASKPASS=/bin/false GIT_TERMINAL_PROMPT=0" in prepare
     assert "credential.helper=" in prepare
     assert "http.userAgent=curl/8.4.0" in prepare
@@ -167,6 +168,24 @@ def test_t4_runs_immutable_offline_mcp_verifier_against_same_final_image() -> No
     assert build.index("docker create") < build.index("docker cp")
     assert build.index("docker cp") < build.index("docker start")
     assert build.index("docker start") < build.index("KEEP_T4_IMAGE=1")
+
+    git_seal = (
+        'git -C "$MOLECULE_CI_ROOT" diff --quiet --no-ext-diff '
+        '--no-textconv "$MOLECULE_CI_REF" -- scripts/mcp_pin_lockstep.py '
+        "scripts/mcp_built_image_e2e.py"
+    )
+    attestation_check = 'sha256sum --check "$MCP_ATTESTATION_SHA256"'
+    checker = 'python3 "$MOLECULE_CI_ROOT/scripts/mcp_pin_lockstep.py"'
+    assert prepare.count(git_seal) == 2
+    assert build.count(git_seal) == 1
+    assert prepare.count(attestation_check) == 1
+    assert build.count(attestation_check) == 1
+    assert prepare.index(git_seal) < prepare.index(checker)
+    assert prepare.rindex(git_seal) < prepare.index(attestation_check)
+    assert prepare.index(attestation_check) < prepare.index("load_attestation")
+    assert build.index(git_seal) < build.index("docker cp")
+    assert build.index("docker cp") < build.index(attestation_check)
+    assert build.index(attestation_check) < build.index("docker start")
 
 
 def test_meta_ci_advisory_is_the_immutable_canonical_copy() -> None:
