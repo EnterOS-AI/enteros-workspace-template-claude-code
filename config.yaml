@@ -185,22 +185,42 @@ runtime_config:
     # (migrations 037 + 039) and be allowlisted in the org's
     # `organizations.llm_allowed_models` row (CheckPlatformManagedLLMAllowed
     # enforces both). Internal RFC #695 covers the catalog expansion plan.
-    - id: moonshot/kimi-k2.6
-      name: Kimi K2.6 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: moonshot/kimi-k2.5
-      name: Kimi K2.5 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: anthropic/claude-opus-4-7
-      name: Claude Opus 4.7 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: anthropic/claude-sonnet-4-6
-      name: Claude Sonnet 4.6 (Molecule platform)
-      provider: platform
-      required_env: []
+    #
+    # 2026-08-04 — PLATFORM MENU NARROWED TO MINIMAX-ONLY (operator directive).
+    # WITHDRAWN, COMMENTED NOT DELETED — restore by uncommenting once the
+    # vendor account is funded and the operator lifts the directive.
+    #   * moonshot/* — the platform's Moonshot vendor account
+    #     (org-bd1467ed2be74ef3a0bfa43941abf167) is SUSPENDED for non-payment:
+    #     every moonshot/* platform call returns HTTP 429
+    #     exceeded_current_quota_error in ~200ms, 100% of the time. A paying
+    #     client burned 2,451 failed calls over 16h while every health signal
+    #     read green — and because these ids stayed user-selectable, a customer
+    #     could provision a permanently DEAD workspace.
+    #   * anthropic/* — still returns 200 upstream, but withdrawn under the SAME
+    #     standing "minimax is the platform family everywhere" directive.
+    # Mirrors the registry SSOT: molecule-ai-sdk#203
+    # (contracts/llm-registry/llm-registry.yaml) + molecule-controlplane#2850
+    # (internal/providers/providers.yaml runtimes.claude-code platform arm),
+    # which withdrew the same ids. A withdrawn id now fails DeriveProvider
+    # CLOSED -> 422 UNREGISTERED_MODEL_FOR_RUNTIME at workspace-create, which is
+    # the intent: refused at selection instead of a silently dead workspace.
+    # - id: moonshot/kimi-k2.6
+    #   name: Kimi K2.6 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: moonshot/kimi-k2.5
+    #   name: Kimi K2.5 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: anthropic/claude-opus-4-7
+    #   name: Claude Opus 4.7 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: anthropic/claude-sonnet-4-6
+    #   name: Claude Sonnet 4.6 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    #
     # NOTE — claude-haiku entry pending CTO sign-off on snapshot id.
     # CP price catalog (migration 037) lists the full snapshot id
     # `claude-haiku-4-5-20251001` rather than the `claude-haiku-4-5`
