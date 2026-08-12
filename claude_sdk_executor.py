@@ -590,6 +590,16 @@ _CONTEXT_OVERFLOW_PATTERNS = (
     "token limit",            # proxy: "token limit 262144 requested 268132"
     "context window",
     "context_length_exceeded",
+    # The human-readable form the runtime emits when compaction gives up:
+    #   "Context length exceeded (182,430 tokens). Cannot compress further."
+    # The snake_case entry above is the upstream API error CODE and does NOT
+    # match it, so before this line `_is_context_overflow` returned False for
+    # the runtime's own overflow message: the auto-heal never fired, the
+    # bloated transcript was never purged, and the workspace stayed wedged
+    # through every restart. Observed on a live tier-4 agent 2026-08-04..12 —
+    # 8 days of zero output, token count still GROWING across a restart AND a
+    # reset (181,917 -> 182,430) because nothing ever cleared it.
+    "context length exceeded",
     "maximum context length",
     "exceeds the context",
     "input length and `max_tokens`",
