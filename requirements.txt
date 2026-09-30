@@ -25,4 +25,15 @@ python-multipart>=0.0.27
 # Claude Agent SDK — programmatic API to Claude Code engine.
 # Replaces CLI subprocess approach (no more --print, --resume, json parsing).
 # The Claude Code CLI is still pre-installed via npm because the SDK uses it under the hood.
-claude-agent-sdk>=0.1.58
+#
+# EXACT pin. scripts/patch_claude_sdk_2_1_150.py rewrites a block of the
+# installed claude_agent_sdk/_internal/query.py at image build time and exits 3
+# when that block is missing. claude-agent-sdk 0.2.140 (2026-08-18) rewrote the
+# block. With the previous `>=0.1.58` range each image build installed the
+# newest SDK; on 2026-09-29 that was 0.2.162, and the build failed at that step.
+# 0.2.137 is the version in the staging image promoted on 2026-08-13, built
+# from 8845b71: workspace-template-claude-code@sha256:
+# 12c7f00def15f0a2f81e1ad597902bed831eb011238cd3c9bf79dad92d141eed
+# Moving the pin means re-checking the hotfix against the new query.py first;
+# tests/test_claude_agent_sdk_pin.py holds the verified version.
+claude-agent-sdk==0.2.137
