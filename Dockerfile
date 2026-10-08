@@ -170,6 +170,17 @@ COPY config.yaml .
 # from its workspace package and publishes the next runtime version to
 # the internal Gitea package registry, the template is the sole source.
 COPY claude_sdk_executor.py .
+# Cross-repo MCP-plugin delivery contract (core#3080), the SSOT for the
+# management-MCP verb the readiness gate requires. The executor resolves it
+# RELATIVE TO ITSELF (os.path.dirname(__file__)/contracts/...), i.e.
+# /app/contracts/ in this image. Without this COPY the file is absent from
+# every published image: _load_platform_mcp_required_tool() logs a
+# FileNotFoundError traceback at EVERY import and silently uses its
+# hard-coded fallback, so the bundled contract (and the drift gate that keeps
+# it in sync with the SDK) never reaches production. Same trap as config.yaml
+# above — guarded by the publish-image "bundled contract" smoke step and
+# tests/test_extra_mcp_servers.py.
+COPY contracts/mcp-plugin-delivery.contract.json contracts/mcp-plugin-delivery.contract.json
 
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter
