@@ -274,6 +274,52 @@ jobs:
           '
           echo "::notice::${IMAGE}: all top-level modules import cleanly"
 
+      - name: Smoke test — bundled MCP delivery contract reaches the executor
+        # The import smoke above passes even when claude_sdk_executor cannot
+        # find /app/contracts/mcp-plugin-delivery.contract.json: the loader
+        # catches the FileNotFoundError, logs a traceback and falls back to a
+        # hard-coded default, so the SSOT contract silently never reached
+        # production (every publish up to 2026-10-08 carried that traceback).
+        # Fail loudly here instead: the file must be bundled AND the executor
+        # must have resolved the required tool from it, not from the fallback.
+        shell: bash
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}:sha-${{ needs.resolve-version.outputs.sha }}
+        run: |
+          set -eu
+          docker run --rm -i \
+            -e WORKSPACE_ID=smoke-test \
+            -e CLAUDE_CODE_OAUTH_TOKEN=sk-fake-smoke-token \
+            -e ANTHROPIC_API_KEY=sk-fake-smoke-key \
+            -e OPENAI_API_KEY=sk-fake-smoke-key \
+            -w /app --entrypoint python3 "${IMAGE}" - <<'PY'
+          import io, json, logging, os, sys
+
+          CONTRACT = "/app/contracts/mcp-plugin-delivery.contract.json"
+          # Capture the executor's import-time logging so the fallback warning
+          # becomes a hard failure instead of noise in the job log.
+          buf = io.StringIO()
+          logging.basicConfig(stream=buf, level=logging.WARNING, force=True)
+          import claude_sdk_executor as executor  # noqa: E402
+
+          if not os.path.isfile(CONTRACT):
+              print(f"::error::{CONTRACT} is not bundled in the image (Dockerfile COPY missing)")
+              sys.exit(1)
+          with open(CONTRACT, encoding="utf-8") as f:
+              want = json.load(f)["required_tool"]
+          captured = buf.getvalue()
+          if "falling back to hard-coded default" in captured:
+              print("::error::claude_sdk_executor fell back to its hard-coded required tool instead of the bundled contract")
+              print(captured)
+              sys.exit(1)
+          got = executor._PLATFORM_MCP_REQUIRED_TOOL
+          if got != want:
+              print(f"::error::executor required tool {got!r} != bundled contract required_tool {want!r}")
+              sys.exit(1)
+          print(f"bundled contract OK: {CONTRACT} required_tool={want}")
+          PY
+          echo "::notice::${IMAGE}: executor resolved the management-MCP required tool from the bundled contract"
+
       - name: Publish image to registry (chunked pusher through CF tunnel)
         id: push
         # Smoke passed. Publish the locally-loaded 1.7-2.4GB image to
