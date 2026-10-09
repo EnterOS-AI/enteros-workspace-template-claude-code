@@ -200,6 +200,10 @@ _OVERFLOW_TEXTS = [
     "Prompt is too long",                         # Anthropic-native 400
     "input length and `max_tokens` exceed context window",
     "This model's maximum context length is 262144 tokens",
+    # Regression guard: the human-readable string the runtime itself emits
+    # when compaction gives up. Only the snake_case API code was listed, so
+    # this went unmatched and wedged a live agent for 8 days.
+    "Context length exceeded (182,430 tokens). Cannot compress further.",
 ]
 
 

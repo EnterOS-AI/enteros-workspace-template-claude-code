@@ -301,8 +301,17 @@ providers:
     # base_url_anthropic; OpenAI-protocol runtimes (hermes/codex/openclaw) use
     # base_url_template. Previously both pointed at the anthropic surface — a
     # PR-1 simplification when only claude-code referenced platform.
-    base_url_template: "https://api.moleculesai.app/api/v1/internal/llm/openai/v1"
-    base_url_anthropic: "https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1"
+    #
+    # The CP base URL is templated so CI can point the serving-e2e gate at
+    # staging-api (using the same canary admin_token the deploy-pipeline smoke
+    # resolves) while production tenants continue to get the production CP URL
+    # from their workspace's CP_BASE_URL env.
+    base_url_template: "{cp_base_url}/api/v1/internal/llm/openai/v1"
+    base_url_anthropic: "{cp_base_url}/api/v1/internal/llm/anthropic/v1"
+    endpoint_vars:
+      cp_base_url:
+        env: CP_BASE_URL
+        default: "https://api.moleculesai.app"
     auth_env: [MOLECULE_LLM_USAGE_TOKEN]
     auth_token_env: ANTHROPIC_API_KEY
     # Adapter routes kimi- / moonshot/ through platform by default. No bare
@@ -381,6 +390,25 @@ providers:
     # inferLLMProvider), so this cannot change live routing.
     model_prefix_match: "^kimi-"
     model_aliases: []
+    # THINKING-PARAM POLICY (serving-e2e RED fix, 2026-06-29; EMPIRICALLY VERIFIED
+    # against the live api.kimi.com/coding gateway). The kimi-for-coding model
+    # REJECTS an Anthropic-protocol request that OMITS the `thinking` object:
+    #   HTTP 400 {"error":{"type":"invalid_request_error",
+    #     "message":"invalid thinking: only type=enabled is allowed for this model"}}
+    # Observed live: no `thinking` field -> 400; thinking:{type:enabled} -> 200
+    # (reasoning model: answers with a leading `thinking` block); thinking:
+    # {type:disabled} -> 200 (plain text). So the true upstream rule is "a
+    # `thinking` object MUST be present", and {type:enabled} is the shape the
+    # error names. This is a per-model REQUEST-SHAPING fact, so it lives on the
+    # SSOT entry (not a hardcoded model-name special-case). Consumers that DIAL
+    # this entry's endpoint — the serving-e2e gate (via ResolveEndpoint) and the
+    # BYOK claude-code adapter — call Provider.NormalizeThinking, which injects
+    # thinking:{type:enabled} when the caller supplied NO thinking object, and
+    # leaves an explicit caller-set thinking (enabled OR disabled) untouched.
+    # NOTE: the CP proxy is NOT a consumer — it never routes to this gateway (it
+    # is a verbatim passthrough that resolves bare kimi-* to the moonshot vendor /
+    # api.moonshot.ai; see internal/handlers/llm_proxy.go inferLLMProviderLegacy).
+    thinking_policy: require_enabled
 
   # ===========================================================================
   # DeepSeek — adapter + canvas. proxy has no arm; DB has no rows.
@@ -424,10 +452,10 @@ providers:
     model_aliases: []
 
   # Google Vertex AI — served via the Molecule CP LLM proxy (NOT on-box ADC).
-  # google-adk routes ALL Gemini through the proxy, which mints a Vertex token
-  # server-side over Workload Identity Federation (AWS -> GCP STS -> SA; see
-  # internal/vertexauth + llm_proxy.go google/vertex case) and meters usage to
-  # org credits. The former on-box ADC delivery (a NON-SECRET external_account
+  # The proxy's Vertex path mints a token server-side over Workload Identity
+  # Federation (AWS -> GCP STS -> SA; see internal/vertexauth + llm_proxy.go
+  # google/vertex case) and meters usage to org credits. The former on-box ADC
+  # delivery (a NON-SECRET external_account
   # cred-config written to /configs/gcp-adc.json via GOOGLE_APPLICATION_CREDENTIALS,
   # injected by the provisioner) was REMOVED: a tenant has EC2 root and could
   # have used that credential to call Vertex DIRECTLY, bypassing metering
@@ -849,10 +877,12 @@ runtimes:
         models:
           - claude-sonnet-4-6
           - claude-opus-4-7
+          - claude-opus-4-8
           - claude-haiku-4-5
           - claude-sonnet-4-5
           - anthropic:claude-sonnet-4-6
           - anthropic:claude-opus-4-7
+          - anthropic:claude-opus-4-8
           - anthropic:claude-haiku-4-5
           - anthropic:claude-sonnet-4-5
       - name: kimi-coding
@@ -882,14 +912,67 @@ runtimes:
       # drift gate (molecule-ci validate-workspace-template) enforces the
       # template can offer no platform model absent from this set.
       - name: platform
+        # SELECTABLE (`models`) vs OWNED (`withdrawn_models`) - read this once;
+        # every other platform arm below refers back here. Mirrors the SDK SSOT
+        # (molecule-ai-sdk contracts/llm-registry/llm-registry.yaml, sdk#204).
+        #
+        # 2026-08-04 (morning) the four platform arms were narrowed to
+        # minimax-only after the platform's Moonshot vendor account
+        # (org-bd1467ed2be74ef3a0bfa43941abf167) was SUSPENDED for non-payment:
+        # every moonshot/* platform call returns HTTP 429
+        # exceeded_current_quota_error in ~200ms, 100% of the time. A paying
+        # client's SEO agent burned 2,451 failed calls over 16h while every
+        # health signal read green, and because the ids stayed user-selectable
+        # any customer could provision a permanently dead workspace.
+        #
+        # That narrowing was WRONG IN TWO WAYS, corrected here:
+        #
+        # (1) It withdrew five ids that were HEALTHY. Live probe of the CP
+        #     metered proxy on 2026-08-04 (staging, org-scoped bearer):
+        #         anthropic/claude-opus-4-7    HTTP 200
+        #         anthropic/claude-opus-4-8    HTTP 200
+        #         anthropic/claude-sonnet-4-6  HTTP 200
+        #         openai/gpt-5.4               HTTP 200
+        #         openai/gpt-5.4-mini          HTTP 200
+        #         moonshot/kimi-k2.6           HTTP 429  "account ... is suspended"
+        #         moonshot/kimi-k2.5           HTTP 429  "account ... is suspended"
+        #     Only the two moonshot ids were dead. The other five are RESTORED to
+        #     `models` below (and on the codex arm): workspaces already pinned to
+        #     them serve 200, so there is nothing to protect anyone from.
+        #
+        # (2) It conflated SELECTABILITY with OWNERSHIP. Dropping an id from an
+        #     arm made it unresolvable, so a workspace ALREADY pinned to it lost
+        #     MOLECULE_RESOLVED_PROVIDER - and with it the metered-proxy env AND
+        #     the raw-vendor-key strip (local_docker_workspace.go
+        #     applyLocalLLMOverride). The agent was then handed a stale
+        #     MINIMAX_API_KEY / CLAUDE_CODE_OAUTH_TOKEN and called the vendor
+        #     DIRECTLY: spend never metered, never billed. Withdrawing ids to stop
+        #     unmetered spend created a different unmetered-spend path.
+        #
+        # `withdrawn_models` is the fix for (2), and is the ONLY correct way to
+        # retire a platform id from now on. An id listed there is:
+        #   * NOT on the menu - absent from ModelsForRuntime, so the canvas does
+        #     not offer it and the create-time registered-model check refuses it
+        #     (the "permanently dead workspace" hazard stays closed), and
+        #   * STILL OWNED - DeriveProviderForPin resolves it, so an existing pin
+        #     keeps the metered proxy bearer, keeps getting its raw vendor keys
+        #     stripped, and fails LEGIBLY with the vendor's own 429 through the
+        #     meter.
+        # It MUST be disjoint from `models` on the same runtime (parseManifest
+        # fails closed otherwise). The strict DeriveProvider still refuses it, so
+        # selection-time gates are unchanged.
         models:
           - anthropic/claude-opus-4-7
+          - anthropic/claude-opus-4-8
           - anthropic/claude-sonnet-4-6
-          - moonshot/kimi-k2.6
-          - moonshot/kimi-k2.5
           - minimax/MiniMax-M2.7
           - minimax/MiniMax-M2.7-highspeed
           - minimax/MiniMax-M3
+        withdrawn_models:
+          # DEAD upstream (suspended vendor account) - unselectable, still owned.
+          # Move back into `models` once the account is funded.
+          - moonshot/kimi-k2.6
+          - moonshot/kimi-k2.5
       # NAME-ONLY BYOK arms (cp#529): zero model ids → add NOTHING to the
       # platform menu (ModelsForRuntime), but wire these CONFIRMED-NON-PLATFORM
       # providers into claude-code's NATIVE prefix-routing set so the bare BYOK
@@ -901,18 +984,33 @@ runtimes:
       - name: deepseek
       - name: xiaomi-mimo
 
-  # hermes: native Kimi only (kimi-coding gateway). hermes-agent owns its own
-  # broad provider matrix, but the CTO native matrix for the Molecule
-  # platform constrains it to kimi.
+  # hermes: native Kimi PLUS the shared platform MiniMax family. hermes-agent
+  # owns its own broad provider matrix; the Molecule platform arm carries Kimi
+  # (hermes's historical native platform family) AND minimax/MiniMax-M2.7(+
+  # siblings) so the ONE shared platform default model (MOLECULE_LLM_DEFAULT_MODEL
+  # = minimax/MiniMax-M2.7) routes platform-managed on a hermes concierge exactly
+  # as it does on claude-code/codex/openclaw — closing the cross-runtime gap that
+  # otherwise mis-classified the shared default as BYOK (byok-minimax) on hermes.
   hermes:
     providers:
       - name: kimi-coding
         models: [kimi-coding/kimi-k2]
-      # Platform-managed Kimi (hermes's native platform family). Routed via
-      # the proxy OpenAI-compat surface; see the template's
-      # scripts/derive-platform-llm.sh.
+      # Platform-managed (no tenant key; Molecule owns billing). Kimi is hermes's
+      # native platform family; the minimax/* ids are the SHARED platform default
+      # family (parity with claude-code/codex/openclaw). Routed via the proxy
+      # OpenAI-compat surface; see the template's scripts/derive-platform-llm.sh.
       - name: platform
+        # Kimi was hermes's historical native platform family; it is DEAD on the
+        # platform key (suspended vendor account - see the claude-code arm above
+        # for the full incident note and the models/withdrawn_models contract),
+        # so the shared minimax family is the whole selectable platform menu here.
+        # The two moonshot ids stay OWNED via withdrawn_models so an existing
+        # hermes workspace pinned to one is still metered and still stripped.
         models:
+          - minimax/MiniMax-M2.7
+          - minimax/MiniMax-M2.7-highspeed
+          - minimax/MiniMax-M3
+        withdrawn_models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
       # NAME-ONLY BYOK arms (cp#529): zero model ids → no addition to the
@@ -992,12 +1090,39 @@ runtimes:
       # Responses surface (/internal/llm/openai/v1/responses) that the Codex
       # CLI (0.130+, Responses-API-only) requires. The codex template adapter
       # routes these via that surface (provider_config.py platform provider,
-      # auth_mode=openai_compat_responses, wire_api=responses). Default
-      # mirrors the deploy's MOLECULE_LLM_DEFAULT_MODEL (openai/gpt-5.4-mini).
+      # auth_mode=openai_compat_responses, wire_api=responses). The deploy's
+      # MOLECULE_LLM_DEFAULT_MODEL SSOT (Infisical /shared/controlplane/llm) is
+      # minimax/MiniMax-M2.7 — the openai/gpt-* ids here are the codex-native
+      # platform menu, not the shared default (see task #83 note below).
+      #
+      # task #83 (CTO 2026-06-24): MiniMax is the PLATFORM-MANAGED default for
+      # ALL runtimes (cheaper, token-plan prepaid; BYOK optional), so the
+      # concierge default `minimax/MiniMax-M2.7` must derive to the closed
+      # `platform` provider (IsPlatform=true → platform_managed billing,
+      # required_env=[]) for codex too — NOT byok-minimax (which needs a tenant
+      # key). These EXACT `minimax/...` ids are listed here so DeriveProvider's
+      # exact-id step (authoritative, beats prefix) picks `platform` even though
+      # byok-minimax's `(?i)^(minimax[:/]|codex-minimax-)` prefix also matches
+      # them — exactly how claude-code's platform arm carries them. They route
+      # via the proxy's MiniMax upstream (ResolveUpstream maps `minimax/` →
+      # the `minimax` catalog entry's api.minimax.io). The BYOK
+      # `codex-minimax-m2.7` token-plan id stays on byok-minimax below (its
+      # `codex-minimax-` leg), so the platform default and the BYOK opt-in
+      # coexist without overlap.
       - name: platform
+        # This arm never carried a moonshot id, so NOTHING here was ever dead -
+        # the openai/* ids were collateral in the 2026-08-04 narrowing and are
+        # RESTORED (live probe: openai/gpt-5.4 and openai/gpt-5.4-mini both HTTP
+        # 200 through the metered proxy; see the claude-code arm above). No
+        # withdrawn_models here: there is nothing to withdraw.
+        # codex's OWN default_model (gpt-5.5) is unaffected either way - it lives
+        # on the BYOK openai-subscription / openai-api arms below.
         models:
           - openai/gpt-5.4
           - openai/gpt-5.4-mini
+          - minimax/MiniMax-M2.7
+          - minimax/MiniMax-M2.7-highspeed
+          - minimax/MiniMax-M3
       # NAME-ONLY BYOK arm (cp#529): the codex template offers a BYOK MiniMax
       # token-plan model `codex-minimax-m2.7` (its `minimax-token-plan` provider:
       # base_url api.minimax.io, tenant MINIMAX_API_KEY, model_id_override
@@ -1020,10 +1145,65 @@ runtimes:
       # Platform-managed Kimi. Note the slash form (moonshot/...) here vs the
       # BYOK colon form (moonshot:...) above — openclaw's adapter uses colon
       # ids natively; the platform path normalizes to the proxy's slash form.
+      #
+      # task #83 (CTO 2026-06-24): MiniMax is the PLATFORM-MANAGED default for
+      # ALL runtimes (cheaper, token-plan prepaid; BYOK optional). openclaw's
+      # default model is MiniMax, so its concierge default `minimax/MiniMax-M2.7`
+      # must derive to the closed `platform` provider (IsPlatform=true →
+      # platform_managed billing, required_env=[]) — NOT byok-minimax (which
+      # needs a tenant key). These EXACT `minimax/...` ids (slash form, the
+      # proxy's platform spelling) are listed here so DeriveProvider's exact-id
+      # step (authoritative, beats prefix) picks `platform` even though
+      # byok-minimax's `(?i)^(minimax[:/]|codex-minimax-)` prefix also matches
+      # them. They route via the proxy's MiniMax upstream (ResolveUpstream maps
+      # `minimax/` → the `minimax` catalog entry's api.minimax.io). The BYOK
+      # colon form `minimax:MiniMax-M2.7` stays on byok-minimax below, so the
+      # platform default and the BYOK opt-in coexist without overlap.
       - name: platform
+        # 2026-08-04 — openclaw's narrowing is DEFERRED. The other three runtimes'
+        # platform arms above ARE narrowed to minimax-only; this one is deliberately
+        # NOT, and the two moonshot slash ids below are still listed.
+        #
+        # WHY (this is NOT an oversight — it is a cross-repo GATE CYCLE):
+        #   * cp `verify-template-models` asserts template ⊆ registry, reading the
+        #     openclaw template's config.yaml from ITS main. Narrowing this arm while
+        #     that template still offers moonshot/kimi-k2.{5,6} reds it, so this PR
+        #     cannot merge.
+        #   * the openclaw template repo's `verify-providers-projection` asserts the
+        #     reverse, registry ⊆ template, using its SYNCED copy of THIS file — and
+        #     `sync-providers-yaml` pins that copy byte-identical to controlplane
+        #     main. So the template cannot be trimmed until this file lands first.
+        #   Each side's own gate demands the other side move first. No ordering
+        #   satisfies both, and neither may be force-merged or disabled.
+        #
+        # WHY DEFERRING IS SAFE: the create-time enforcer is molecule-core's
+        # validateRegisteredModelForRuntime, which reads the SDK SSOT
+        # (go.moleculesai.app/sdk/gen/go/llmregistry) DIRECTLY, not this mirror.
+        # molecule-ai-sdk#203 already withdrew these ids on openclaw, so once core
+        # adopts that pin (molecule-core#5056) an openclaw create on
+        # moonshot/kimi-k2.6 is REFUSED 422 UNREGISTERED_MODEL_FOR_RUNTIME — the
+        # user-facing hazard closes with or without this arm. What stays open here
+        # is only CP-side proxy routing for an id no new workspace can hold.
+        # The CARVEOUT_RUNTIME_ARM_MODELS carve-out in
+        # .gitea/scripts/llm_registry_semantic_diff.py is what lets this mirror
+        # legitimately lag the SSOT on a runtime arm; the resulting delta is
+        # reported as a NOTICE by contract-ssot-sync, by design.
+        #
+        # TO FINISH: break the cycle (operator call), then uncomment nothing here —
+        # just delete the two ids below and trim the openclaw template in the same
+        # window. Tracked by the openclaw template PR left open at
+        # molecule-ai-workspace-template-openclaw#312, which is green on every check
+        # EXCEPT sync-providers-yaml and needs only a re-run once this arm narrows.
+        #
+        # NOTE: openclaw's BYOK kimi-coding arm keeps the COLON forms
+        # (moonshot:kimi-k2.*) — those bill the TENANT's own KIMI_API_KEY against
+        # api.kimi.com/coding and are unaffected by the platform account suspension.
         models:
           - moonshot/kimi-k2.6
           - moonshot/kimi-k2.5
+          - minimax/MiniMax-M2.7
+          - minimax/MiniMax-M2.7-highspeed
+          - minimax/MiniMax-M3
       # NAME-ONLY BYOK arms (cp#529): zero model ids → no platform-menu change,
       # but wire openclaw's CONFIRMED-NON-PLATFORM passthroughs into its NATIVE
       # prefix-routing set so the BYOK colon/slash ids the openclaw template
@@ -1039,45 +1219,3 @@ runtimes:
       - name: byok-openai
       - name: byok-minimax
       - name: groq
-
-
-  # google-adk: Gemini via Vertex AI, keyless ADC (Workload Identity
-  # Federation; provisioner cp#416 + envs.yaml). The google vendor entry
-  # in the top-level providers: list supplies auth/model-prefix metadata;
-  # this runtimes entry declares the selectable model set.
-  google-adk:
-    providers:
-      # Platform-managed (keyless, metered) Gemini via the Molecule LLM proxy ->
-      # Vertex AI (server-side WIF mint; NO credential on the tenant box — the
-      # keyless-Vertex leak fix). Resolves to the closed `platform` provider ->
-      # IsPlatform=true -> platform_managed billing + required_env=[] (derived).
-      # The org-compliant default. The runtime translates the `platform:` select
-      # id to the bare wire id the proxy routes to Vertex.
-      - name: platform
-        models:
-          - platform:gemini-2.5-pro
-          - platform:gemini-2.5-flash
-      # API-key BYOK arm: AI Studio (the tenant's OWN GOOGLE_API_KEY).
-      #
-      # The colon-namespaced `google_genai:` ids are the BYOK spelling the
-      # template's models[] offers (template-google-adk main:
-      # `google_genai:gemini-2.5-pro` / `-flash`, AI-Studio BYOK; the default is
-      # the platform arm above). The runtime adapter (_routing.resolve_model)
-      # treats `google_genai`/`google`/`gemini` as the SAME AI-Studio prefix
-      # family — it strips the prefix to the bare `gemini-2.5-pro` and serves it
-      # via ADK LlmAgent on the AI-Studio backend (GOOGLE_API_KEY) — so both the
-      # bare and `google_genai:` forms resolve to THIS `google` arm. The bare ids
-      # stay (registry-projection / canvas form); the `google_genai:` ids are
-      # ADDED because the LIVE core check is EXACT membership in ModelsForRuntime,
-      # NOT the `^gemini-` prefix (model_registry_validation.go), so without these
-      # exact entries a template BYOK create 422s UNREGISTERED_MODEL_FOR_RUNTIME.
-      # (This corrects the template's own stale comment that `google_genai:` is
-      # covered by the `^gemini-` prefix — it is not; `^gemini-` matches only the
-      # BARE id.) Vertex was intentionally dropped from the runtime arm (cp#514);
-      # the template no longer offers `vertex:`, so no vertex arm is added here.
-      - name: google
-        models:
-          - gemini-2.5-pro
-          - gemini-2.5-flash
-          - google_genai:gemini-2.5-pro
-          - google_genai:gemini-2.5-flash

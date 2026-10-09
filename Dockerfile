@@ -20,12 +20,11 @@ FROM python:3.11-slim
 #   uid and does NOT change /configs token ownership (still uid-1000,
 #   enforced by entrypoint.sh + the Layer-3 conformance gate).
 #
-# rsync (added cp#326 2026-05-26):
-#   entrypoint.sh's restore_from_secondary_volume() rsyncs the prior
-#   workspace's /configs, /workspace, and /home/agent/.claude back
-#   into root on first boot from the snapshot-restored secondary
-#   volume CP attaches at /dev/xvdb. Without rsync the restore path
-#   silently no-ops and the workspace boots with empty state.
+# rsync (legacy restore compatibility, cp#326):
+#   when a restored secondary device is present at /dev/xvdb,
+#   entrypoint.sh copies /configs, /workspace, and /home/agent/.claude
+#   into the container root on first boot. Without rsync that optional
+#   compatibility path would silently no-op.
 #
 # e2fsprogs (added cp#326 2026-05-26):
 #   provides /sbin/blkid + /sbin/e2label so the restore code can
@@ -77,25 +76,66 @@ RUN set -eux; \
 
 WORKDIR /app
 
-# RUNTIME_VERSION is forwarded from the reusable publish workflow as
+# RUNTIME_VERSION is forwarded from this repository's publish-image workflow as
 # a docker build-arg. When set (cascade-triggered builds), it's the
-# exact runtime version PyPI just published. Including it as an ARG
+# exact runtime version the private registry just published. Including it
+# as an ARG
 # changes the cache key for the pip install layer below — without
 # this, identical Dockerfile + identical requirements.txt content
 # would let docker reuse the cached layer with the previous version
 # baked in (the cache trap that bit us 5x on 2026-04-27).
 # Empty default = falls back to whatever requirements.txt resolves to.
 ARG RUNTIME_VERSION=
-ARG PIP_INDEX_URL=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
+ARG MOLECULE_RUNTIME_INDEX=https://git.moleculesai.app/api/packages/molecule-ai/pypi/simple/
 
-# Install Python deps. The RUNTIME_VERSION ARG is a no-op argument to
-# the RUN command itself but its presence as a declared ARG above
-# means buildx hashes it into the cache key.
+# Parse and remove the runtime requirement before the public solve so a direct
+# reference can never bypass private acquisition. Public requirements and
+# runtime transitive dependencies are then resolved together from pip's
+# default public source; the local wheel fixes the runtime candidate for that
+# single solve. --isolated keeps ambient pip configuration and index
+# environment variables out of both operations.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" -r requirements.txt && \
-    if [ -n "${RUNTIME_VERSION}" ]; then \
-      pip install --no-cache-dir --index-url "${PIP_INDEX_URL}" --upgrade "molecule-ai-workspace-runtime==${RUNTIME_VERSION}"; \
-    fi
+COPY scripts/prepare_runtime_requirements.py /tmp/prepare_runtime_requirements.py
+RUN set -eu; \
+    runtime_project="molecules-workspace-runtime"; \
+    rm -rf /tmp/molecule-runtime; \
+    rm -f /tmp/template-requirements.txt; \
+    mkdir -p /tmp/molecule-runtime; \
+    runtime_requirement="$(python3 /tmp/prepare_runtime_requirements.py \
+      requirements.txt /tmp/template-requirements.txt \
+      --runtime-version "${RUNTIME_VERSION}")"; \
+    if [ "${runtime_requirement#${runtime_project}}" = "${runtime_requirement}" ]; then \
+      echo "ERROR: runtime requirement was not canonicalized" >&2; \
+      exit 1; \
+    fi; \
+    pip download --isolated --only-binary=:all: --no-deps \
+      --index-url "$MOLECULE_RUNTIME_INDEX" \
+      --dest /tmp/molecule-runtime "${runtime_requirement}"; \
+    set -- /tmp/molecule-runtime/*.whl; \
+    if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then \
+      echo "ERROR: private runtime acquisition did not produce exactly one wheel" >&2; \
+      exit 1; \
+    fi; \
+    pip install --isolated --no-cache-dir /tmp/molecule-runtime/*.whl \
+      -r /tmp/template-requirements.txt; \
+    rm -rf /tmp/molecule-runtime /tmp/template-requirements.txt
+
+# --- Pre-bake the management-MCP server (base-runtime helper; task #54) ---
+# The kind=platform concierge launches `npx --prefer-offline @molecule-ai/mcp-server@<PIN>`
+# in a HARD-deadline enumeration spawn at boot; without a warm cache it cold-pulls
+# -> ETARGET / CF-WAF throttle -> #1027 fail-close (launch-side of RCA #2970). The bake
+# LOGIC + the pinned version now live ONCE in the base runtime (molecule_runtime, pinned
+# to the SDK contract management_mcp_server block) — this template DELEGATES to the shared
+# helper instead of carrying its own bake + ARG (ADR-004: SDK contract -> base-runtime
+# default -> per-adapter override-if-needed; no per-template fork). Replaces the former
+# per-template bake that had drifted to a STALE 1.8.1 pin (the plugin fragment pins 1.8.2)
+# — the SSOT delegation always bakes the contract pin. claude-code ships node globally on
+# PATH, so no MOLECULE_PREBAKE_NODE_BIN override. The helper's build-time OFFLINE
+# self-check fails the image if the bake is broken.
+USER agent
+RUN bash "$(python3 -c 'import molecule_runtime, os; print(os.path.dirname(molecule_runtime.__file__))')/scripts/prebake-mgmt-mcp.sh"
+USER root
+
 
 # MOLECULE-HOTFIX (claude-code 2.1.150 / agent-sdk 0.2.84): apply in-place
 # SDK patch so the receive_messages loop treats is_error+subtype=success as
@@ -110,7 +150,7 @@ RUN python3 /tmp/patch_claude_sdk_2_1_150.py && rm /tmp/patch_claude_sdk_2_1_150
 COPY adapter.py .
 COPY __init__.py .
 # Provider registry. The adapter's _load_providers walks 4 paths:
-#   1. /opt/adapter/config.yaml          — provisioner-managed canonical
+#   1. /opt/adapter/config.yaml          — legacy/self-managed compatibility
 #   2. os.path.dirname(__file__)/config.yaml  — alongside adapter.py (this image)
 #   3. ${WORKSPACE_CONFIG_PATH}/config.yaml   — workspace per-instance overrides
 #   4. _BUILTIN_PROVIDERS                — oauth + anthropic-api only
@@ -127,9 +167,20 @@ COPY config.yaml .
 # Python's import system picks the local /app/claude_sdk_executor.py
 # before the same-named module that older molecule-runtime versions
 # also shipped under site-packages. Once molecule-core drops the file
-# from its workspace/ package and bumps the runtime PyPI version, the
-# template will be the sole source of truth.
+# from its workspace package and publishes the next runtime version to
+# the internal Gitea package registry, the template is the sole source.
 COPY claude_sdk_executor.py .
+# Cross-repo MCP-plugin delivery contract (core#3080), the SSOT for the
+# management-MCP verb the readiness gate requires. The executor resolves it
+# RELATIVE TO ITSELF (os.path.dirname(__file__)/contracts/...), i.e.
+# /app/contracts/ in this image. Without this COPY the file is absent from
+# every published image: _load_platform_mcp_required_tool() logs a
+# FileNotFoundError traceback at EVERY import and silently uses its
+# hard-coded fallback, so the bundled contract (and the drift gate that keeps
+# it in sync with the SDK) never reaches production. Same trap as config.yaml
+# above — guarded by the publish-image "bundled contract" smoke step and
+# tests/test_extra_mcp_servers.py.
+COPY contracts/mcp-plugin-delivery.contract.json contracts/mcp-plugin-delivery.contract.json
 
 # Set the adapter module for runtime discovery
 ENV ADAPTER_MODULE=adapter

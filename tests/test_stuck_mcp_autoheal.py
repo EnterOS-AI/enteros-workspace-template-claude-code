@@ -149,6 +149,102 @@ def _write_platform_config(tmp_path) -> str:
     return str(tmp_path)
 
 
+def _write_self_schedule_config(tmp_path) -> str:
+    """Write a config.yaml that declares ONLY the self-audience `molecule-self`
+    MCP (the scheduler plugin's self-schedule surface) — what an ORDINARY
+    workspace now gets once the self-schedule MCP is default-on. The child env
+    carries the injector-authoritative `MOLECULE_MCP_MODE=self` marker, and the
+    server exposes schedule verbs, NOT provision_workspace."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: ordinary-ws\n"
+        "mcp_servers:\n"
+        "  - name: molecule-self\n"
+        "    command: npx\n"
+        "    args:\n"
+        "      - '@molecule-ai/mcp-server'\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: self\n"
+    )
+    return str(tmp_path)
+
+
+def _write_concierge_plus_self_config(tmp_path) -> str:
+    """Concierge that declares BOTH the management `molecule-platform` MCP AND
+    the self-audience `molecule-self` MCP. The gate must enforce
+    provision_workspace on molecule-platform but EXEMPT molecule-self."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: concierge\n"
+        "mcp_servers:\n"
+        "  - name: molecule-platform\n"
+        "    command: node\n"
+        "    args:\n"
+        "      - /opt/molecule-mcp-server/dist/index.js\n"
+        "  - name: molecule-self\n"
+        "    command: npx\n"
+        "    args:\n"
+        "      - '@molecule-ai/mcp-server'\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: self\n"
+    )
+    return str(tmp_path)
+
+
+def _write_other_plugin_config(tmp_path) -> str:
+    """A THIRD MCP delivered via the new plugins channel: NEITHER self-audience
+    (no MOLECULE_MCP_MODE=self, name != molecule-self) NOR management-audience (no
+    MOLECULE_MCP_MODE=management, name not a known management name). It ships its
+    own verbs, NOT provision_workspace. The allowlist gate must NOT force the
+    management required-tool onto it (#6/#11)."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: ordinary-ws\n"
+        "mcp_servers:\n"
+        "  - name: acme-tools\n"
+        "    command: npx\n"
+        "    args:\n"
+        "      - '@acme/mcp'\n"
+    )
+    return str(tmp_path)
+
+
+def _write_mgmt_misinjected_self_config(tmp_path) -> str:
+    """The management MCP (molecule-platform) MIS-injected with MODE=self (#7).
+    Management classification by NAME must win over the bogus mode env, so it is
+    still enforced for provision_workspace, not exempted."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: concierge\n"
+        "mcp_servers:\n"
+        "  - name: molecule-platform\n"
+        "    command: node\n"
+        "    args:\n"
+        "      - /opt/molecule-mcp-server/dist/index.js\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: self\n"
+    )
+    return str(tmp_path)
+
+
+def _write_mgmt_by_mode_env_config(tmp_path) -> str:
+    """A management MCP delivered under a NON-standard name but carrying the
+    injector-authoritative MOLECULE_MCP_MODE=management. Classification by env
+    must still enforce the required tool (#8: env channel, not name alone)."""
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        "name: concierge\n"
+        "mcp_servers:\n"
+        "  - name: org-mcp\n"
+        "    command: node\n"
+        "    args:\n"
+        "      - /opt/molecule-mcp-server/dist/index.js\n"
+        "    env:\n"
+        "      MOLECULE_MCP_MODE: management\n"
+    )
+    return str(tmp_path)
+
+
 def _make_executor(mod, config_path, model="sonnet"):
     ex = mod.ClaudeSDKExecutor(
         system_prompt=None,
@@ -249,6 +345,45 @@ FAILED = [{"name": "platform", "status": "failed", "error": "boom"}]
 DISABLED = [{"name": "platform", "status": "disabled"}]
 MISSING_TOOL = [{"name": "platform", "status": "connected", "tools": ["other"]}]
 
+# A self-audience server (molecule-self) that is connected but exposes only its
+# own schedule verbs — NO provision_workspace. The audience-scoped gate must
+# treat this as READY, not connected-missing.
+SELF_CONNECTED = [{
+    "name": "molecule-self",
+    "status": "connected",
+    "tools": ["list_schedules", "create_schedule", "delete_schedule"],
+}]
+# Concierge: molecule-platform connected WITH provision_workspace + molecule-self
+# connected WITHOUT it. Ready — the exemption is scoped to the self server only.
+CONCIERGE_PLUS_SELF_READY = [
+    {"name": "molecule-platform", "status": "connected", "tools": ["provision_workspace"]},
+    {"name": "molecule-self", "status": "connected", "tools": ["list_schedules"]},
+]
+# Same pair but molecule-platform is MISSING provision_workspace → must raise on
+# molecule-platform (NOT molecule-self): the exemption must not leak to the mgmt MCP.
+CONCIERGE_PLUS_SELF_MGMT_MISSING = [
+    {"name": "molecule-platform", "status": "connected", "tools": ["other"]},
+    {"name": "molecule-self", "status": "connected", "tools": ["list_schedules"]},
+]
+# A self-audience server stuck `pending` — it never connects. The gate must NOT
+# wedge the turn on it (#5): the turn proceeds degraded (schedule tools absent).
+SELF_PENDING = [{"name": "molecule-self", "status": "pending"}]
+# A self-audience server CONNECTED but whose tools have NOT enumerated yet (empty
+# `tools` list). This is the distinctive #9 branch (issue #330): connected alone
+# is NOT settled — the gate must keep polling so the turn doesn't start with the
+# self-schedule verbs missing. `SELF_CONNECTED` (above) is the enumerated form it
+# settles to.
+SELF_CONNECTED_NO_TOOLS = [{"name": "molecule-self", "status": "connected", "tools": []}]
+# A THIRD (non-self, non-management) server connected WITHOUT provision_workspace.
+# The allowlist gate must treat it as READY — it is never asked for a management
+# verb it does not ship (#6/#11).
+OTHER_CONNECTED = [{"name": "acme-tools", "status": "connected", "tools": ["do_thing"]}]
+# molecule-platform mis-injected MODE=self, connected but WITHOUT provision_workspace.
+# Management-by-name must still enforce → raise (#7).
+MGMT_MISINJECTED_MISSING = [
+    {"name": "molecule-platform", "status": "connected", "tools": ["do_thing"]}
+]
+
 
 # ---- Tests ----------------------------------------------------------------
 
@@ -343,6 +478,91 @@ async def test_connected_missing_required_tool_raises_not_ready(tmp_path):
     with pytest.raises(mod._McpNotReadyError) as ei:
         await ex._run_query("x", ex._build_options())
     assert ei.value.server == "platform"
+    assert "missing-provision_workspace" in ei.value.status
+
+
+def test_self_audience_names_classified_by_mode_env(tmp_path):
+    """`_self_audience_mcp_names()` classifies a declared server as self-audience
+    from its MOLECULE_MCP_MODE=self child env — the injector-authoritative marker
+    — not from a name. The management `platform` config is NOT self-audience."""
+    mod = _load_executor()
+    ex_self = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    assert ex_self._self_audience_mcp_names() == {"molecule-self"}
+    # And the plain management config is not classified self-audience.
+    other = tmp_path / "mgmt"
+    other.mkdir()
+    ex_mgmt = _make_executor(mod, _write_platform_config(other))
+    assert ex_mgmt._self_audience_mcp_names() == set()
+
+
+@pytest.mark.asyncio
+async def test_self_audience_ready_without_provision_workspace(tmp_path):
+    """REGRESSION GUARD (self-schedule MCP default-on, RFC audience-contract v1):
+    an ORDINARY workspace that declares ONLY the self-audience molecule-self MCP
+    must reach the prompt once that server is `connected` — even though it exposes
+    schedule verbs, NOT provision_workspace. Before the audience-scoped gate this
+    raised _McpNotReadyError(connected-missing-provision_workspace) and errored
+    every turn (the Local Provision Lifecycle E2E failure)."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    # It IS gated (declares an extra server) AND IS exempted from the tool check.
+    assert ex._declared_extra_mcp_names() == ["molecule-self"]
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[SELF_CONNECTED],
+            response=[mod_RM(result="scheduled", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("schedule a daily digest", ex._build_options())
+    assert res.text == "scheduled"
+    client = _StubClient.instances[0]
+    assert client.queried == "schedule a daily digest", (
+        "prompt must be sent — a connected self-audience server is READY"
+    )
+
+
+@pytest.mark.asyncio
+async def test_concierge_self_exempt_but_mgmt_still_enforced(tmp_path):
+    """The exemption is SCOPED: on a concierge declaring BOTH molecule-platform
+    and molecule-self, the gate passes when the management MCP has
+    provision_workspace and the self MCP is merely connected."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_concierge_plus_self_config(tmp_path))
+    assert set(ex._declared_extra_mcp_names()) == {"molecule-platform", "molecule-self"}
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[CONCIERGE_PLUS_SELF_READY],
+            response=[mod_RM(result="ok", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("provision a workspace", ex._build_options())
+    assert res.text == "ok"
+    assert _StubClient.instances[0].queried == "provision a workspace"
+
+
+@pytest.mark.asyncio
+async def test_concierge_mgmt_missing_tool_still_raises_despite_self_exempt(tmp_path):
+    """NEGATIVE CONTROL: the self exemption must NOT leak to the management MCP.
+    molecule-platform connected-without-provision_workspace still raises — keyed on
+    molecule-platform, not molecule-self."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_concierge_plus_self_config(tmp_path))
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 1
+    # Reload also returns the mgmt-missing status so the heal retries exhaust too.
+    _install_client_scripts(mod, [
+        _ClientScript(status_sequence=[CONCIERGE_PLUS_SELF_MGMT_MISSING], response=[]),
+        _ClientScript(status_sequence=[CONCIERGE_PLUS_SELF_MGMT_MISSING], response=[]),
+        _ClientScript(status_sequence=[CONCIERGE_PLUS_SELF_MGMT_MISSING], response=[]),
+        _ClientScript(status_sequence=[CONCIERGE_PLUS_SELF_MGMT_MISSING], response=[]),
+    ])
+    with pytest.raises(mod._McpNotReadyError) as ei:
+        await ex._run_query("x", ex._build_options())
+    assert ei.value.server == "molecule-platform"
     assert "missing-provision_workspace" in ei.value.status
 
 
@@ -452,6 +672,229 @@ async def test_heal_does_not_mark_wedge(tmp_path):
     ])
     await ex._execute_locked("create a workspace")
     assert not mod.is_wedged()
+
+
+@pytest.mark.asyncio
+async def test_self_never_connects_proceeds_degraded_not_wedged(tmp_path):
+    """#5 (NON-BLOCKING self): an ORDINARY workspace declares ONLY the now-
+    universal self-schedule molecule-self MCP, and it never connects (slow box /
+    install failure / handshake timeout). The turn must PROCEED DEGRADED — the
+    prompt is sent, no wedge — instead of exhausting the heal retries and wedging
+    EVERY turn on a workspace that previously completed fine without schedule
+    tools.
+
+    NEGATIVE CONTROL: before the fix a self server's connect was a hard gate, so
+    a stuck-pending molecule-self raised _McpNotReadyError, the heal loop
+    exhausted, and `_run_query` RAISED + marked the workspace wedged. This test's
+    `res.text` / `not is_wedged()` assertions therefore fail against pre-fix code.
+    """
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 3
+    # molecule-self stuck pending for the whole (short) budget.
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[SELF_PENDING],
+            response=[mod_RM(result="degraded-ok", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("schedule a daily digest", ex._build_options())
+    assert res.text == "degraded-ok"
+    client = _StubClient.instances[0]
+    assert client.queried == "schedule a daily digest", (
+        "prompt must be sent even though the self server never connected (#5)"
+    )
+    # Degraded, NOT wedged — and no reconnect heal was needed.
+    assert not mod.is_wedged()
+    assert client.reconnects == []
+
+
+def test_self_server_connected_empty_tools_not_settled(tmp_path):
+    """#9 (issue #330): the DISTINCTIVE branch of `_self_server_settled` — a self
+    server that is CONNECTED but whose `tools` list is still EMPTY is NOT settled.
+    Only once its tools enumerate does it settle; a terminal-failure status also
+    settles (it won't ever list tools — don't hold the turn for it).
+
+    NEGATIVE CONTROL: pre-#329 the gate treated a self server as ready on
+    `connected` ALONE (no tools check), so a connected-empty-tools spec read as
+    settled. The `is False` assertions below therefore fail against pre-fix
+    behavior — verified by re-implementing the pre-#329 predicate:
+
+        def _pre329_settled(server):
+            return server.get("status", "pending") == "connected"
+
+    which returns True for the connected-empty-tools spec, flipping both
+    assertions red.
+    """
+    mod = _load_executor()
+    settled = mod.ClaudeSDKExecutor._self_server_settled  # staticmethod
+    # Connected but tools not yet enumerated → NOT settled (keep polling, #9).
+    assert settled({"name": "molecule-self", "status": "connected", "tools": []}) is False
+    # `tools` key absent behaves the same (normalized to empty).
+    assert settled({"name": "molecule-self", "status": "connected"}) is False
+    # Still handshaking → NOT settled.
+    assert settled({"name": "molecule-self", "status": "pending"}) is False
+    # Once its own schedule verbs enumerate → SETTLED.
+    assert settled(
+        {"name": "molecule-self", "status": "connected", "tools": ["list_schedules"]}
+    ) is True
+    # Terminal failure → settled (won't ever list tools; don't hold the turn).
+    assert settled({"name": "molecule-self", "status": "disabled"}) is True
+
+
+@pytest.mark.asyncio
+async def test_gate_waits_for_self_tools_to_enumerate_then_sends_prompt(tmp_path):
+    """#9 (issue #330): an ORDINARY workspace declares ONLY the molecule-self MCP,
+    which reports `connected` with an EMPTY tools list for the first polls, THEN
+    enumerates its schedule verbs. The gate must WAIT (bounded by the poll budget)
+    across the empty-tools polls — NOT start the turn while the self-schedule verbs
+    are missing — and send the prompt only once the tools appear.
+
+    NEGATIVE CONTROL: pre-#329 a connected self server was ready the instant it
+    reported `connected`, so the gate would have returned on the FIRST poll (with
+    zero self tools live) and `client._poll` would be 1. The `_poll >= 3` assertion
+    below — the gate polled through both empty-tools snapshots before settling —
+    fails against pre-fix code.
+    """
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_self_schedule_config(tmp_path))
+    assert ex._self_audience_mcp_names() == {"molecule-self"}
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    # connected-empty-tools for 2 polls, then tools enumerate.
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[
+                SELF_CONNECTED_NO_TOOLS,
+                SELF_CONNECTED_NO_TOOLS,
+                SELF_CONNECTED,
+            ],
+            response=[mod_RM(result="scheduled", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("schedule a daily digest", ex._build_options())
+    assert res.text == "scheduled"
+    client = _StubClient.instances[0]
+    assert client.queried == "schedule a daily digest", (
+        "prompt must be sent once the self server's tools enumerate (#9)"
+    )
+    # The gate waited through both empty-tools polls before settling on poll 3 —
+    # it did NOT start the turn on `connected` alone.
+    assert client._poll >= 3, (
+        "gate must keep polling while a connected self server's tools are empty (#9)"
+    )
+    # Healthy enumeration path — no reload, no wedge.
+    assert client.reconnects == []
+    assert not mod.is_wedged()
+
+
+@pytest.mark.asyncio
+async def test_non_self_non_management_server_not_forced_to_expose_required_tool(tmp_path):
+    """#6/#11 (allowlist): a THIRD MCP that is neither self- nor management-
+    audience is connected but exposes only its own verbs (no provision_workspace).
+    The gate must NOT force the management required-tool onto it — the turn
+    proceeds once it is connected.
+
+    NEGATIVE CONTROL: the pre-fix gate scoped the required-tool check by a
+    self-audience BLOCKLIST (`name not in self_audience`), so this non-self
+    server was forced to expose provision_workspace, raised
+    connected-missing-provision_workspace, and wedged. The `res.text` assertion
+    fails against pre-fix code."""
+    mod = _load_executor()
+    mod._reset_sdk_wedge_for_test()
+    ex = _make_executor(mod, _write_other_plugin_config(tmp_path))
+    assert ex._declared_extra_mcp_names() == ["acme-tools"]
+    assert ex._self_audience_mcp_names() == set()
+    assert ex._management_audience_mcp_names() == set()
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 2
+    _install_client_scripts(mod, [
+        _ClientScript(
+            status_sequence=[OTHER_CONNECTED],
+            response=[mod_RM(result="did-thing", session_id="s1")],
+        ),
+    ])
+    res = await ex._run_query("use acme", ex._build_options())
+    assert res.text == "did-thing"
+    assert _StubClient.instances[0].queried == "use acme"
+    assert not mod.is_wedged()
+
+
+def test_management_classified_by_name_or_mode_env(tmp_path):
+    """#6/#7/#8: management-audience classification is robust — by known NAME
+    (molecule-platform / platform) OR by MOLECULE_MCP_MODE=management. A
+    management server MIS-injected with MODE=self is still management (name wins),
+    never exempted."""
+    mod = _load_executor()
+    # By env, non-standard name.
+    ex_env = _make_executor(mod, _write_mgmt_by_mode_env_config(tmp_path))
+    assert ex_env._management_audience_mcp_names() == {"org-mcp"}
+    assert ex_env._self_audience_mcp_names() == set()
+    # Mis-injected MODE=self on molecule-platform → management by name wins (#7).
+    other = tmp_path / "misinjected"
+    other.mkdir()
+    ex_mis = _make_executor(mod, _write_mgmt_misinjected_self_config(other))
+    assert ex_mis._management_audience_mcp_names() == {"molecule-platform"}
+    assert ex_mis._self_audience_mcp_names() == set(), (
+        "a management server must NOT be classified self-audience even with a "
+        "mis-injected MODE=self (#7)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_misinjected_self_on_management_still_enforces_required_tool(tmp_path):
+    """#7 (gated): molecule-platform mis-injected with MODE=self, connected but
+    missing provision_workspace, must STILL raise — the mis-injected mode env
+    cannot exempt the management server from the hard gate.
+
+    NEGATIVE CONTROL: the pre-fix gate keyed the exemption on MODE=self alone, so
+    this server was exempted and the turn wrongly proceeded; the pytest.raises
+    below does not fire against pre-fix code."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_mgmt_misinjected_self_config(tmp_path))
+    mod._MCP_READY_POLL_INTERVAL_S = 0
+    mod._MCP_READY_MAX_POLLS = 1
+    _install_client_scripts(mod, [
+        _ClientScript(status_sequence=[MGMT_MISINJECTED_MISSING], response=[]),
+    ])
+    client = _StubClient()
+    await client.connect()  # loads the scripted status sequence
+    with pytest.raises(mod._McpNotReadyError) as ei:
+        await ex._await_mcp_ready(client, ["molecule-platform"])
+    assert ei.value.server == "molecule-platform"
+    assert "missing-provision_workspace" in ei.value.status
+
+
+def test_declared_specs_memoized_per_turn(tmp_path):
+    """#8 (perf): the 3 config files backing the MCP-spec helpers are read+merged
+    ONCE per turn and reused, not re-read on every helper call / heal retry. The
+    memo refreshes across turns so a hot-reloaded config is still picked up."""
+    mod = _load_executor()
+    ex = _make_executor(mod, _write_concierge_plus_self_config(tmp_path))
+    # Count real disk reads via the loaders the merge calls.
+    calls = {"n": 0}
+    orig = ex._load_config_dict
+
+    def _counting_load():
+        calls["n"] += 1
+        return orig()
+
+    ex._load_config_dict = _counting_load  # type: ignore[assignment]
+    # Several helper calls within one turn → config.yaml read at most once.
+    ex._declared_extra_mcp_names()
+    ex._self_audience_mcp_names()
+    ex._management_audience_mcp_names()
+    ex._declared_extra_mcp_specs()
+    assert calls["n"] == 1, "declared specs must be memoized within a turn (#8)"
+    # New turn boundary refreshes the memo.
+    calls["n"] = 0
+    ex._declared_specs_cache = None  # what _execute_locked does at turn start
+    ex._declared_extra_mcp_names()
+    ex._declared_extra_mcp_names()
+    assert calls["n"] == 1, "the memo must refresh once per turn, then hold"
 
 
 def test_tool_names_from_mcp_server_status_handles_object_name_attr():

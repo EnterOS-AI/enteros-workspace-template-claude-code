@@ -1,3 +1,16 @@
+# Coding Discipline (Karpathy 4)
+
+All code changes in this workspace follow these principles:
+
+1. **Think Before Coding** — State assumptions explicitly. If unclear, ask, don't guess.
+2. **Simplicity First** — Minimum code that solves the problem. No speculative abstractions.
+3. **Surgical Changes** — Only touch what the task requires. Match existing style exactly.
+4. **Goal-Driven Execution** — Define verifiable success criteria before implementing.
+
+For concrete anti-pattern examples, see the `coding-discipline` skill or `EXAMPLES.md` in the Karpathy guidelines repo.
+
+---
+
 # Agent Workspace
 
 You are an AI agent running inside an Molecule AI workspace container. You are part of a multi-agent organization managed by a central platform.
@@ -98,7 +111,7 @@ Use the `update_agent_card` MCP tool to update this workspace's `agent_card` on 
 The `runtime_wedge` module (in `molecule_runtime`) is the universal cross-cutting holder for "this Python process can no longer serve queries — only a workspace restart will recover." It surfaces unrecoverable wedges to two consumers:
 
 - **Heartbeat** — reads `runtime_wedge.is_wedged()` on each beat and reports `runtime_state="wedged"` to the platform, which flips the workspace card to `degraded` so the canvas surfaces a Restart hint instead of leaving the user staring at a green dot while every chat hangs.
-- **Boot smoke (`smoke_mode`)** — when the publish-image workflow boots the image with `MOLECULE_SMOKE_MODE=1`, the smoke runner consults `runtime_wedge.is_wedged()` at the end of every result path and upgrades a provisional PASS to FAIL when the flag is set. Catches PR-25-class regressions (malformed CLI argv → SDK init wedge) BEFORE the broken image ships to GHCR.
+- **Boot smoke (`smoke_mode`)** — when the publish-image workflow boots the image with `MOLECULE_SMOKE_MODE=1`, the smoke runner consults `runtime_wedge.is_wedged()` at the end of every result path and upgrades a provisional PASS to FAIL when the flag is set. Catches PR-25-class regressions (malformed CLI argv → SDK init wedge) before the broken image reaches the Gitea OCI registry.
 
 The executor sets the flag in its catch arm in `claude_sdk_executor.py` (`_mark_sdk_wedged`) when `claude_agent_sdk` raises `Control request timeout: initialize` — that wedge corrupts the SDK's internal client-process state for the rest of the Python process, so every subsequent `_run_query()` call would hit the same wedge and re-throw without intervention. The flag is cleared automatically on the next successful query (`_clear_sdk_wedge_on_success`) so a transient handshake blip self-heals to `online` without a manual restart.
 

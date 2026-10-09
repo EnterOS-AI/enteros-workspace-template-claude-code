@@ -40,37 +40,27 @@ log_boot_context() {
 log_boot_context
 
 # ---------------------------------------------------------------------
-# Restore-on-recreate from secondary EBS volume (cp#326 Option D).
+# Legacy secondary-volume restore compatibility (cp#326).
 #
-# Contract with CP: when ProvisionWorkspace finds a non-expired backup
-# snapshot for this WorkspaceID, it attaches the snapshot as a SECONDARY
-# EBS volume at /dev/xvdb at launch (DeleteOnTermination=true). This
-# function mounts that volume on first container boot and rsyncs the
-# restore set (/configs, /workspace, /home/agent/.claude) from it back
-# into the root filesystem, then drops a marker so subsequent container
-# restarts (within the same EC2's lifetime) skip the restore.
-#
-# Why cp#326 needs this: AWS rejects ANY SnapshotId on the ROOT device
-# at RunInstances time with "InvalidBlockDeviceMapping: snapshotId
-# cannot be modified on root device". The cp#301 architecture (override
-# the AMI's root snapshot) is impossible per AWS spec. Option D works
-# WITH AWS's model — secondary volumes accept SnapshotId — and rsync
-# bridges the data-plane gap.
+# Existing restored workspaces may still surface a Linux block device at
+# /dev/xvdb. When present, this function mounts it on first container boot
+# and rsyncs the restore set (/configs, /workspace, /home/agent/.claude)
+# into the container root. Current provisioning must not assume a particular
+# cloud vendor; absence of the device is the normal no-restore path.
 #
 # Operational contract:
 #   - Idempotent: a marker at /configs/.restore-completed gates re-runs.
-#     If the container restarts in the same EC2 (DOT=true so the volume
-#     persists across container restarts but NOT EC2 terminate), the
-#     restore skips. If the EC2 is terminated + replaced, /configs is
-#     fresh and the marker is gone — restore runs on the new EC2.
+#     Container restarts on the same workspace host skip the restore. If
+#     the workspace host is replaced, /configs is fresh and the marker is
+#     gone, so restore runs again if the secondary device is present.
 #   - Best-effort: any failure (volume absent, fs unreadable, rsync
 #     error) is LOGGED with MOLECULE-RESTORE: prefix but does NOT abort
 #     the boot. The workspace comes up with empty state — the explicit
 #     no-restore branch the user already accepts on first-time provision.
 #   - Read-only mount on the secondary at /mnt/restore so a defective
 #     filesystem can't corrupt our root.
-#   - All log lines prefixed `MOLECULE-RESTORE:` so `docker logs <id>
-#     2>&1 | grep MOLECULE-RESTORE` is the operator's one-liner debug.
+#   - All log lines use the `MOLECULE-RESTORE:` prefix so the workspace
+#     log surface can isolate restore diagnostics without host access.
 #
 # Path allowlist (NOT a blanket /mnt/restore -> / rsync — that would
 # also restore /etc/passwd, /var/lib/docker, etc. which are container-
@@ -88,10 +78,10 @@ restore_from_secondary_volume() {
     local MOUNT_POINT="/mnt/restore"
     local MARKER="/configs/.restore-completed"
 
-    # Marker present = restore already done for this EC2's lifetime.
+    # Marker present = restore already done for this workspace-host lifetime.
     # Cheapest possible idempotency check; runs before any blockdev probe.
     if [ -f "$MARKER" ]; then
-        echo "MOLECULE-RESTORE: marker $MARKER present — skipping (already restored on this EC2)"
+        echo "MOLECULE-RESTORE: marker $MARKER present — skipping (already restored on this workspace host)"
         return 0
     fi
 
@@ -134,9 +124,8 @@ restore_from_secondary_volume() {
     # prior workspace is also removed from the new one); -x stays on
     # one filesystem (defensive against bind-mounts on the source).
     #
-    # Source paths on the snapshot must match prod root layout. The
-    # workspace EC2's root filesystem mirrors a normal Linux root, so
-    # /configs lives at $MOUNT_POINT/configs and so on.
+    # Source paths on the snapshot must match the workspace's Linux root
+    # layout, so /configs lives at $MOUNT_POINT/configs and so on.
     local RESTORE_PATHS="configs workspace home/agent/.claude"
     local rsync_failed=0
     for rel in $RESTORE_PATHS; do
@@ -189,6 +178,49 @@ restore_from_secondary_volume() {
     fi
 }
 
+# Expose plugin-contributed agent skills to Claude Code.
+#
+# The runtime's AgentskillsAdaptor materializes plugin skills into
+# /configs/skills/<skill>/SKILL.md — but Claude Code discovers personal
+# skills ONLY under ~/.claude/skills. Nothing else bridges the two, so
+# plugin skills were installed yet INVISIBLE to the agent (verified live
+# on the agents-team platform agent 2026-07-05: /configs/skills/lark-connect
+# present since plugin install, absent from the session's skill_listing;
+# hand-creating this exact symlink made the very next turn list + invoke
+# the skill successfully — the adapter.py/claude_sdk_executor.py claim
+# "claude-code reads /configs/skills natively" was wrong as deployed).
+#
+# Symlink the DIRECTORY (not per-skill copies) so post-boot plugin
+# installs/updates that rewrite /configs/skills are picked up by the
+# next turn without another boot. Guards:
+#   - create /configs/skills first (root context; chown to agent so the
+#     adaptor — uid 1000 — can keep writing skills into it post-boot)
+#   - never clobber a REAL directory already at ~/.claude/skills (could
+#     hold agent-authored skills; also `ln -sfn` against an existing dir
+#     would nest the link INSIDE it). A symlink (ours from a prior boot,
+#     possibly restored stale by the backup rsync) is safe to re-point.
+#   - fail-soft: skill exposure must never block boot.
+link_plugin_skills_into_claude_home() {
+    local CONFIG_SKILLS="/configs/skills"
+    local CLAUDE_SKILLS="/home/agent/.claude/skills"
+
+    mkdir -p "$CONFIG_SKILLS" 2>/dev/null || true
+    chown agent:agent "$CONFIG_SKILLS" 2>/dev/null || true
+
+    if [ -e "$CLAUDE_SKILLS" ] && [ ! -L "$CLAUDE_SKILLS" ]; then
+        echo "MOLECULE-SKILLS: $CLAUDE_SKILLS exists and is not a symlink — leaving it alone (plugin skills in $CONFIG_SKILLS will NOT be visible to Claude Code)"
+        return 0
+    fi
+
+    if ln -sfn "$CONFIG_SKILLS" "$CLAUDE_SKILLS" 2>/dev/null; then
+        chown -h agent:agent "$CLAUDE_SKILLS" 2>/dev/null || true
+        echo "MOLECULE-SKILLS: linked $CLAUDE_SKILLS -> $CONFIG_SKILLS"
+    else
+        echo "MOLECULE-SKILLS: WARN could not link $CLAUDE_SKILLS -> $CONFIG_SKILLS — plugin skills will not be visible this boot"
+    fi
+    return 0
+}
+
 if [ "$(id -u)" = "0" ]; then
     # Restore-on-recreate runs FIRST in the root branch — before any
     # chown — so rsync's preserved ownership doesn't immediately get
@@ -211,77 +243,22 @@ if [ "$(id -u)" = "0" ]; then
     # container alongside the host-root-reach assertion.
     chown -R agent:agent /configs 2>/dev/null
 
-    # RFC#2843 #32: install the workspace's DECLARED plugins (the DB desired-set,
-    # passed as MOLECULE_DECLARED_PLUGINS — comma-separated gitea:// sources)
-    # into /configs/plugins BEFORE dropping to agent + exec'ing the runtime.
+    # DECLARED-plugin boot-install is owned by the runtime's Python source
+    # provider — molecule_runtime/plugin_sources.install_declared_plugins(), run
+    # from main() after npm_auth and BEFORE load_config/adapter.setup, so the
+    # plugins land on disk before load_plugins reads <config>/plugins every boot
+    # (skills-survive-restart, loop-free; fail-soft, never blocks boot). That is
+    # the git-native, provider-agnostic SSOT (runtime #270): it clones anonymously
+    # by default and only wires a per-host credential helper on a 401, so the
+    # PUBLIC mgmt-MCP plugin repo is fetched with NO token ever sent — closing the
+    # 401-poison class (RCA #2970) that the former per-template shell fork here
+    # (an archive-REST curl that sent a token to public repos) tripped.
     #
-    # WHY HERE (not provisioning user-data): agent-skills are plugins, installed
-    # dynamically — but a SaaS "restart" is a full ephemeral re-provision (fresh
-    # instance + disk), so a plugin pushed post-online lived only on the
-    # destroyed instance and vanished on every restart (root-caused 2026-06-17
-    # from live box logs). /configs is re-rendered every boot; bringing plugins
-    # onto the same every-boot model — installed in-container before serving —
-    # makes skills survive the restart, loop-free (present before the agent
-    # starts, so no online->install->restart cycle). The box fetches each source
-    # itself via the read-only PAT already in this container's env; only the
-    # small source LIST rides the provision env (MOLECULE_DECLARED_PLUGINS),
-    # never the skill content — so it never hits the user-data 16 KiB cap.
-    # Fail-soft: a fetch/extract failure logs and continues; never blocks boot.
-    if [ -n "${MOLECULE_DECLARED_PLUGINS:-}" ]; then
-        _plg_base="${MOLECULE_GITEA_BASE_URL:-https://git.moleculesai.app}"
-        _plg_base="${_plg_base%/}"
-        rm -rf /configs/plugins 2>/dev/null
-        mkdir -p /configs/plugins
-        _plg_old_ifs="$IFS"
-        IFS=','
-        for _plg_src in $MOLECULE_DECLARED_PLUGINS; do
-            IFS="$_plg_old_ifs"
-            _plg_src="$(printf '%s' "$_plg_src" | tr -d '[:space:]')"
-            if [ -z "$_plg_src" ]; then IFS=','; continue; fi
-            case "$_plg_src" in
-                gitea://*) : ;;
-                *) echo "[plugins] skip unsupported source: $_plg_src"; IFS=','; continue ;;
-            esac
-            _plg_spec="${_plg_src#gitea://}"
-            _plg_ref="main"
-            case "$_plg_spec" in *"#"*) _plg_ref="${_plg_spec##*#}"; _plg_spec="${_plg_spec%%#*}" ;; esac
-            _plg_owner="${_plg_spec%%/*}"
-            _plg_rest="${_plg_spec#*/}"
-            _plg_repo="${_plg_rest%%/*}"
-            _plg_sub="${_plg_rest#*/}"
-            [ "$_plg_sub" = "$_plg_rest" ] && _plg_sub=""
-            if [ -n "$_plg_sub" ]; then _plg_name="${_plg_sub##*/}"; else _plg_name="$_plg_repo"; fi
-            if [ -z "$_plg_owner" ] || [ -z "$_plg_repo" ] || [ -z "$_plg_name" ]; then
-                echo "[plugins] bad source: $_plg_src"; IFS=','; continue
-            fi
-            _plg_td="$(mktemp -d)"
-            _plg_url="${_plg_base}/api/v1/repos/${_plg_owner}/${_plg_repo}/archive/${_plg_ref}.tar.gz"
-            if [ -n "${MOLECULE_TEMPLATE_REPO_TOKEN:-}" ]; then
-                curl -fsSL --retry 3 --max-time 120 -H "Authorization: token ${MOLECULE_TEMPLATE_REPO_TOKEN}" "$_plg_url" -o "$_plg_td/a.tgz"
-            else
-                curl -fsSL --retry 3 --max-time 120 "$_plg_url" -o "$_plg_td/a.tgz"
-            fi
-            if [ -s "$_plg_td/a.tgz" ] && tar -xzf "$_plg_td/a.tgz" -C "$_plg_td" 2>/dev/null; then
-                _plg_top="$(find "$_plg_td" -mindepth 1 -maxdepth 1 -type d | head -n1)"
-                _plg_dir="$_plg_top"
-                [ -n "$_plg_sub" ] && _plg_dir="$_plg_top/$_plg_sub"
-                if [ -d "$_plg_dir" ]; then
-                    mkdir -p "/configs/plugins/$_plg_name"
-                    cp -a "$_plg_dir/." "/configs/plugins/$_plg_name/" 2>/dev/null \
-                        && echo "[plugins] installed $_plg_name <- $_plg_src" \
-                        || echo "[plugins] copy failed: $_plg_src"
-                else
-                    echo "[plugins] subpath not in archive: $_plg_sub ($_plg_src)"
-                fi
-            else
-                echo "[plugins] fetch/extract failed: $_plg_src"
-            fi
-            rm -rf "$_plg_td"
-            IFS=','
-        done
-        IFS="$_plg_old_ifs"
-        chown -R agent:agent /configs/plugins 2>/dev/null || true
-    fi
+    # The shell fork was removed so every template uses one implementation.
+    # Runtime 0.4 validates the resolved install destination and rejects unsafe
+    # dot/path names before copying. The version floor in requirements.txt and
+    # .runtime-version makes that validation part of this template's boot
+    # contract. Do not reintroduce a privileged shell fetch block here.
 
     # /workspace handling — only chown when the contents are root-owned
     # (typical on Docker Desktop on Windows where host uid maps to 0).
@@ -342,6 +319,11 @@ EOF
         chown -R agent:agent /root/.claude 2>/dev/null
         ln -sfn /root/.claude/sessions /home/agent/.claude/sessions
     fi
+
+    # Plugin skills → Claude Code personal-skills dir (see function docs).
+    # Runs AFTER the ~/.claude mkdir/chown block so the parent dir exists
+    # and after the /configs chown so ownership is settled.
+    link_plugin_skills_into_claude_home
 
     # Optional GitHub mirror credential helper setup.
     # GitHub is mirror-only for Molecule; keep this disabled unless an
