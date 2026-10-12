@@ -17,6 +17,10 @@ supported way to create a workspace from it.
   `internal/providers/` is a CI-checked projection of the control-plane
   registry, not a second runtime configuration.
 
+New workspaces default to MiniMax M3 through the Molecule platform
+(`minimax/MiniMax-M3`). Select `MiniMax-M3` to use your own MiniMax key.
+An explicit workspace model continues to take precedence over this template.
+
 ## Authentication
 
 Authentication follows the selected provider. Claude subscription workspaces
