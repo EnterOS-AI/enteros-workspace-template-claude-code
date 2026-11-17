@@ -170,10 +170,11 @@ runtime_config:
   # worker takes this value literally (only the concierge resolves the platform
   # MOLECULE_LLM_DEFAULT_MODEL SSOT directly), so the retired moonshot/kimi-k2.6
   # pin made every hired worker boot on moonshot and fail out-of-credits. The
-  # platform default is Gemini 4 Carbon since 2026-11-17 (owner: Gemini is the
-  # platform vendor; matches the hermes and openclaw templates + the
-  # platformDefaultModelFallback const); no moonshot default anywhere.
-  model: google/gemini-4-carbon
+  # platform default is Gemini 4 Hydrogen since 2026-11-17 (owner: Gemini is
+  # the platform vendor; Gemini 4 Carbon before it, still on the menu; matches
+  # the hermes and openclaw templates + the platformDefaultModelFallback
+  # const); no moonshot default anywhere.
+  model: google/gemini-4-hydrogen
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars based on the selected entry. OAuth and API-key
@@ -244,7 +245,12 @@ runtime_config:
     #
     # Gemini (2026-11-17): the platform's model vendor. The proxy serves
     # google/* from Google AI Studio and translates Anthropic requests to it.
-    # Gemini 4 Carbon is the default; Gemini 3.1 Flash-Lite is the cheapest.
+    # Gemini 4 Hydrogen is the default; Gemini 4 Carbon stays selectable;
+    # Gemini 3.1 Flash-Lite is the cheapest.
+    - id: google/gemini-4-hydrogen
+      name: Gemini 4 Hydrogen (Molecule platform)
+      provider: platform
+      required_env: []
     - id: google/gemini-4-carbon
       name: Gemini 4 Carbon (Molecule platform)
       provider: platform
