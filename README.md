@@ -17,9 +17,10 @@ supported way to create a workspace from it.
   `internal/providers/` is a CI-checked projection of the control-plane
   registry, not a second runtime configuration.
 
-New workspaces default to Gemini 4 Carbon through the Molecule platform
-(`google/gemini-4-carbon`; the proxy serves it from Google AI Studio and
-translates this runtime's Anthropic-protocol requests). Gemini 3.1 Flash-Lite
+New workspaces default to Gemini 4 Hydrogen through the Molecule platform
+(`google/gemini-4-hydrogen`; the proxy serves it from Google AI Studio and
+translates this runtime's Anthropic-protocol requests). Gemini 4 Carbon
+(`google/gemini-4-carbon`), Gemini 3.1 Flash-Lite
 (`google/gemini-3.1-flash-lite`) and MiniMax M3 (`minimax/MiniMax-M3`) are also
 on the platform menu. Select `MiniMax-M3` to use your own MiniMax key. An
 explicit workspace model continues to take precedence over this template.
