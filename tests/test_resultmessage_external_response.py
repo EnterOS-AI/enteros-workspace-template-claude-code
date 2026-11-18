@@ -40,7 +40,7 @@ import pytest
 
 # --------------------------------------------------------------------------
 # REAL sanitizer, vendored VERBATIM from
-# molecule-ai-workspace-runtime molecule_runtime/executor_helpers.py.
+# molecules-workspace-runtime molecule_runtime/executor_helpers.py.
 # Drift-guarded below (test_vendored_sanitizer_matches_installed_runtime).
 # --------------------------------------------------------------------------
 

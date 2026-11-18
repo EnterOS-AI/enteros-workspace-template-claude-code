@@ -322,6 +322,45 @@ def test_mcp_plugin_delivery_contract_is_byte_identical_ssot():
     assert contract["loaded_mcp_tools_field"] == "loaded_mcp_tools"
 
 
+def test_dockerfile_bundles_mcp_plugin_delivery_contract():
+    """The Dockerfile must COPY the contract next to claude_sdk_executor.py.
+
+    _load_platform_mcp_required_tool() resolves the contract RELATIVE TO THE
+    EXECUTOR (os.path.dirname(__file__)/contracts/...), which is /app in the
+    image. The repo-level tests above read the repo copy, so they stay green
+    while every published image lacks the file and the executor silently
+    boots on its hard-coded fallback (FileNotFoundError traceback at every
+    import, seen on every publish-image run up to 2026-10-08). This pins the
+    COPY so a Dockerfile edit cannot drop the file again without failing CI.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "Dockerfile"), encoding="utf-8") as f:
+        dockerfile = f.read()
+    copies = [
+        line.split()
+        for line in dockerfile.splitlines()
+        if line.startswith("COPY ")
+    ]
+    bundled = [
+        parts
+        for parts in copies
+        if parts[1] == "contracts/mcp-plugin-delivery.contract.json"
+        and parts[2] in (
+            "contracts/mcp-plugin-delivery.contract.json",
+            "/app/contracts/mcp-plugin-delivery.contract.json",
+        )
+    ]
+    assert bundled, (
+        "Dockerfile does not COPY contracts/mcp-plugin-delivery.contract.json "
+        "to /app/contracts/ — claude_sdk_executor would fall back to its "
+        "hard-coded required tool in every published image"
+    )
+    assert ["COPY", "claude_sdk_executor.py", "."] in copies, (
+        "claude_sdk_executor.py is no longer copied to /app; the contract "
+        "path above assumes the executor lives there"
+    )
+
+
 def test_build_options_logs_settings_mcp_servers_folding(tmp_path, caplog):
     """core#3082: when /configs/.claude/settings.json contains mcpServers,
     _build_options logs the on-disk names that --strict-mcp-config would

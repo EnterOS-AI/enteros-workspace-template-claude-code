@@ -209,11 +209,9 @@ def _normalize_provider(entry: dict):
     }
 
 
-# Canonical install path the platform provisioner is contracted to clone
-# the template repo into. Hardcoded so the adapter's config.yaml lookup
-# is invariant across Docker (mounted /app→/opt/adapter) and EC2-host
-# (cloned by molecule-controlplane's ec2.go) install paths — robust
-# against the site-packages copy that bit us 2026-05-04 11:08Z.
+# Legacy install path retained for older and self-managed layouts. The
+# published image loads config.yaml beside adapter.py in /app; checking this
+# compatibility path first also protects older site-packages installs.
 _CANONICAL_ADAPTER_DIR = "/opt/adapter"
 
 # Adjacent-to-adapter.py path. Module-level so tests can monkeypatch it
@@ -241,8 +239,8 @@ def _load_providers(config_path: str) -> tuple:
         "Not logged in. Please run /login". Fixed by adding a
         template-bundled lookup using
         ``os.path.dirname(os.path.abspath(__file__))``.
-      • 2026-05-04 11:08Z: that ``__file__`` lookup misses on EC2-host
-        installs because the provisioner copies adapter.py to
+      • 2026-05-04 11:08Z: that ``__file__`` lookup missed on legacy
+        host installs because the provisioner copied adapter.py to
         ``/opt/molecule-venv/lib/python3.12/site-packages/`` —
         site-packages wins over PYTHONPATH=/opt/adapter (which the
         host install doesn't set), so __file__ resolves to the venv
@@ -255,15 +253,11 @@ def _load_providers(config_path: str) -> tuple:
         chronic red for 38h before this commit restored the lookup.
 
     Resolution order:
-      1. ``/opt/adapter/config.yaml`` — canonical provisioner-managed
-         install dir. Hardcoded because the platform contract is
-         "provisioner clones template repo into /opt/adapter"; this
-         is invariant across Docker (mounted /app→/opt/adapter) and
-         EC2-host (cloned by ec2.go) install paths. Robust against
-         site-packages copy.
-      2. Adjacent to ``adapter.__file__`` — works in dev/test where
-         the canonical path doesn't exist. Also covers the Docker
-         image's /app/config.yaml (bundled by Dockerfile #6).
+      1. ``/opt/adapter/config.yaml`` — compatibility path for older and
+         explicitly self-managed installs. Robust against a site-packages
+         copy that has no adjacent config.
+      2. Adjacent to ``adapter.__file__`` — current published-image path
+         (``/app/config.yaml``) and the normal dev/test path.
       3. Per-workspace ``${config_path}/config.yaml`` — fallback for
          operator-shipped overrides on a private deployment that
          wants a custom providers list.
@@ -291,7 +285,7 @@ def _load_providers(config_path: str) -> tuple:
     raw = None
     chosen_path = None
     try:
-        import yaml  # transitive dep via molecule-ai-workspace-runtime
+        import yaml  # transitive dep via molecules-workspace-runtime
     except ImportError:
         logger.warning("providers: yaml import failed; using builtins")
         return _BUILTIN_PROVIDERS
@@ -376,7 +370,7 @@ def _resolve_model_and_provider_from_env(
       * ``MODEL_PROVIDER`` — the provider slug (e.g. ``minimax``,
         ``claude-code``, ``anthropic``).
 
-    The legacy ``workspace/config.py`` (in molecule-ai-workspace-runtime)
+    The shared ``molecule_runtime/config.py`` (in molecules-workspace-runtime)
     historically interpreted ``MODEL_PROVIDER`` as the *model id* — a name
     chosen before there was a separate ``MODEL`` env var. When both env vars
     are set with the persona convention, the legacy code reads
@@ -468,11 +462,11 @@ def _resolve_model_and_provider_from_env(
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Strip LangChain-style "<provider>:<model>" prefix from a model id.
+    """Strip a known "<provider>:<model>" prefix from a model id.
 
     The molecule-runtime wheel's config.py defaults model to
-    "anthropic:claude-opus-4-7" so langchain/crewai consumers get a uniform
-    LangChain-style provider:model string out of the box. The claude CLI's
+    "anthropic:claude-opus-4-7" so runtime consumers get a uniform
+    provider:model string out of the box. The claude CLI's
     --model arg expects the bare model id and silently exits 1 (no stderr)
     on prefixed strings — root cause of the 2026-05-01 claude-code adapter
     "Agent error (Exception)" bug.
@@ -742,10 +736,9 @@ def _resolve_provider(
             f"            base_url: https://...   # provider's Anthropic-compat endpoint\n"
             f"            auth_env: [{explicit_provider.upper()}_API_KEY]\n"
             f"            model_prefixes: [...]\n"
-            f"  (b) Switch the workspace runtime template to one that "
-            f"natively supports {explicit_provider} (CrewAI, LangGraph, or "
-            f"DeepAgents read provider/model from runtime_config and route "
-            f"directly without needing an Anthropic-compat shim).\n"
+            f"  (b) Switch to an official runtime whose provider registry "
+            f"supports {explicit_provider} and routes it "
+            f"without an Anthropic-compat shim.\n"
             f"\n"
             f"Note: claude-code SDK speaks the Anthropic API protocol. "
             f"Providers that only expose OpenAI-compatible endpoints "
@@ -984,7 +977,7 @@ class ClaudeCodeAdapter(BaseAdapter):
         if not yaml_provider_name:
             yaml_path = os.path.join(config.config_path, "config.yaml")
             try:
-                import yaml  # transitive dep via molecule-ai-workspace-runtime
+                import yaml  # transitive dep via molecules-workspace-runtime
                 with open(yaml_path, "r") as f:
                     data = yaml.safe_load(f) or {}
                 if isinstance(data, dict):

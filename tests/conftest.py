@@ -6,7 +6,7 @@
   - a2a.server.agent_execution (AgentExecutor)
   - claude_sdk_executor (lazy in create_executor(), stubbed proactively)
 
-In production those arrive transitively via molecule-ai-workspace-runtime.
+In production those arrive transitively via molecules-workspace-runtime.
 The CI runner only installs `pytest pytest-asyncio pyyaml`, so the import
 chain would fail with ModuleNotFoundError before any test collects —
 exactly the failure that broke CI on the #180 fix branch (PR #4) and

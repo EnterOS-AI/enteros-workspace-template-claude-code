@@ -399,8 +399,9 @@ async def test_setup_passes_for_minimax_model(adapter, monkeypatch, configs_dir)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["minimax-m2.7", "MiniMax-M3", "minimax-m3"])
 async def test_setup_minimax_case_insensitive_match(
-    adapter, monkeypatch, configs_dir
+    adapter, monkeypatch, configs_dir, model
 ):
     """MiniMax docs use mixed-case ids (MiniMax-M2.7); some operators may
     type minimax-m2.7. Both must resolve to the same provider — registry
@@ -408,7 +409,7 @@ async def test_setup_minimax_case_insensitive_match(
     """
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     cfg = _StubAdapterConfig(
-        runtime_config={"model": "minimax-m2.7"}, config_path=configs_dir
+        runtime_config={"model": model}, config_path=configs_dir
     )
 
     await adapter.setup(cfg)
@@ -882,8 +883,8 @@ def test_resolve_provider_falls_back_to_first_when_unknown():
 # ---- _strip_provider_prefix tests (2026-05-01 exit-1 root cause) ----
 #
 # Wheel's molecule_runtime/config.py defaults model to
-# "anthropic:claude-opus-4-7" so langchain/crewai consumers get a uniform
-# LangChain-style provider:model string. The claude CLI rejects prefixed
+# "anthropic:claude-opus-4-7" so runtime consumers get a uniform
+# provider:model string. The claude CLI rejects prefixed
 # strings and exits 1 silently. Adapter must strip known-Claude prefixes
 # before either provider routing (setup) or CLI invocation (executor)
 # touches the value.

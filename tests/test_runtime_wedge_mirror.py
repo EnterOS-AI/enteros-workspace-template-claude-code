@@ -11,7 +11,7 @@ consumers can observe the wedge:
 
   2. Boot smoke (workspace/smoke_mode.py:run_executor_smoke) — task
      #131. Catches PR-25-class regressions (malformed CLI argv → SDK
-     init wedge) BEFORE the broken image ships to GHCR. WITHOUT the
+     init wedge) BEFORE the broken image ships to Gitea OCI. WITHOUT the
      mirror, the smoke sees the outer wait_for time out and reports
      PASS even though the runtime self-reported wedged.
 

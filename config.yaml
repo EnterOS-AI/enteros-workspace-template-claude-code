@@ -77,6 +77,9 @@ providers:
   #     proxyAnthropicViaOpenAICompatible.
   #   * `minimax/` — namespaced; routes to MiniMax's own /anthropic/v1
   #     endpoint.
+  #   * `google/` — platform Gemini (the platform default since 2026-11-17).
+  #     The proxy serves it from Google AI Studio and translates the
+  #     Anthropic protocol both ways (molecule-controlplane#3070).
   #
   # Bare prefixes intentionally NOT added here:
   #   * Bare `minimax-` continues to route through the BYOK `minimax`
@@ -95,7 +98,7 @@ providers:
   # return 403 from CheckPlatformManagedLLMAllowed.
   - name: platform
     auth_mode: third_party_anthropic_compat
-    model_prefixes: [anthropic/, moonshot/, minimax/, kimi-]
+    model_prefixes: [anthropic/, moonshot/, minimax/, google/, kimi-]
     model_aliases: []
     base_url: https://api.moleculesai.app/api/v1/internal/llm/anthropic/v1
     auth_env: [ANTHROPIC_API_KEY, MOLECULE_LLM_USAGE_TOKEN]
@@ -166,10 +169,12 @@ runtime_config:
   # Default model for members/workers CREATED from this template. A created
   # worker takes this value literally (only the concierge resolves the platform
   # MOLECULE_LLM_DEFAULT_MODEL SSOT directly), so the retired moonshot/kimi-k2.6
-  # pin made every hired worker boot on moonshot and fail out-of-credits. minimax
-  # is the permanent platform default (matches the openclaw template + the
-  # platformDefaultModelFallback const); no moonshot default anywhere.
-  model: minimax/MiniMax-M2.7
+  # pin made every hired worker boot on moonshot and fail out-of-credits. The
+  # platform default is Gemini 4 Hydrogen since 2026-11-17 (owner: Gemini is
+  # the platform vendor; Gemini 4 Carbon before it, still on the menu; matches
+  # the hermes and openclaw templates + the platformDefaultModelFallback
+  # const); no moonshot default anywhere.
+  model: google/gemini-4-hydrogen
 
   # Canvas surfaces this list as a Model dropdown and auto-populates
   # Required Env Vars based on the selected entry. OAuth and API-key
@@ -185,22 +190,42 @@ runtime_config:
     # (migrations 037 + 039) and be allowlisted in the org's
     # `organizations.llm_allowed_models` row (CheckPlatformManagedLLMAllowed
     # enforces both). Internal RFC #695 covers the catalog expansion plan.
-    - id: moonshot/kimi-k2.6
-      name: Kimi K2.6 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: moonshot/kimi-k2.5
-      name: Kimi K2.5 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: anthropic/claude-opus-4-7
-      name: Claude Opus 4.7 (Molecule platform)
-      provider: platform
-      required_env: []
-    - id: anthropic/claude-sonnet-4-6
-      name: Claude Sonnet 4.6 (Molecule platform)
-      provider: platform
-      required_env: []
+    #
+    # 2026-08-04 — PLATFORM MENU NARROWED TO MINIMAX-ONLY (operator directive).
+    # WITHDRAWN, COMMENTED NOT DELETED — restore by uncommenting once the
+    # vendor account is funded and the operator lifts the directive.
+    #   * moonshot/* — the platform's Moonshot vendor account
+    #     (org-bd1467ed2be74ef3a0bfa43941abf167) is SUSPENDED for non-payment:
+    #     every moonshot/* platform call returns HTTP 429
+    #     exceeded_current_quota_error in ~200ms, 100% of the time. A paying
+    #     client burned 2,451 failed calls over 16h while every health signal
+    #     read green — and because these ids stayed user-selectable, a customer
+    #     could provision a permanently DEAD workspace.
+    #   * anthropic/* — still returns 200 upstream, but withdrawn under the SAME
+    #     standing "minimax is the platform family everywhere" directive.
+    # Mirrors the registry SSOT: molecule-ai-sdk#203
+    # (contracts/llm-registry/llm-registry.yaml) + molecule-controlplane#2850
+    # (internal/providers/providers.yaml runtimes.claude-code platform arm),
+    # which withdrew the same ids. A withdrawn id now fails DeriveProvider
+    # CLOSED -> 422 UNREGISTERED_MODEL_FOR_RUNTIME at workspace-create, which is
+    # the intent: refused at selection instead of a silently dead workspace.
+    # - id: moonshot/kimi-k2.6
+    #   name: Kimi K2.6 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: moonshot/kimi-k2.5
+    #   name: Kimi K2.5 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: anthropic/claude-opus-4-7
+    #   name: Claude Opus 4.7 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    # - id: anthropic/claude-sonnet-4-6
+    #   name: Claude Sonnet 4.6 (Molecule platform)
+    #   provider: platform
+    #   required_env: []
+    #
     # NOTE — claude-haiku entry pending CTO sign-off on snapshot id.
     # CP price catalog (migration 037) lists the full snapshot id
     # `claude-haiku-4-5-20251001` rather than the `claude-haiku-4-5`
@@ -217,6 +242,27 @@ runtime_config:
     # OpenAI models on the platform belong on a runtime that speaks
     # the OpenAI protocol natively (codex, hermes); they are not
     # surfaced on the claude-code template until the bridge ships.
+    #
+    # Gemini (2026-11-17): the platform's model vendor. The proxy serves
+    # google/* from Google AI Studio and translates Anthropic requests to it.
+    # Gemini 4 Hydrogen is the default; Gemini 4 Carbon stays selectable;
+    # Gemini 3.1 Flash-Lite is the cheapest.
+    - id: google/gemini-4-hydrogen
+      name: Gemini 4 Hydrogen (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: google/gemini-4-carbon
+      name: Gemini 4 Carbon (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: google/gemini-3.1-flash-lite
+      name: Gemini 3.1 Flash-Lite (Molecule platform)
+      provider: platform
+      required_env: []
+    - id: minimax/MiniMax-M3
+      name: MiniMax M3 (Molecule platform)
+      provider: platform
+      required_env: []
     - id: minimax/MiniMax-M2.7
       name: MiniMax M2.7 (Molecule platform)
       provider: platform
@@ -278,6 +324,9 @@ runtime_config:
     # MINIMAX_API_KEY → ANTHROPIC_AUTH_TOKEN at boot (only when
     # ANTHROPIC_AUTH_TOKEN is unset, so an explicit operator override wins).
     # Mirrors hermes-side fix from task #249 / hermes PR #38.
+    - id: MiniMax-M3
+      name: MiniMax M3 (third-party, Anthropic-API-compatible)
+      required_env: [MINIMAX_API_KEY]
     - id: MiniMax-M2
       name: MiniMax M2 (third-party, Anthropic-API-compatible)
       required_env: [MINIMAX_API_KEY]
